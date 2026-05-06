@@ -177,10 +177,9 @@ void partial_softmax_bf16(bfloat16 *restrict input,
     partial_softmax_alias_bf16(input, output, scale_buffer, input_size, row_idx, num_rows, scale);
 }
 
-void mask_bf16(bfloat16 *inout, const int32 unmasked_size, const int32 total_size)
-{
+void mask_bf16(bfloat16 *inout, const int32 unmasked_size, const int32 total_size) {
     // TODO: Optimize this to use vector code
-    for (int32 i = unmasked_size; i < total_size; i++) {
+    for(int32 i = unmasked_size; i < total_size; i++) {
         inout[i] = (bfloat16)(-INFINITY);
     }
 }
