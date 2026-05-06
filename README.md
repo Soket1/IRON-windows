@@ -131,9 +131,30 @@ If starting from `Ubuntu 24.04` you may need to update the Linux kernel to 6.11+
 
 ## Installation (Windows)
 
-These instructions cover building and running IRON on **Windows 10/11** with an AMD Ryzen™ AI NPU.
+> ⚠️ **Important: Toolchain Availability**
+>
+> The **Python code** of IRON is fully cross-platform and runs on Windows without modification.
+> However, the upstream **`mlir_aie`** package (which provides `aiecc.py`, MLIR Python bindings,
+> and XRT runtime integration) currently ships **Linux-only** wheels. The **`llvm-aie`** package
+> (Peano compiler: `clang++`, `llvm-ar`, `llvm-objcopy`) **does** provide Windows wheels.
+>
+> This means:
+>
+> | Component | Native Windows | Via WSL2 |
+> |-----------|:-:|:-:|
+> | Python IRON code (operators, tests, API) | ✅ | ✅ |
+> | Peano compiler (`clang++`, `llvm-ar`) | ✅ | ✅ |
+> | `aiecc.py` (xclbin compilation) | ❌ | ✅ |
+> | MLIR Python bindings (`aie.*`) | ❌ | ✅ |
+> | XRT runtime (`pyxrt`) | ✅ (separate SDK) | ✅ |
+>
+> **Recommended approach: use WSL2** (Windows Subsystem for Linux) — all tools work
+> identically to native Linux. Follow the Linux instructions above inside WSL2.
+>
+> For native Windows development (editing, testing CPU-side code, running the Python API),
+> the setup below works as-is.
 
-### Prerequisites
+### Prerequisites (Native Windows)
 
 > **Important**: Ensure your system has the latest BIOS version that enables NPU support. Check your laptop/mini-PC manufacturer's support website for BIOS updates.
 
@@ -151,7 +172,7 @@ These instructions cover building and running IRON on **Windows 10/11** with an 
    >
    > XRT is typically installed to `C:\Xilinx\XRT` or `C:\Program Files\AMD\XRT`.
 
-### Setup
+### Setup (Native Windows)
 
 1. Open **PowerShell** or **Command Prompt** and clone the repository:
    ```cmd
@@ -181,12 +202,25 @@ These instructions cover building and running IRON on **Windows 10/11** with an 
    pytest .\iron\operators\axpy\
    ```
 
+### Setup (WSL2 — Recommended)
+
+1. Install WSL2 with Ubuntu 24.04:
+   ```powershell
+   wsl --install -d Ubuntu-24.04
+   ```
+
+1. Inside WSL2, follow the **Linux installation instructions** above. All tools
+   (`mlir_aie`, `llvm-aie`, XRT) work natively in WSL2.
+
+1. Access your Windows files from WSL2 at `/mnt/c/` if needed.
+
 ### Windows Notes
 
 - The LLVM/Clang tools from the `llvm-aie` pip package are used automatically (including `clang++`, `llvm-objcopy`, `llvm-nm`, `llvm-ar`). On Windows these ship as `.exe` files and are discovered by the build system.
 - File copy operations during compilation use Python's `shutil.copy2` instead of the Unix `cp` command.
 - Symbol map generation (used by some operators) is done in pure Python on Windows, replacing the `sh | awk` pipeline used on Linux.
 - The `aiecc` compiler tool is located via the MLIR-AIE package and handles both `aiecc` and `aiecc.py` entry points on Windows.
+- When `mlir_aie` gains official Windows wheels, full native compilation will work without any code changes — the IRON build system is already prepared.
 
 ### Building/Using & Testing Operators
 
