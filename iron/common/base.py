@@ -29,6 +29,11 @@ from .compilation import (
 )
 
 
+class AIEOperatorConstraintError(RuntimeError):
+    """Raised when an operator's parameter constraints are violated."""
+    pass
+
+
 class AIEOperatorBase(ABC):
     """Base class for AIE-accelerated operations"""
 

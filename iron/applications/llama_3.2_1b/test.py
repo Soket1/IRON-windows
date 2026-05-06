@@ -5,10 +5,12 @@
 import subprocess
 import pytest
 import os
+import sys
 from pathlib import Path
 
 test_dir = Path(__file__).parent
-weights_dir = Path(os.environ.get("IRON_EXAMPLE_WEIGHTS_DIR", "/srv"))
+_default_weights = "C:/srv" if sys.platform == "win32" else "/srv"
+weights_dir = Path(os.environ.get("IRON_EXAMPLE_WEIGHTS_DIR", _default_weights))
 
 
 def generate_test_params():
@@ -34,7 +36,8 @@ params, names = generate_test_params()
 )
 @pytest.mark.parametrize("prompt_len,num_tokens", params, ids=names)
 def test_llama_3_2_1b(prompt_len, num_tokens):
-    command = f"python3 {test_dir}/llama_npu.py {weights_dir}/llama3.2-1b/model.safetensors {weights_dir}/llama3.2-1b/tokenizer.model --num-tokens {num_tokens} --prompt-len {prompt_len}"
+    python_exe = sys.executable
+    command = f"{python_exe} {test_dir}/llama_npu.py {weights_dir}/llama3.2-1b/model.safetensors {weights_dir}/llama3.2-1b/tokenizer.model --num-tokens {num_tokens} --prompt-len {prompt_len}"
 
     result = subprocess.run(
         command,

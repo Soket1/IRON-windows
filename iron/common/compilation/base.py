@@ -484,7 +484,16 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
 class AieccCompilationRule(CompilationRule):
     def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
         self.build_dir = build_dir
-        self.aiecc_path = Path(mlir_aie_dir) / "bin" / "aiecc"
+        # On Windows, aiecc may be aiecc.py or aiecc.exe; try both
+        aiecc_base = Path(mlir_aie_dir) / "bin" / "aiecc"
+        if sys.platform == "win32":
+            aiecc_py = Path(mlir_aie_dir) / "bin" / "aiecc.py"
+            if aiecc_py.is_file():
+                self.aiecc_path = aiecc_py
+            else:
+                self.aiecc_path = aiecc_base
+        else:
+            self.aiecc_path = aiecc_base
         self.peano_dir = peano_dir
         super().__init__(*args, **kwargs)
 
@@ -590,11 +599,18 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 if sources_to.get(mlir_source, [])[1:]:
                     copy_src = sources_to[mlir_source][0]
                     for copy_dest in sources_to[mlir_source][1:]:
-                        commands.append(
-                            ShellCompilationCommand(
-                                ["cp", copy_src.filename, copy_dest.filename]
+                        if sys.platform == "win32":
+                            commands.append(
+                                PythonCallbackCompilationCommand(
+                                    partial(shutil.copy2, copy_src.filename, copy_dest.filename)
+                                )
                             )
-                        )
+                        else:
+                            commands.append(
+                                ShellCompilationCommand(
+                                    ["cp", copy_src.filename, copy_dest.filename]
+                                )
+                            )
 
         # Update graph
         for artifact in worklist:
@@ -604,23 +620,34 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
 
 
 def _find_tool(name, peano_dir, mlir_aie_dir):
-    """Locate an LLVM tool by name, trying peano_dir, mlir_aie_dir, then system PATH."""
+    """Locate an LLVM tool by name, trying peano_dir, mlir_aie_dir, then system PATH.
+
+    On Windows, automatically appends '.exe' to candidate names.
+    """
+    exe_suffix = ".exe" if sys.platform == "win32" else ""
     candidates = [
-        Path(peano_dir) / "bin" / name,
-        Path(mlir_aie_dir) / "bin" / name,
+        Path(peano_dir) / "bin" / (name + exe_suffix),
+        Path(mlir_aie_dir) / "bin" / (name + exe_suffix),
     ]
+    # On case-insensitive filesystems (Windows), also try the original name
+    if exe_suffix:
+        candidates += [
+            Path(peano_dir) / "bin" / name,
+            Path(mlir_aie_dir) / "bin" / name,
+        ]
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
     # Try versioned suffix for distros that install LLVM tools as e.g. llvm-objcopy-18
-    for tool_name in [name, f"{name}-18"]:
+    search_names = [name, f"{name}{exe_suffix}", f"{name}-18", f"{name}-18{exe_suffix}"]
+    for tool_name in search_names:
         found = shutil.which(tool_name)
         if found:
             return found
     raise FileNotFoundError(
         f"{name} not found. Searched in: "
         + ", ".join(str(c) for c in candidates)
-        + f", and system PATH (also tried {name}-18)"
+        + f", and system PATH (also tried {', '.join(search_names)})"
     )
 
 
@@ -634,7 +661,8 @@ class PeanoCompilationRule(CompilationRule):
         return any(artifacts.get_worklist(KernelObjectArtifact))
 
     def compile(self, artifacts):
-        clang_path = Path(self.peano_dir) / "bin" / "clang++"
+        clang_name = "clang++.exe" if sys.platform == "win32" else "clang++"
+        clang_path = Path(self.peano_dir) / "bin" / clang_name
         include_path = Path(self.mlir_aie_dir) / "include"
         worklist = artifacts.get_worklist(KernelObjectArtifact)
         commands = []
@@ -709,13 +737,33 @@ class PeanoCompilationRule(CompilationRule):
         nm_path = self._find_tool("llvm-nm")
         symbol_map_file = artifact.filename + ".symbol_map"
 
-        # Extract defined symbols and create symbol map
-        nm_cmd = [
-            "sh",
-            "-c",
-            f"{nm_path} --defined-only --extern-only {artifact.filename} | "
-            f"awk '{{print $3 \" {prefix}\" $3}}' > {symbol_map_file}",
-        ]
+        if sys.platform == "win32":
+            # On Windows, use a Python callback instead of sh -c / awk pipe
+            def _generate_symbol_map():
+                import re
+                result = subprocess.run(
+                    [nm_path, "--defined-only", "--extern-only", artifact.filename],
+                    capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                    print(result.stderr, file=sys.stderr)
+                    return False
+                with open(symbol_map_file, "w") as f:
+                    for line in result.stdout.splitlines():
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            sym = parts[2]
+                            f.write(f"{sym} {prefix}{sym}\n")
+                return True
+
+            nm_cmd = PythonCallbackCompilationCommand(_generate_symbol_map)
+        else:
+            # On Linux, use sh + awk pipe as before
+            nm_cmd = ShellCompilationCommand([
+                "sh", "-c",
+                f"{nm_path} --defined-only --extern-only {artifact.filename} | "
+                f"awk '{{print $3 \" {prefix}\" $3}}' > {symbol_map_file}",
+            ])
 
         # Apply the renaming using the symbol map
         objcopy_cmd = [
@@ -724,7 +772,7 @@ class PeanoCompilationRule(CompilationRule):
             artifact.filename,
         ]
 
-        return [ShellCompilationCommand(nm_cmd), ShellCompilationCommand(objcopy_cmd)]
+        return [nm_cmd, ShellCompilationCommand(objcopy_cmd)]
 
 
 class ArchiveCompilationRule(CompilationRule):

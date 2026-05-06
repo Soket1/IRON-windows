@@ -129,6 +129,65 @@ If starting from `Ubuntu 24.04` you may need to update the Linux kernel to 6.11+
    pytest ./iron/operators/axpy/
    ```
 
+## Installation (Windows)
+
+These instructions cover building and running IRON on **Windows 10/11** with an AMD Ryzen™ AI NPU.
+
+### Prerequisites
+
+> **Important**: Ensure your system has the latest BIOS version that enables NPU support. Check your laptop/mini-PC manufacturer's support website for BIOS updates.
+
+1. Install **Python 3.10, 3.12, or 3.13** from [python.org](https://www.python.org/downloads/) or the Microsoft Store.
+   During installation, check **"Add Python to PATH"**.
+
+1. Install **Visual Studio Build Tools** (needed for compilation):
+   - Download from [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+   - Or install the full [Visual Studio Community](https://visualstudio.microsoft.com/vs/community/) with the **"Desktop development with C++"** workload.
+
+1. Install **Git for Windows** from [git-scm.com](https://git-scm.com/download/win).
+
+1. Install the AMD XDNA™ Driver and XRT for Windows:
+   > Follow the [AMD Ryzen AI SDK installation guide](https://ryzenai.docs.amd.com/en/latest/inst/install.html) for Windows.
+   >
+   > XRT is typically installed to `C:\Xilinx\XRT` or `C:\Program Files\AMD\XRT`.
+
+### Setup
+
+1. Open **PowerShell** or **Command Prompt** and clone the repository:
+   ```cmd
+   git clone https://github.com/amd/IRON.git
+   cd IRON
+   ```
+
+1. Create and activate a virtual environment:
+   ```cmd
+   python -m venv ironenv
+   ironenv\Scripts\activate
+   python -m pip install --upgrade pip
+   ```
+
+1. Set up XRT environment (adjust path to your XRT installation):
+   ```cmd
+   call "C:\Xilinx\XRT\setup.bat"
+   ```
+
+1. Install required Python packages:
+   ```cmd
+   pip install -r requirements.txt
+   ```
+
+1. Test your installation:
+   ```cmd
+   pytest .\iron\operators\axpy\
+   ```
+
+### Windows Notes
+
+- The LLVM/Clang tools from the `llvm-aie` pip package are used automatically (including `clang++`, `llvm-objcopy`, `llvm-nm`, `llvm-ar`). On Windows these ship as `.exe` files and are discovered by the build system.
+- File copy operations during compilation use Python's `shutil.copy2` instead of the Unix `cp` command.
+- Symbol map generation (used by some operators) is done in pure Python on Windows, replacing the `sh | awk` pipeline used on Linux.
+- The `aiecc` compiler tool is located via the MLIR-AIE package and handles both `aiecc` and `aiecc.py` entry points on Windows.
+
 ### Building/Using & Testing Operators
 
 All available operators can be found in `iron/operators`. These each contain:
@@ -139,8 +198,8 @@ All available operators can be found in `iron/operators`. These each contain:
 - `test.py`: An end-to-end test that instantiates and builds the operator, runs it and verifies its outputs against the reference.
 
 > NOTE: Be sure the XRT setup script has been sourced and the Python environment is activated:
->       `source /opt/xilinx/xrt/setup.sh`
->       `source /path/to/ironenv/bin/activate`
+>       **Linux:** `source /opt/xilinx/xrt/setup.sh` + `source /path/to/ironenv/bin/activate`
+>       **Windows:** `call "C:\Xilinx\XRT\setup.bat"` + `ironenv\Scripts\activate`
 
 To build and test all the operators:
 
@@ -164,9 +223,15 @@ pytest iron/operators/axpy/
 
 To ensure your code passes CI linting checks before pushing, install the pre-push hook:
 
+**Linux / macOS:**
 ```bash
 cp scripts/hooks/pre-push .git/hooks/pre-push
 chmod +x .git/hooks/pre-push
+```
+
+**Windows (PowerShell):**
+```powershell
+Copy-Item scripts\hooks\pre-push .git\hooks\pre-push
 ```
 
 The hook will run the same linting checks as CI:

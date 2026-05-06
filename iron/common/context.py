@@ -5,9 +5,36 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 import os
+import sys
 
 from . import compilation as comp
 import aie.utils.config
+
+
+def _detect_xrt_root() -> Path | None:
+    """Detect XRT installation root on the current platform.
+
+    Returns the path if found, None otherwise.
+    The caller should ``source <root>/setup.sh`` (Linux) or ``<root>\\setup.bat``
+    (Windows) before using XRT.
+    """
+    if sys.platform == "win32":
+        # Common Windows locations
+        candidates = [
+            Path(os.environ.get("XILINX_XRT", "")),
+            Path("C:/Xilinx/XRT"),
+            Path("C:/Program Files/AMD/XRT"),
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Xilinx/XRT",
+        ]
+    else:
+        candidates = [
+            Path("/opt/xilinx/xrt"),
+            Path(os.environ.get("XILINX_XRT", "")),
+        ]
+    for p in candidates:
+        if p and p.is_dir():
+            return p
+    return None
 
 
 @dataclass

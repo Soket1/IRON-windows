@@ -2,7 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import torch
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor, xrt as _pyxrt
+
+torch_dtype_map = {
+    "bf16": torch.bfloat16,
+    "f32": torch.float32,
+    "i8": torch.int8,
+    "ui8": torch.uint8,
+    "i16": torch.int16,
+    "i32": torch.int32,
+}
 
 
 def get_shim_dma_limit(dev) -> int:
@@ -30,6 +40,25 @@ def float_to_name(v: float) -> str:
       1e-10 -> '1en10'
     """
     return repr(v).replace(".", "p").replace("-", "n").replace("+", "")
+
+
+def torch_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    """Convert a torch tensor to a numpy array, preserving bfloat16 bit patterns.
+
+    For bfloat16 tensors, avoids numeric conversion by reinterpreting the
+    underlying uint16 memory as numpy bfloat16.
+    """
+    t = tensor.detach()
+    if t.device.type != "cpu":
+        t = t.cpu()
+    if not t.is_contiguous():
+        t = t.contiguous()
+
+    if t.dtype == torch.bfloat16:
+        u16_np = t.view(torch.uint16).numpy()
+        return u16_np.view(np.dtype("bfloat16"))
+
+    return t.numpy()
 
 
 class XRTSubBuffer(XRTTensor):
