@@ -16,7 +16,7 @@ from iron.common import (
     PythonGeneratedMLIRArtifact,
 )
 from iron.operators.dual_gemv_silu_mul.op import AIEDualGEMVSiLUMul, interleave_weights
-from iron.operators.gemv.op import AIEGEMV
+from iron.operators.gemv.op import GEMV
 from iron.common.utils import torch_to_numpy
 
 
@@ -61,7 +61,7 @@ class AIESwiGLUDecode(AIEOperatorBase):
         fused_xclbin.kernel_name = "swiglu_fused"
         artifacts.append(fused_insts)
 
-        gemv_2 = AIEGEMV(
+        gemv_2 = GEMV(
             M=self.embedding_dim,
             K=self.hidden_dim,
             num_aie_columns=8,

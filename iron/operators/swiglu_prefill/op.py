@@ -15,7 +15,7 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
-from iron.operators.gemm.op import AIEGEMM
+from iron.operators.gemm.op import GEMM
 from iron.operators.silu_mul.op import AIESiLUMul
 from iron.common.utils import torch_to_numpy
 
@@ -62,7 +62,7 @@ class AIESwiGLUPrefill(AIEOperatorBase):
                 "round_conv_even": True,
             }
 
-        gemm_1 = AIEGEMM(
+        gemm_1 = GEMM(
             M=self.seq_len, K=self.embedding_dim, N=self.hidden_dim, **accuracy_flags
         )
         self.gemm_1 = gemm_1
@@ -100,7 +100,7 @@ class AIESwiGLUPrefill(AIEOperatorBase):
         silu_mul_xclbin.depends += [gemm_1_xclbin]
         artifacts.append(silu_mul_insts)
 
-        gemm_2 = AIEGEMM(
+        gemm_2 = GEMM(
             M=self.seq_len, K=self.hidden_dim, N=self.embedding_dim, **accuracy_flags
         )
         self.gemm_2 = gemm_2
