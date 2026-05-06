@@ -100,6 +100,9 @@ class AIEFusedQKVProj(AIEOperatorBase):
                             self.context.base_dir / "aie_kernels" / "generic" / "mv.cc"
                         )
                     ],
+                    extra_flags=[
+                        f"-DDIM_K={self.embedding_dim}",
+                    ],
                 ),
             ],
         )

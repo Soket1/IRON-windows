@@ -283,6 +283,10 @@ class CompilationArtifact(ABC):
 class SourceArtifact(CompilationArtifact):
     """Artifact representing a source file that does not need to be generated, is assumed to be there."""
 
+    @classmethod
+    def new(cls, filename, **kwargs):
+        return cls(filename)
+
     pass
 
 
@@ -335,6 +339,15 @@ class XclbinArtifact(_MLIRInputMixin, CompilationArtifact):
         self.extra_flags = extra_flags if extra_flags is not None else []
         self.xclbin_input = xclbin_input
 
+    @classmethod
+    def new(cls, filename, depends=None, **kwargs):
+        deps = depends or []
+        mlir_input = next(
+            (d for d in deps if isinstance(d, (SourceArtifact, PythonGeneratedMLIRArtifact))),
+            deps[0] if deps else None,
+        )
+        return cls(filename, mlir_input=mlir_input, dependencies=deps, **kwargs)
+
 
 class InstsBinArtifact(_MLIRInputMixin, CompilationArtifact):
     def __init__(
@@ -348,6 +361,15 @@ class InstsBinArtifact(_MLIRInputMixin, CompilationArtifact):
             dependencies = dependencies + [mlir_input]
         super().__init__(filename, dependencies)
         self.extra_flags = extra_flags if extra_flags is not None else []
+
+    @classmethod
+    def new(cls, filename, depends=None, **kwargs):
+        deps = depends or []
+        mlir_input = next(
+            (d for d in deps if isinstance(d, (SourceArtifact, PythonGeneratedMLIRArtifact))),
+            deps[0] if deps else None,
+        )
+        return cls(filename, mlir_input=mlir_input, dependencies=deps, **kwargs)
 
 
 class KernelObjectArtifact(CompilationArtifact):
@@ -364,6 +386,10 @@ class KernelObjectArtifact(CompilationArtifact):
         self.rename_symbols = rename_symbols if rename_symbols is not None else {}
         self.prefix_symbols = prefix_symbols
 
+    @classmethod
+    def new(cls, filename, depends=None, extra_flags=None, **kwargs):
+        return cls(filename, dependencies=depends or [], extra_flags=extra_flags)
+
 
 class KernelArchiveArtifact(CompilationArtifact):
     """A static archive (.a) bundling one or more KernelObjectArtifacts."""
@@ -379,6 +405,15 @@ class PythonGeneratedMLIRArtifact(CompilationArtifact):
     ) -> None:
         self.generator = generator
         super().__init__(filename, dependencies=[SourceArtifact(generator.source_path)])
+
+    @classmethod
+    def new(cls, filename, import_path=None, callback_fn=None, callback_args=None, **kwargs):
+        generator = DesignGenerator(
+            source_path=Path(import_path),
+            fn_name=callback_fn,
+            args=tuple(callback_args or ()),
+        )
+        return cls(filename, generator=generator)
 
 
 # Compilation Command

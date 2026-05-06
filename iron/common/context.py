@@ -9,6 +9,15 @@ import sys
 
 from . import compilation as comp
 import aie.utils.config
+import aie.utils as aie_utils
+
+
+class _DeviceManager:
+    """Compatibility shim for new operators that access context.device_manager.device_type."""
+
+    @property
+    def device_type(self):
+        return aie_utils.get_current_device()
 
 
 def _detect_xrt_root() -> Path | None:
@@ -56,6 +65,11 @@ class AIEContext:
     def __post_init__(self) -> None:
         """Normalize build_dir to a Path object."""
         self.build_dir = Path(self.build_dir)
+
+    @property
+    def device_manager(self):
+        """Compatibility shim for operators that access context.device_manager.device_type."""
+        return _DeviceManager()
 
     @property
     def compilation_rules(self):

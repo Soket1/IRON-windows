@@ -15,6 +15,10 @@
 
 #include <aie_api/aie.hpp>
 
+#ifndef VEC_SIZE
+#define VEC_SIZE 64
+#endif
+
 void matvec_scalar(uint32_t m,
                    uint32_t k,
                    const bfloat16 *__restrict a,
@@ -40,22 +44,17 @@ Matrix-vector multiplication kernel
  - c: Pointer to the output vector
  - r: Vector size; data from the matrix and vector will be loaded in and processed in chunks of this size
 */
-template <uint32_t r>
-void matvec_vectorized(uint32_t m,
-                       uint32_t k,
-                       const bfloat16 *__restrict a,
-                       const bfloat16 *__restrict b,
-                       bfloat16 *__restrict c)
+template <uint32_t r, uint32_t k>
+void matvec_vectorized(uint32_t m, const bfloat16 *__restrict a, const bfloat16 *__restrict b, bfloat16 *__restrict c)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     bfloat16 *c_end = c + m;
     const bfloat16 *b_end = b + k;
     for (; c < c_end; c++) {
         aie::accum acc = aie::zeros<accfloat, r>();
-        // The following two pragmas enable pipelining the zero-overhead loop, but they do assume that k is at least
-        // two. This assumption should hold for any useful use of this function; if k were one, this would be a simple
-        // scalar multiplication of a vector.
-        AIE_LOOP_MIN_ITERATION_COUNT(2)
+        // The following two pragmas enable pipelining the zero-overhead loop, but they do assume that there are at
+        // least two iterations of the loop, i.e. k >= 2*r. This pragma will break the code if that is not the case!
+        AIE_LOOP_MIN_ITERATION_COUNT(k / VEC_SIZE)
         for (const bfloat16 *__restrict b_cur = b; b_cur < b_end; b_cur += r, a += r) {
             aie::vector<bfloat16, r> a_vec = aie::load_v<r>(a);
             aie::vector<bfloat16, r> b_vec = aie::load_v<r>(b_cur);
@@ -72,25 +71,23 @@ extern "C" {
  * `c`.  */
 
 void matvec_scalar_bf16_bf16(uint32_t m,
-                             uint32_t k,
                              uint32_t row_offset,
                              const bfloat16 *__restrict a_in,
                              const bfloat16 *__restrict b_in,
                              bfloat16 *__restrict c_out)
 {
     c_out += row_offset;
-    matvec_scalar(m, k, a_in, b_in, c_out);
+    matvec_scalar(m, DIM_K, a_in, b_in, c_out);
 }
 
 void matvec_vectorized_bf16_bf16(uint32_t m,
-                                 uint32_t k,
                                  uint32_t row_offset,
                                  const bfloat16 *__restrict a_in,
                                  const bfloat16 *__restrict b_in,
                                  bfloat16 *__restrict c_out)
 {
     c_out += row_offset;
-    matvec_vectorized<64>(m, k, a_in, b_in, c_out);
+    matvec_vectorized<VEC_SIZE, DIM_K>(m, a_in, b_in, c_out);
 }
 
 } // extern "C"
