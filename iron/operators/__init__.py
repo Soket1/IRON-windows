@@ -26,6 +26,14 @@ from .transpose.op import Transpose
 from .strided_copy.op import StridedCopy
 from .repeat.op import Repeat
 
+# AIE-prefixed aliases used by Llama application
+AIEGEMM = GEMM
+AIEGEMV = GEMV
+AIESiLU = SiLU
+AIERMSNorm = RMSNorm
+AIEElementwiseMul = ElementwiseMul
+AIEElementwiseAdd = ElementwiseAdd
+
 # New operators from decode-fusion-llama (AIE prefix)
 from .dual_gemv_silu_mul.op import AIEDualGEMVSiLUMul
 from .flowkv_decode.op import AIEFlowKVDecode
