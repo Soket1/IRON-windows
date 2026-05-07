@@ -751,7 +751,7 @@ class PeanoCompilationRule(CompilationRule):
         return any(artifacts.get_worklist(KernelObjectArtifact))
 
     def compile(self, artifacts):
-        clang_name = "clang++.exe" if sys.platform == "win32" else "clang++"
+        clang_name = "clang.exe" if sys.platform == "win32" else "clang++"
         clang_path = Path(self.peano_dir) / "bin" / clang_name
         include_path = Path(self.mlir_aie_dir) / "include"
         worklist = artifacts.get_worklist(KernelObjectArtifact)
