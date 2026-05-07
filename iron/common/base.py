@@ -57,13 +57,25 @@ class AIEOperatorBase(ABC):
         """
         pass
 
-    @abstractmethod
     def get_arg_spec(self) -> list[AIERuntimeArgSpec]:
-        pass
+        """Return the runtime argument specification for this operator.
 
-    @abstractmethod
+        Composite operators that are only used for compilation (via
+        set_up_artifacts + compile) may leave this unimplemented.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_arg_spec()"
+        )
+
     def get_callable(self) -> Callable[..., Any]:
-        pass
+        """Return a callable that executes this operator on the NPU.
+
+        Composite operators that are only used for compilation (via
+        set_up_artifacts + compile) may leave this unimplemented.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_callable()"
+        )
 
     @classmethod
     def get_default_context(cls) -> AIEContext:

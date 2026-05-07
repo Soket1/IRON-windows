@@ -446,13 +446,40 @@ class ShellCompilationCommand(CompilationCommand):
         self.env = env
 
     def run(self) -> bool:
-        result = subprocess.run(
-            self.command,
-            capture_output=True,
-            text=True,
-            cwd=self.cwd,
-            env={**self.env, "PYTHONUNBUFFERED": "1"},
-        )
+        # Pre-check: verify the executable exists before spawning subprocess.
+        # On Windows, FileNotFoundError is raised when the target of
+        # CreateProcess does not exist.  We catch it early to give a
+        # clear diagnostic instead of a raw OS error.
+        exe = self.command[0] if self.command else ""
+        if exe and not Path(exe).exists() and not shutil.which(exe):
+            print(
+                f"ERROR: executable not found: {exe}\n"
+                f"  Full command: {' '.join(self.command)}\n"
+                f"  Make sure mlir_aie and llvm-aie (Peano) are installed:\n"
+                f"    pip install mlir_aie==1.3.1 -f "
+                f"https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.3.1\n"
+                f"    pip install llvm-aie -f "
+                f"https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly",
+                file=sys.stderr,
+            )
+            return False
+        try:
+            result = subprocess.run(
+                self.command,
+                capture_output=True,
+                text=True,
+                cwd=self.cwd,
+                env={**self.env, "PYTHONUNBUFFERED": "1"},
+            )
+        except FileNotFoundError as exc:
+            print(
+                f"ERROR: failed to start process: {exc}\n"
+                f"  Full command: {' '.join(self.command)}\n"
+                f"  The executable may exist on disk but fail to resolve at runtime.\n"
+                f"  Check that all required tools (aiecc, clang++, llvm-objcopy) are installed.",
+                file=sys.stderr,
+            )
+            return False
         if result.returncode != 0:
             print("Return code: ", result.returncode)
             print(result.stdout)
@@ -519,18 +546,51 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
 class AieccCompilationRule(CompilationRule):
     def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
         self.build_dir = build_dir
-        # On Windows, aiecc may be aiecc.py or aiecc.exe; try both
-        aiecc_base = Path(mlir_aie_dir) / "bin" / "aiecc"
-        if sys.platform == "win32":
-            aiecc_py = Path(mlir_aie_dir) / "bin" / "aiecc.py"
-            if aiecc_py.is_file():
-                self.aiecc_path = aiecc_py
-            else:
-                self.aiecc_path = aiecc_base
-        else:
-            self.aiecc_path = aiecc_base
         self.peano_dir = peano_dir
+        self.aiecc_path = self._resolve_aiecc(mlir_aie_dir)
         super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _resolve_aiecc(mlir_aie_dir: Path) -> Path:
+        """Locate aiecc on the current platform.
+
+        Search order (Windows):
+          1. <mlir_aie_dir>/bin/aiecc.py
+          2. <mlir_aie_dir>/bin/aiecc
+          3. <mlir_aie_dir>/bin/aiecc.exe
+          4. System PATH (aiecc / aiecc.py / aiecc.exe)
+        Search order (Linux/macOS):
+          1. <mlir_aie_dir>/bin/aiecc
+          2. System PATH (aiecc)
+        """
+        candidates: list[Path] = []
+        if sys.platform == "win32":
+            candidates = [
+                mlir_aie_dir / "bin" / "aiecc.py",
+                mlir_aie_dir / "bin" / "aiecc",
+                mlir_aie_dir / "bin" / "aiecc.exe",
+            ]
+        else:
+            candidates = [
+                mlir_aie_dir / "bin" / "aiecc",
+            ]
+        for c in candidates:
+            if c.is_file():
+                return c
+        # Fallback: check system PATH
+        for name in (["aiecc.py", "aiecc", "aiecc.exe"] if sys.platform == "win32" else ["aiecc"]):
+            found = shutil.which(name)
+            if found:
+                return Path(found)
+        # Return the first candidate even if missing — the error message
+        # in ShellCompilationCommand.run() will explain what's wrong.
+        logging.warning(
+            "aiecc not found. Searched: %s and system PATH. "
+            "Install mlir_aie: pip install mlir_aie==1.3.1 -f "
+            "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.3.1",
+            ", ".join(str(c) for c in candidates),
+        )
+        return candidates[0]
 
 
 class AieccFullElfCompilationRule(AieccCompilationRule):
