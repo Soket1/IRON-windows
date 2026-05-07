@@ -752,18 +752,27 @@ class PeanoCompilationRule(CompilationRule):
             try:
                 import importlib.metadata as _meta
                 _dist_path = Path(_meta.distribution("llvm-aie")._path)
-                _cxx_inc = _dist_path.parent / "llvm-aie" / "include" / "c++" / "v1"
-                if _cxx_inc.is_dir():
-                    self._cxx_include = _cxx_inc
+                _llvm_aie_dir = _dist_path.parent / "llvm-aie"
             except Exception:
-                # Fallback: try common locations
+                _llvm_aie_dir = None
                 for _base in [
                     Path(sys.prefix) / "Lib" / "site-packages",
                     Path(sys.prefix),
                 ]:
-                    _cxx_inc = _base / "llvm-aie" / "include" / "c++" / "v1"
-                    if _cxx_inc.is_dir():
-                        self._cxx_include = _cxx_inc
+                    _candidate = _base / "llvm-aie"
+                    if _candidate.is_dir():
+                        _llvm_aie_dir = _candidate
+                        break
+            if _llvm_aie_dir is not None:
+                # Try target-specific include dir first (has __config_site),
+                # fall back to generic include/c++/v1.
+                _kernel = get_kernel_dir()  # "aie2p" or "aie2"
+                for _sub in [
+                    _llvm_aie_dir / "include" / f"{_kernel}-none-unknown-elf" / "c++" / "v1",
+                    _llvm_aie_dir / "include" / "c++" / "v1",
+                ]:
+                    if _sub.is_dir():
+                        self._cxx_include = _sub
                         break
         super().__init__(*args, **kwargs)
 
@@ -801,10 +810,12 @@ class PeanoCompilationRule(CompilationRule):
 
             extra_include_flags = []
             if self._cxx_include is not None:
-                extra_include_flags = [
-                    "-isystem", str(self._cxx_include),
-                    f"-isystem{str(self._cxx_include.parent)}",
-                ]
+                extra_include_flags = ["-isystem", str(self._cxx_include)]
+                # The generic include/c++/v1 has the actual headers (algorithm, etc.)
+                # while the target-specific dir has __config_site. Both needed.
+                _generic_cxx = self._cxx_include.parent.parent.parent / "include" / "c++" / "v1"
+                if _generic_cxx.is_dir() and _generic_cxx != self._cxx_include:
+                    extra_include_flags += ["-isystem", str(_generic_cxx)]
 
             cmd = (
                 [
