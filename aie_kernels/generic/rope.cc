@@ -4,8 +4,6 @@
 #include <aie_api/aie.hpp>
 #include <math.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 template <typename T, int N>
 void rope_kernel_interleaved(const T *restrict input, const T *restrict lut, T *restrict output, int32_t dims)

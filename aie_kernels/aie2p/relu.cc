@@ -7,8 +7,6 @@
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <type_traits>
 
 void relu_vectorized_bf16(bfloat16 *restrict a, bfloat16 *restrict c, const int32_t vector_size)

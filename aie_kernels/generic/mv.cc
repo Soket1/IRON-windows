@@ -4,9 +4,6 @@
 #define NOCPP
 
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <type_traits>
 
 #define REL_WRITE 0
 #define REL_READ 1

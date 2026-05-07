@@ -5,8 +5,6 @@
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 template <typename T, int N>
 void rms_norm_general(const T *restrict input, const T *restrict input2, T *restrict output, int32_t cols)

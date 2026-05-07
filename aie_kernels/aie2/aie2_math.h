@@ -18,7 +18,6 @@
 
 #include <cstring>
 #include <stdint.h>
-#include <stdlib.h>
 
 // fast inverse square root implementation from Quake III Arena
 inline __attribute__((always_inline)) float invsqrt(float in)

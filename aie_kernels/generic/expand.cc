@@ -5,8 +5,6 @@
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <type_traits>
 
 template <typename T_in, typename T_sf, typename T_out, const int N, const int G> void expand(T_in *in, T_out *out)

@@ -8,7 +8,6 @@
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
-#include <stdlib.h>
 
 template <typename T, int N>
 __attribute__((noinline)) void

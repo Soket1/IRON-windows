@@ -5,8 +5,6 @@
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <type_traits>
 
 template <typename T_in, typename T_out> void eltwise_mul(T_in *a, T_in *b, T_out *c, int size)

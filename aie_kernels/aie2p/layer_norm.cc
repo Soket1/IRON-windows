@@ -3,8 +3,6 @@
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 template <typename T, int N> void layer_norm(const T *restrict input, T *restrict output, int32_t cols)
 {

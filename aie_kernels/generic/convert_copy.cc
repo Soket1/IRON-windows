@@ -3,8 +3,6 @@
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 extern "C" {
 // Define a utility function to convert an f32 buffer to bf16 using the AIE API
