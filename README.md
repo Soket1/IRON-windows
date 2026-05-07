@@ -45,6 +45,7 @@ The IRON Python API for Ryzen™ AI NPUs is described in the following paper:
 | [Element-wise Add](./aie_kernels/generic/add.cc) | Element-wise addition kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/elementwise_add/](./iron/operators/elementwise_add/) |
 | [Element-wise Mul](./aie_kernels/generic/mul.cc) | Element-wise multiplication kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/elementwise_mul/](./iron/operators/elementwise_mul/) |
 | [GEMM](./aie_kernels/aie2p/mm.cc) | General Matrix Multiplication kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/gemm/](./iron/operators/gemm/) |
+| [GEMM INT8](./aie_kernels/aie2p/mm.cc) | INT8 General Matrix Multiplication (i8→i8/i16/i32) | int8 | ✓ | ✓ | 🟢 | [iron/operators/gemm/](./iron/operators/gemm/) |
 | [GEMV](./aie_kernels/generic/mv.cc) | General Matrix-Vector Multiplication kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/gemv/](./iron/operators/gemv/) |
 | [GQA](./aie_kernels/aie2p/mha.cc) | Grouped Query Attention kernel (Single pipeline) | bfloat16 | | ✓ | 🟢 | [iron/operators/mha/](./iron/operators/mha/) |
 | [MHA](./aie_kernels/aie2p/mha.cc) | Multi-Head Attention kernel & Grouped Query Attention | bfloat16 | | ✓ | 🟢 | [iron/operators/mha/](./iron/operators/mha/) |
@@ -319,6 +320,28 @@ Run benchmarks:
 # Run all operators with performance metrics stored in tests_latest.csv
 pytest iron/operators/ -m "not extensive" -v
 ```
+
+## ggml-xdna Backend (Windows)
+
+This fork includes a **ggml-xdna backend** for [llama.cpp](https://github.com/ggml-org/llama.cpp) — enabling LLM inference on AMD XDNA NPUs via the ggml ecosystem.
+
+Based on [albiol2004/llama.cpp ggml-xdna branch](https://github.com/albiol2004/llama.cpp/tree/ggml-xdna). See [ggml-org/llama.cpp#21725](https://github.com/ggml-org/llama.cpp/issues/21725) for the upstream feature request.
+
+### Supported operations (bf16)
+- ✅ GEMM/GEMV (prefill & decode)
+- ✅ SwiGLU (fused decode, prefill)
+- ✅ QKV projection (fused)
+- ✅ RMSNorm, RoPE, Softmax
+- ✅ Attention (FlowKV decode)
+
+### INT8 support (in progress)
+- ✅ INT8 GEMM operator (i8×i8→i8/i16/i32)
+- 🔜 INT8 GEMV (decode path)
+- 🔜 INT8 SwiGLU (W8A16 decode, W8A8 prefill)
+
+### Files
+- `compile.py` — Compilation bridge (Python, called by C++ backend)
+- `ggml-xdna.cpp` — ggml backend (C++, links against XRT)
 
 ## Community and Support
 
