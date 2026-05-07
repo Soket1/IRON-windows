@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import difflib
 import subprocess
 import sys
 from pathlib import Path
@@ -65,14 +66,17 @@ def run_clang_format_diff(files: List[str]) -> str:
 
             # Generate diff if there are differences
             if formatted_content != original_content:
-                diff_result = subprocess.run(
-                    ["diff", "-u", file, "-"],
-                    input=formatted_content,
-                    capture_output=True,
-                    text=True,
+                original_lines = original_content.splitlines(keepends=True)
+                formatted_lines = formatted_content.splitlines(keepends=True)
+                diff_lines = difflib.unified_diff(
+                    original_lines,
+                    formatted_lines,
+                    fromfile=file,
+                    tofile=file + " (formatted)",
                 )
-                if diff_result.stdout:
-                    diff_output += diff_result.stdout + "\n"
+                diff_str = "".join(diff_lines)
+                if diff_str:
+                    diff_output += diff_str + "\n"
 
         except subprocess.CalledProcessError as e:
             print(f"Error running clang-format on {file}: {e}", file=sys.stderr)

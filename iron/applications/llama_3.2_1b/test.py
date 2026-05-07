@@ -37,12 +37,18 @@ params, names = generate_test_params()
 @pytest.mark.parametrize("prompt_len,num_tokens", params, ids=names)
 def test_llama_3_2_1b(prompt_len, num_tokens):
     python_exe = sys.executable
-    command = f"{python_exe} {test_dir}/llama_npu.py {weights_dir}/llama3.2-1b/model.safetensors {weights_dir}/llama3.2-1b/tokenizer.model --num-tokens {num_tokens} --prompt-len {prompt_len}"
+    command = [
+        python_exe,
+        str(test_dir / "llama_npu.py"),
+        str(weights_dir / "llama3.2-1b" / "model.safetensors"),
+        str(weights_dir / "llama3.2-1b" / "tokenizer.model"),
+        "--num-tokens", str(num_tokens),
+        "--prompt-len", str(prompt_len),
+    ]
 
     result = subprocess.run(
         command,
         cwd=test_dir,
-        shell=True,
         capture_output=True,
         text=True,
     )
