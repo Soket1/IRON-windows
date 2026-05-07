@@ -52,7 +52,7 @@ class AIESwiGLUPrefill(AIEOperatorBase):
         # to meet hardware alignment requirements. We store the padded dimensions
         # from GEMM and verify that all operators use consistent padded sizes.
         artifacts = []
-        device_str = self.context.device_manager.device_str()
+        device_type = self.context.device_manager.device_type
 
         accuracy_flags = {}
         if self.prio_accuracy:

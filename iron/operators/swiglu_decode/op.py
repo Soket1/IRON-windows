@@ -42,7 +42,7 @@ class AIESwiGLUDecode(AIEOperatorBase):
 
     def set_up_artifacts(self):
         artifacts = []
-        device_str = self.context.device_manager.device_str()
+        device_type = self.context.device_manager.device_type
 
         fused = AIEDualGEMVSiLUMul(
             M=self.hidden_dim,
