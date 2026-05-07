@@ -821,6 +821,10 @@ class PeanoCompilationRule(CompilationRule):
                 _generic_cxx = self._cxx_include.parent.parent.parent / "c++" / "v1"
                 if _generic_cxx.is_dir() and _generic_cxx != self._cxx_include:
                     extra_include_flags += ["-isystem", str(_generic_cxx)]
+                # libc++ expects a C standard library (size_t, memcpy, mbstate_t,
+                # wchar.h).  On bare-metal AIE targets there is no libc, so tell
+                # libc++ to provide its own definitions.
+                extra_include_flags += ["-D_LIBCPP_HAS_NO_LIBC"]
 
             cmd = (
                 [
