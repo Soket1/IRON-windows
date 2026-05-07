@@ -821,10 +821,14 @@ class PeanoCompilationRule(CompilationRule):
                 _generic_cxx = self._cxx_include.parent.parent.parent / "c++" / "v1"
                 if _generic_cxx.is_dir() and _generic_cxx != self._cxx_include:
                     extra_include_flags += ["-isystem", str(_generic_cxx)]
-                # libc++ expects a C standard library (size_t, memcpy, mbstate_t,
-                # wchar.h).  On bare-metal AIE targets there is no libc, so tell
-                # libc++ to provide its own definitions.
-                extra_include_flags += ["-D_LIBCPP_HAS_NO_LIBC"]
+
+            # On Windows, include a minimal C library shim before any other
+            # headers so that libc++ can find size_t, memcpy, mbstate_t, etc.
+            _platform_flags = []
+            if sys.platform == "win32":
+                _shim = Path(source_file.filename).parent.parent / "aie_platform_shim.h"
+                if _shim.is_file():
+                    _platform_flags = [f"-include{_shim}"]
 
             cmd = (
                 [
@@ -840,6 +844,7 @@ class PeanoCompilationRule(CompilationRule):
                     f"-I{str(include_path)}",
                     f"-I{str(runtime_lib_include_path)}",
                 ]
+                + _platform_flags
                 + extra_include_flags
                 + artifact.extra_flags
                 + ["-c", source_file.filename, "-o", artifact.filename]
