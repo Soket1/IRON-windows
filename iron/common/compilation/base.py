@@ -745,6 +745,26 @@ class PeanoCompilationRule(CompilationRule):
     def __init__(self, peano_dir, mlir_aie_dir, *args, **kwargs):
         self.peano_dir = peano_dir
         self.mlir_aie_dir = mlir_aie_dir
+        # Locate libc++ headers from pip-installed llvm-aie (needed on Windows
+        # where the conda win64.o Peano package does not ship C++ headers).
+        self._cxx_include = None
+        if sys.platform == "win32":
+            try:
+                import importlib.metadata as _meta
+                _dist_path = Path(_meta.distribution("llvm-aie")._path)
+                _cxx_inc = _dist_path.parent / "llvm-aie" / "include" / "c++" / "v1"
+                if _cxx_inc.is_dir():
+                    self._cxx_include = _cxx_inc
+            except Exception:
+                # Fallback: try common locations
+                for _base in [
+                    Path(sys.prefix) / "Lib" / "site-packages",
+                    Path(sys.prefix),
+                ]:
+                    _cxx_inc = _base / "llvm-aie" / "include" / "c++" / "v1"
+                    if _cxx_inc.is_dir():
+                        self._cxx_include = _cxx_inc
+                        break
         super().__init__(*args, **kwargs)
 
     def matches(self, artifacts):
@@ -779,6 +799,13 @@ class PeanoCompilationRule(CompilationRule):
                         "Expected all KernelObject dependencies to be C source files"
                     )
 
+            extra_include_flags = []
+            if self._cxx_include is not None:
+                extra_include_flags = [
+                    "-isystem", str(self._cxx_include),
+                    f"-isystem{str(self._cxx_include.parent)}",
+                ]
+
             cmd = (
                 [
                     str(clang_path),
@@ -793,6 +820,7 @@ class PeanoCompilationRule(CompilationRule):
                     f"-I{str(include_path)}",
                     f"-I{str(runtime_lib_include_path)}",
                 ]
+                + extra_include_flags
                 + artifact.extra_flags
                 + ["-c", source_file.filename, "-o", artifact.filename]
             )
