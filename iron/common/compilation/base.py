@@ -554,31 +554,26 @@ class AieccCompilationRule(CompilationRule):
     def _resolve_aiecc(mlir_aie_dir: Path) -> Path:
         """Locate aiecc on the current platform.
 
-        Search order (Windows):
-          1. <mlir_aie_dir>/bin/aiecc.py
-          2. <mlir_aie_dir>/bin/aiecc
-          3. <mlir_aie_dir>/bin/aiecc.exe
-          4. System PATH (aiecc / aiecc.py / aiecc.exe)
-        Search order (Linux/macOS):
-          1. <mlir_aie_dir>/bin/aiecc
-          2. System PATH (aiecc)
+        Search order (all platforms):
+          1. <mlir_aie_dir>/bin/aiecc.py   (Python wrapper, preferred)
+          2. <mlir_aie_dir>/bin/aiecc      (shell wrapper / native)
+          3. <mlir_aie_dir>/bin/aiecc.exe  (Windows native)
+          4. System PATH (aiecc.py, aiecc, aiecc.exe)
         """
-        candidates: list[Path] = []
+        candidates: list[Path] = [
+            mlir_aie_dir / "bin" / "aiecc.py",
+            mlir_aie_dir / "bin" / "aiecc",
+        ]
         if sys.platform == "win32":
-            candidates = [
-                mlir_aie_dir / "bin" / "aiecc.py",
-                mlir_aie_dir / "bin" / "aiecc",
-                mlir_aie_dir / "bin" / "aiecc.exe",
-            ]
-        else:
-            candidates = [
-                mlir_aie_dir / "bin" / "aiecc",
-            ]
+            candidates.append(mlir_aie_dir / "bin" / "aiecc.exe")
         for c in candidates:
             if c.is_file():
                 return c
         # Fallback: check system PATH
-        for name in (["aiecc.py", "aiecc", "aiecc.exe"] if sys.platform == "win32" else ["aiecc"]):
+        path_names = ["aiecc.py", "aiecc"]
+        if sys.platform == "win32":
+            path_names.append("aiecc.exe")
+        for name in path_names:
             found = shutil.which(name)
             if found:
                 return Path(found)
