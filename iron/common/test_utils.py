@@ -19,6 +19,14 @@ torch_dtype_map = {
     "i32": torch.int32,
 }
 
+np_dtype_map = {
+    "bf16": bfloat16,
+    "f32": np.float32,
+    "i8": np.int8,
+    "i16": np.int16,
+    "i32": np.int32,
+}
+
 # TODO: Consider upstreaming generic buffer utilities to mlir-aie once operator abstractions stabilize.
 
 
