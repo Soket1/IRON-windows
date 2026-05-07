@@ -749,12 +749,17 @@ class PeanoCompilationRule(CompilationRule):
         # where the conda win64.o Peano package does not ship C++ headers).
         self._cxx_include = None
         if sys.platform == "win32":
+            _llvm_aie_dir = None
+            # Try importlib.metadata first, then fall back to known paths.
             try:
                 import importlib.metadata as _meta
                 _dist_path = Path(_meta.distribution("llvm-aie")._path)
-                _llvm_aie_dir = _dist_path.parent / "llvm-aie"
+                _candidate = _dist_path.parent / "llvm-aie"
+                if _candidate.is_dir():
+                    _llvm_aie_dir = _candidate
             except Exception:
-                _llvm_aie_dir = None
+                pass
+            if _llvm_aie_dir is None:
                 for _base in [
                     Path(sys.prefix) / "Lib" / "site-packages",
                     Path(sys.prefix),
@@ -813,7 +818,7 @@ class PeanoCompilationRule(CompilationRule):
                 extra_include_flags = ["-isystem", str(self._cxx_include)]
                 # The generic include/c++/v1 has the actual headers (algorithm, etc.)
                 # while the target-specific dir has __config_site. Both needed.
-                _generic_cxx = self._cxx_include.parent.parent.parent / "include" / "c++" / "v1"
+                _generic_cxx = self._cxx_include.parent.parent.parent / "c++" / "v1"
                 if _generic_cxx.is_dir() and _generic_cxx != self._cxx_include:
                     extra_include_flags += ["-isystem", str(_generic_cxx)]
 
