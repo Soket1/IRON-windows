@@ -4,13 +4,20 @@
  * Peano from the win64.o conda package does not ship a C standard library.
  * libc++ (from llvm-aie) needs basic C primitives to compile.
  * This header is included via -include before any other header.
- *
- * Combined with -D_LIBCPP_HAS_NO_LIBC (which tells libc++ to define
- * mbstate_t and skip other libc-dependent paths).
  */
 
 #ifndef _AIE_PLATFORM_SHIM_H
 #define _AIE_PLATFORM_SHIM_H
+
+/* Tell libc++ there is no C library.  Must be defined BEFORE any libc++
+   header is included.  libc++ uses this to define mbstate_t internally
+   and to use _LIBCPP_USING_IF_EXISTS for missing C symbols. */
+#ifndef _LIBCPP_HAS_NO_LIBC
+#define _LIBCPP_HAS_NO_LIBC
+#endif
+#ifndef _LIBCPP_HAS_NO_WIDE_CHARACTERS
+#define _LIBCPP_HAS_NO_WIDE_CHARACTERS
+#endif
 
 /* ---- size_t ---- */
 #ifndef __SIZE_TYPE__
@@ -33,11 +40,7 @@ typedef __SIZE_TYPE__ size_t;
 #endif
 typedef __PTRDIFF_TYPE__ ptrdiff_t;
 
-/* ---- wchar_t ---- */
-#ifndef __WCHAR_TYPE__
-#define __WCHAR_TYPE__ int
-#endif
-typedef __WCHAR_TYPE__ wchar_t;
+/* Note: wchar_t is a built-in C++ keyword in Peano/Clang — no typedef needed. */
 
 /* ---- div_t / ldiv_t / lldiv_t ---- */
 typedef struct { int quot, rem; } div_t;
@@ -116,7 +119,7 @@ void exit(int __status);
 #endif
 
 #ifdef __cplusplus
-/* C++ overloads for memchr (non-const version) */
+/* C++ overload for memchr (non-const version) */
 inline void *memchr(void *__s, int __c, size_t __n) {
     return const_cast<void *>(memchr(static_cast<const void *>(__s), __c, __n));
 }
