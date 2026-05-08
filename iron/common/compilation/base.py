@@ -582,6 +582,14 @@ class AieccCompilationRule(CompilationRule):
         The wrapper invokes the real ld.lld with ``--orphan-handling=place``
         appended, ensuring that orphan sections (like .tctmemtab from newer
         Peano builds) are placed instead of causing a link error.
+
+        .. note::
+
+           On Windows, aiecc may invoke the linker via an absolute path
+           (``-fuse-ld=<abs>/ld.lld``) which bypasses PATH-based wrappers.
+           As a safety net, callers should **also** strip ``.tctmemtab`` from
+           external object files before invoking aiecc (see
+           ``_strip_tctmemtab_external``).
         """
         import tempfile
 
@@ -596,7 +604,6 @@ class AieccCompilationRule(CompilationRule):
                 encoding="utf-8",
             )
         else:
-            wrapper_dir = Path(tempfile.mkdtemp(prefix="iron_lld_"))
             wrapper = wrapper_dir / "ld.lld"
             wrapper.write_text(
                 f'#!/bin/sh\nexec "{real_lld}" "$@" --orphan-handling=place\n',
@@ -605,6 +612,33 @@ class AieccCompilationRule(CompilationRule):
             wrapper.chmod(0o755)
 
         return wrapper_dir
+
+    @staticmethod
+    def _strip_tctmemtab_external(peano_dir: Path, build_dir: Path) -> None:
+        """Strip ``.tctmemtab`` from all ``.o`` files in *build_dir*.
+
+        Newer Peano builds emit a ``.tctmemtab`` section in compiled kernel
+        objects.  The aiecc-generated linker script does not include this
+        section, and with ``--orphan-handling=error`` linking fails.
+
+        PeanoCompilationRule strips the section after each kernel is compiled,
+        but external / pre-compiled objects (or objects from a previous run)
+        may still contain it.  This helper strips the section from **every**
+        ``.o`` file in the build directory as a pre-link safety net.
+        """
+        objcopy = peano_dir / "bin" / ("llvm-objcopy.exe" if sys.platform == "win32" else "llvm-objcopy")
+        if not objcopy.is_file():
+            objcopy = shutil.which("llvm-objcopy")
+            if not objcopy:
+                return  # best-effort
+        for o_file in build_dir.glob("*.o"):
+            try:
+                subprocess.run(
+                    [str(objcopy), "--remove-section=.tctmemtab", str(o_file)],
+                    capture_output=True, check=False,
+                )
+            except Exception:
+                pass  # best-effort
 
     @staticmethod
     def _resolve_aiecc(mlir_aie_dir: Path) -> Path:
@@ -668,6 +702,10 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 os.path.abspath(artifact.filename),
                 os.path.abspath(artifact.mlir_input.filename),
             ]
+            # Strip .tctmemtab from all .o files in build_dir before linking.
+            # External / pre-compiled objects may still contain this section
+            # from newer Peano, causing --orphan-handling=error to fail.
+            self._strip_tctmemtab_external(self.peano_dir, self.build_dir)
             commands.append(
                 ShellCompilationCommand(compile_cmd, cwd=str(self.build_dir), env=self._base_env)
             )
@@ -736,6 +774,8 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 ]
             compile_cmd += [os.path.abspath(mlir_source.filename)]
 
+            # Strip .tctmemtab from all .o files in build_dir before linking.
+            self._strip_tctmemtab_external(self.peano_dir, self.build_dir)
             commands.append(
                 ShellCompilationCommand(compile_cmd, cwd=str(self.build_dir), env=self._base_env)
             )
