@@ -615,7 +615,7 @@ class AieccCompilationRule(CompilationRule):
 
     @staticmethod
     def _strip_tctmemtab_external(peano_dir: Path, build_dir: Path) -> None:
-        """Strip ``.tctmemtab`` from all ``.o`` files in *build_dir*.
+        """Strip ``.tctmemtab`` from all ``.o`` files under *build_dir*.
 
         Newer Peano builds emit a ``.tctmemtab`` section in compiled kernel
         objects.  The aiecc-generated linker script does not include this
@@ -624,21 +624,33 @@ class AieccCompilationRule(CompilationRule):
         PeanoCompilationRule strips the section after each kernel is compiled,
         but external / pre-compiled objects (or objects from a previous run)
         may still contain it.  This helper strips the section from **every**
-        ``.o`` file in the build directory as a pre-link safety net.
+        ``.o`` file under the build directory (including ``.prj``
+        subdirectories) as a pre-link safety net.
         """
         objcopy = peano_dir / "bin" / ("llvm-objcopy.exe" if sys.platform == "win32" else "llvm-objcopy")
         if not objcopy.is_file():
             objcopy = shutil.which("llvm-objcopy")
             if not objcopy:
-                return  # best-effort
-        for o_file in build_dir.glob("*.o"):
+                logging.warning("llvm-objcopy not found; cannot strip .tctmemtab")
+                return
+        # Recursively find ALL .o files under build_dir (root, .prj subdirs, etc.)
+        o_files = list(build_dir.rglob("*.o"))
+        logging.info("_strip_tctmemtab_external: found %d .o files under %s", len(o_files), build_dir)
+        for o_file in o_files:
             try:
-                subprocess.run(
+                result = subprocess.run(
                     [str(objcopy), "--remove-section=.tctmemtab", str(o_file)],
-                    capture_output=True, check=False,
+                    capture_output=True, text=True, check=False,
                 )
-            except Exception:
-                pass  # best-effort
+                if result.returncode == 0:
+                    logging.info("stripped .tctmemtab from %s", o_file.name)
+                else:
+                    logging.debug(
+                        "strip .tctmemtab from %s: rc=%d stderr=%s",
+                        o_file, result.returncode, result.stderr.strip(),
+                    )
+            except Exception as exc:
+                logging.debug("strip .tctmemtab from %s failed: %s", o_file, exc)
 
     @staticmethod
     def _resolve_aiecc(mlir_aie_dir: Path) -> Path:
