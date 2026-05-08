@@ -864,6 +864,20 @@ class PeanoCompilationRule(CompilationRule):
             )
 
             commands.append(ShellCompilationCommand(cmd))
+            # On Windows/AIE2p, Peano may emit a .tctmemtab section that is
+            # not present in the aiecc-generated linker script.  With
+            # --orphan-handling=error this causes a fatal link error.
+            # Strip the section after compilation so linking succeeds.
+            if sys.platform == "win32":
+                try:
+                    objcopy = self._find_tool("llvm-objcopy")
+                    commands.append(
+                        ShellCompilationCommand(
+                            [objcopy, "--remove-section=.tctmemtab", artifact.filename]
+                        )
+                    )
+                except FileNotFoundError:
+                    pass  # best-effort; if objcopy is missing, skip silently
             if artifact.rename_symbols:
                 commands.extend(self._rename_symbols(artifact))
             if artifact.prefix_symbols:
