@@ -8,7 +8,7 @@ import argparse
 import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU1, NPU2
+from aie.iron.device import NPU1, NPU2, Tile
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -29,9 +29,9 @@ def my_silu_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_s
     tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
 
     # AIE-array data movement with object fifos (one per column)
-    of_in1s = [ObjectFifo(tile_ty, name=f"in1_{i}") for i in range(num_columns)]
-    of_in2s = [ObjectFifo(tile_ty, name=f"in2_{i}") for i in range(num_columns)]
-    of_outs = [ObjectFifo(tile_ty, name=f"out_{i}") for i in range(num_columns)]
+    of_in1s = [ObjectFifo(tile_ty, name=f"in1_{i}", tile=Tile(i, 1)) for i in range(num_columns)]
+    of_in2s = [ObjectFifo(tile_ty, name=f"in2_{i}", tile=Tile(i, 1)) for i in range(num_columns)]
+    of_outs = [ObjectFifo(tile_ty, name=f"out_{i}", tile=Tile(i, 1)) for i in range(num_columns)]
 
     # AIE Core Function declaration
     silu_mul_bf16 = Kernel(
@@ -59,6 +59,7 @@ def my_silu_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_s
                 of_outs[i].prod(),
                 silu_mul_bf16,
             ],
+            tile=Tile(i, 2),
         )
         for i in range(num_columns)
     ]
@@ -88,12 +89,14 @@ def my_silu_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_s
                 of_in1s[i].prod(),
                 A,
                 taps[i],
+                tile=Tile(i, 0),
                 task_group=tg,
             )
             rt.fill(
                 of_in2s[i].prod(),
                 B,
                 taps[i],
+                tile=Tile(i, 0),
                 task_group=tg,
             )
         # Drain the output objectFIFOs with data
@@ -102,6 +105,7 @@ def my_silu_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_s
                 of_outs[i].cons(),
                 C,
                 taps[i],
+                tile=Tile(i, 0),
                 wait=True,
                 task_group=tg,
             )
