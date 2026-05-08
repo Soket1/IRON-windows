@@ -378,7 +378,10 @@ def my_matmul(
                 of_offsets,
                 obj_types=[A_l1_ty] * (stop_row - start_row),
                 names=[f"A_L2L1_{row}" for row in range(start_row, stop_row)],
-                dims_to_stream=dims_to_stream,  # alternate columns in full 4x8 NPU2 case
+                dims_to_stream=dims_to_stream,
+                tile=Tile(
+                    2 * i if n_aie_cols == 8 else i, 1
+                ),  # alternate columns in full 4x8 NPU2 case
             )
         )
 
@@ -399,6 +402,7 @@ def my_matmul(
                 obj_type=B_l1_ty,
                 name=f"B_L2L1_{col}",
                 dims_to_stream=dims_to_stream,
+                tile=Tile(col, 1),
             )
         )
 
@@ -424,6 +428,7 @@ def my_matmul(
                 obj_types=[C_l1_ty] * n_aie_rows,
                 names=[f"C_L1L2_{col}_{row}" for row in range(n_aie_rows)],
                 depths=[fifo_depth_out] * n_aie_rows,
+                tile=Tile(col, 1),
             )
         )
         for j in range(n_aie_rows):
@@ -622,6 +627,7 @@ def my_matmul(
                             tap=C_tile,
                             wait=True,
                             task_group=tg,
+                            tile=Tile(col, 0),
                         )
 
                     for tile_row in range(current_tb_n_rows):
@@ -676,6 +682,7 @@ def my_matmul(
                                 tap=C_tile,
                                 wait=True,
                                 task_group=tg,
+                                tile=Tile(col, 0),
                             )
                             # This line does not change MLIR output at all - it's just for recording data movement
                             C_taps.append(C_tile)
@@ -708,7 +715,10 @@ def my_matmul(
                                 A_l3l2_fifos[col].prod(),
                                 A,
                                 tap=A_tiles[tile_offset],
-                                task_group=tg,  # alternate columns in full 4x8 NPU2 case
+                                task_group=tg,
+                                tile=Tile(
+                                    2 * col if n_aie_cols == 8 else col, 0
+                                ),  # alternate columns in full 4x8 NPU2 case
                             )
                         # Use the calculated sizes/strides/offsets to record the data movement
                         # caused by the above call to npu_dma_memcpy_nd.
@@ -737,6 +747,7 @@ def my_matmul(
                             B,
                             tap=B_tiles[col],
                             task_group=tg,
+                            tile=Tile(col, 0),
                         )
 
                         # These lines do not change MLIR output at all - they are just for recording data movement

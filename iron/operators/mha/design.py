@@ -276,6 +276,7 @@ def fused_mha(
         names=[f"memQ{i}" for i in range(number_of_pipelines_join_distribute)],
         dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
         depths=[of_depth] * number_of_pipelines_join_distribute,
+        tile=Tile(col=6, row=1),
     )  # Split between N pipelines
     if number_of_pipelines > 6:
         inQ2 = ObjectFifo(
@@ -288,6 +289,7 @@ def fused_mha(
             names=[f"memQ2{i}" for i in range(number_of_pipelines_join_distribute)],
             dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
             depths=[of_depth] * number_of_pipelines_join_distribute,
+            tile=Tile(col=7, row=1),
         )  # Split between N pipelines
 
     # VJUNG: The compiler will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
@@ -305,6 +307,7 @@ def fused_mha(
     memK = inK.cons().forward(
         name="memK",
         dims_to_stream=k_dims,
+        tile=Tile(col=3, row=1),
         depth=of_depth,
     )  # Broadcast, give this handle to N pipelines
 
@@ -320,6 +323,7 @@ def fused_mha(
     memV = inV.cons().forward(
         name="memV",
         dims_to_stream=v_dims,
+        tile=Tile(col=4, row=1),
         depth=of_depth,
     )  # Broadcast, give this handle to N pipelines
 
@@ -376,6 +380,7 @@ def fused_mha(
         obj_types=[q_ty] * number_of_pipelines_join_distribute,
         names=[f"outO{i}" for i in range(number_of_pipelines_join_distribute)],
         depths=[of_depth] * number_of_pipelines_join_distribute,
+        tile=Tile(col=6, row=1),
     )  # Join onto the output OF
     if number_of_pipelines > 6:
         memO2 = ObjectFifo(
@@ -388,6 +393,7 @@ def fused_mha(
             obj_types=[q_ty] * number_of_pipelines_join_distribute,
             names=[f"outO2{i}" for i in range(number_of_pipelines_join_distribute)],
             depths=[of_depth] * number_of_pipelines_join_distribute,
+            tile=Tile(col=7, row=1),
         )
 
     def batched_matmul_qk(
@@ -646,6 +652,7 @@ def fused_mha(
                     worker_barrier_list[0][i],
                     idx_buffer_qk,
                 ],
+                tile=Tile(col=i, row=2),
                 stack_size=0xD00,
                 while_true=False,
             )
@@ -674,6 +681,7 @@ def fused_mha(
                     idx_buffer_softmax,
                     scale_buffer_softmax,
                 ],
+                tile=Tile(col=i, row=3),
                 stack_size=0xD00,
                 while_true=False,
             )
@@ -698,6 +706,7 @@ def fused_mha(
                     worker_barrier_list[2][i],
                     idx_buffer_pv,
                 ],
+                tile=Tile(col=i, row=4),
                 stack_size=0xD00,
                 while_true=False,
             )
@@ -803,6 +812,7 @@ def fused_mha(
                         tap=Q_tiles[
                             2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
                         ],
+                        tile=Tile(col=4, row=0),
                         task_group=tg,
                     )
                     rt.fill(
@@ -813,6 +823,7 @@ def fused_mha(
                             + q_block_idx * 2
                             + 1
                         ],
+                        tile=Tile(col=4, row=0),
                         task_group=tg,
                     )
                 else:
@@ -820,6 +831,7 @@ def fused_mha(
                         inQ.prod(),
                         Q,
                         tap=Q_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
+                        tile=Tile(col=4, row=0),
                         task_group=tg,
                     )
 
@@ -828,12 +840,14 @@ def fused_mha(
                     inK.prod(),
                     K,
                     tap=K_tiles[kv_head_idx],
+                    tile=Tile(col=5, row=0),
                     task_group=tg,
                 )
                 rt.fill(
                     inV.prod(),
                     V,
                     tap=V_tiles[kv_head_idx],
+                    tile=Tile(col=6, row=0),
                     task_group=tg,
                 )
 
@@ -845,6 +859,7 @@ def fused_mha(
                             2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
                         ],
                         wait=True,
+                        tile=Tile(col=7, row=0),
                         task_group=tg,
                     )
                     rt.drain(
@@ -856,6 +871,7 @@ def fused_mha(
                             + 1
                         ],
                         wait=True,
+                        tile=Tile(col=7, row=0),
                         task_group=tg,
                     )
                 else:
@@ -864,6 +880,7 @@ def fused_mha(
                         O,
                         tap=O_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
                         wait=True,
+                        tile=Tile(col=7, row=0),
                         task_group=tg,
                     )
 
