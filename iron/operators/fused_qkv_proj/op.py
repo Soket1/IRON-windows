@@ -91,6 +91,7 @@ class AIEFusedQKVProj(AIEOperatorBase):
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
+            kernel_name="fused_qkv",
             depends=[
                 mlir_artifact,
                 KernelObjectArtifact.new(
