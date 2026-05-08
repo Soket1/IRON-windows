@@ -296,6 +296,12 @@ typedef long double double_t;
 extern "C" {
 #endif
 
+/* These two MUST be declared before libc++ <cstdio> tries
+   "using ::remove" / "using ::rename" — otherwise it conflicts
+   with std::remove from <algorithm>. */
+int remove(const char *__filename);
+int rename(const char *__old, const char *__new);
+
 void *memcpy(void *__dst, const void *__src, size_t __n);
 void *memmove(void *__dst, const void *__src, size_t __n);
 void *memset(void *__s, int __c, size_t __n);
