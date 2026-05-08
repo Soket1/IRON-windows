@@ -108,7 +108,6 @@ def my_rms_norm(
                     of_in1s[i * num_channels + j].prod(),
                     A,
                     taps[i * num_channels + j],
-                    tile=Tile(i, 0),
                     task_group=tg,
                 )
         # Drain the output objectFIFOs with data
@@ -118,7 +117,6 @@ def my_rms_norm(
                     of_outs[i * num_channels + j].cons(),
                     C,
                     taps[i * num_channels + j],
-                    tile=Tile(i, 0),
                     wait=True,  # wait for the transfer to complete and data to be available
                     task_group=tg,
                 )

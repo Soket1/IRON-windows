@@ -89,14 +89,12 @@ def my_silu_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_s
                 of_in1s[i].prod(),
                 A,
                 taps[i],
-                tile=Tile(i, 0),
                 task_group=tg,
             )
             rt.fill(
                 of_in2s[i].prod(),
                 B,
                 taps[i],
-                tile=Tile(i, 0),
                 task_group=tg,
             )
         # Drain the output objectFIFOs with data
@@ -105,7 +103,6 @@ def my_silu_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_s
                 of_outs[i].cons(),
                 C,
                 taps[i],
-                tile=Tile(i, 0),
                 wait=True,
                 task_group=tg,
             )

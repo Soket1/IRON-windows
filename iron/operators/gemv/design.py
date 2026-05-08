@@ -173,20 +173,18 @@ def my_matvec(
         tg_b = rt.task_group()
         for col in range(cols):
             # Simple linear transfer of B, includes all batches in sequence
-            rt.fill(B_L3L1_fifos[col].prod(), B, B_tap, tile=Tile(col, 0), task_group=tg_b)
+            rt.fill(B_L3L1_fifos[col].prod(), B, B_tap, task_group=tg_b)
         for batch in range(num_batches):
             tg_ac = rt.task_group()
             for col in range(cols):
                 rt.fill(
-                    A_L3L1_fifos[col].prod(), A, A_taps[col][batch],
-                    tile=Tile(col, 0), task_group=tg_ac,
+                    A_L3L1_fifos[col].prod(), A, A_taps[col][batch], task_group=tg_ac,
                 )
             for col in range(cols):
                 rt.drain(
                     C_L1L3_fifos[col].cons(),
                     C,
                     C_taps[col][batch],
-                    tile=Tile(col, 0),
                     task_group=tg_ac,
                     wait=True,
                 )
