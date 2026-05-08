@@ -47,8 +47,100 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable
 import sys
+import struct
 
 from iron.common.device_utils import get_kernel_dir
+
+
+def _elf_remove_section(path: Path, section_name: str) -> bool:
+    """Remove an ELF section by name using pure Python (no external tools).
+
+    Returns True if the section was found and removed, False if not present.
+    Works on relocatable object files (.o) — does NOT handle executables
+    or shared libraries with complex segment layouts.
+
+    This is a fallback for when ``llvm-objcopy`` is not available (common
+    with pip-installed ``llvm-aie`` on Windows).
+    """
+    data = bytearray(path.read_bytes())
+
+    # ELF magic
+    if len(data) < 16 or data[:4] != b"\x7fELF":
+        return False
+
+    ei_class = data[4]  # 1 = 32-bit, 2 = 64-bit
+    ei_data = data[5]   # 1 = LE, 2 = BE
+    if ei_data != 1:  # we only handle little-endian
+        return False
+
+    if ei_class == 2:  # 64-bit
+        e_shoff = struct.unpack_from("<Q", data, 40)[0]
+        e_shentsize = struct.unpack_from("<H", data, 58)[0]
+        e_shnum = struct.unpack_from("<H", data, 60)[0]
+        e_shstrndx = struct.unpack_from("<H", data, 62)[0]
+        sh_name_off = 4
+        sh_offset_off = 24
+        sh_size_off = 32
+        sh_ent_fmt = "<IIQQQQIIQQ"
+    elif ei_class == 1:  # 32-bit
+        e_shoff = struct.unpack_from("<I", data, 32)[0]
+        e_shentsize = struct.unpack_from("<H", data, 46)[0]
+        e_shnum = struct.unpack_from("<H", data, 48)[0]
+        e_shstrndx = struct.unpack_from("<H", data, 50)[0]
+        sh_name_off = 0
+        sh_offset_off = 16
+        sh_size_off = 20
+        sh_ent_fmt = "<IIIIIIIIII"
+    else:
+        return False
+
+    if e_shnum == 0 or e_shoff == 0:
+        return False
+
+    # Read the section header string table.
+    strtab_hdr = e_shoff + e_shstrndx * e_shentsize
+    if ei_class == 2:
+        strtab_offset = struct.unpack_from("<Q", data, strtab_hdr + sh_offset_off)[0]
+        strtab_size = struct.unpack_from("<Q", data, strtab_hdr + sh_size_off)[0]
+    else:
+        strtab_offset = struct.unpack_from("<I", data, strtab_hdr + sh_offset_off)[0]
+        strtab_size = struct.unpack_from("<I", data, strtab_hdr + sh_size_off)[0]
+    strtab = bytes(data[strtab_offset:strtab_offset + strtab_size])
+
+    def _get_name(idx):
+        end = strtab.find(b"\x00", idx)
+        return strtab[idx:end].decode("ascii", errors="replace") if end != -1 else ""
+
+    # Find the target section.
+    target_idx = None
+    for i in range(e_shnum):
+        hdr = e_shoff + i * e_shentsize
+        name_idx = struct.unpack_from("<I", data, hdr + sh_name_off)[0]
+        if _get_name(name_idx) == section_name:
+            target_idx = i
+            break
+
+    if target_idx is None:
+        return False
+
+    # Zero out the section header (effectively removes the section).
+    hdr = e_shoff + target_idx * e_shentsize
+    for j in range(e_shentsize):
+        data[hdr + j] = 0
+
+    # Also null-out the section name in the string table so linker doesn't
+    # see it by name.
+    name_idx = struct.unpack_from("<I", data, hdr + sh_name_off)[0]
+    name_bytes = _get_name(name_idx).encode("ascii")
+    if name_bytes:
+        start = strtab_offset + name_idx
+        for j in range(len(name_bytes)):
+            if start + j < len(data):
+                data[start + j] = 0
+
+    path.write_bytes(bytes(data))
+    return True
+
 
 # Global Functions
 # ##########################################################################
@@ -566,6 +658,12 @@ class AieccCompilationRule(CompilationRule):
         # script do not cause a fatal link error.  The wrapper is placed
         # in a temp directory that is prepended to PATH so aiecc picks it
         # up instead of the real ld.lld.
+        #
+        # NOTE: aiecc may invoke the linker via an absolute path
+        # (``-fuse-ld=<abs>/ld.lld``) which bypasses PATH-based wrappers.
+        # As a safety net, callers should **also** strip ``.tctmemtab`` from
+        # external object files before invoking aiecc (see
+        # ``_strip_tctmemtab_external``).
         self._wrapper_dir = None
         if sys.platform == "win32":
             self._wrapper_dir = self._create_ld_lld_wrapper(peano_dir)
@@ -627,28 +725,81 @@ class AieccCompilationRule(CompilationRule):
         ``.o`` file under the build directory (including ``.prj``
         subdirectories) as a pre-link safety net.
         """
-        objcopy = peano_dir / "bin" / ("llvm-objcopy.exe" if sys.platform == "win32" else "llvm-objcopy")
-        if not objcopy.is_file():
-            objcopy = shutil.which("llvm-objcopy")
-            if not objcopy:
-                logging.warning("llvm-objcopy not found; cannot strip .tctmemtab")
-                return
+        exe = ".exe" if sys.platform == "win32" else ""
+        objcopy = None
+
+        # 1. peano_dir/bin (primary)
+        candidate = peano_dir / "bin" / f"llvm-objcopy{exe}"
+        if candidate.is_file():
+            objcopy = candidate
+
+        # 2. Same dir as clang (handles pip llvm-aie that ships clang but
+        #    not objcopy under peano_dir — the binary may live elsewhere).
+        if objcopy is None:
+            clang = shutil.which(f"clang{exe}") or shutil.which("clang")
+            if clang:
+                clang_dir = Path(clang).parent
+                candidate = clang_dir / f"llvm-objcopy{exe}"
+                if candidate.is_file():
+                    objcopy = candidate
+
+        # 3. System PATH (llvm-objcopy, llvm-objcopy-N, objcopy)
+        if objcopy is None:
+            for name in [
+                "llvm-objcopy",
+                f"llvm-objcopy{exe}",
+                "llvm-objcopy-18",
+                f"llvm-objcopy-18{exe}",
+                "llvm-objcopy-17",
+                f"llvm-objcopy-17{exe}",
+                "objcopy",
+                f"objcopy{exe}",
+            ]:
+                found = shutil.which(name)
+                if found:
+                    objcopy = Path(found)
+                    break
+
+        # 4. Common Windows LLVM install locations
+        if objcopy is None and sys.platform == "win32":
+            import glob as _glob
+            for pattern in [
+                r"C:\Program Files\LLVM\bin\llvm-objcopy.exe",
+                r"C:\Program Files (x86)\LLVM\bin\llvm-objcopy.exe",
+            ]:
+                if Path(pattern).is_file():
+                    objcopy = Path(pattern)
+                    break
+
+        if objcopy is None:
+            logging.warning(
+                "llvm-objcopy not found; falling back to pure-Python "
+                "ELF section stripper for .tctmemtab removal."
+            )
+
         # Recursively find ALL .o files under build_dir (root, .prj subdirs, etc.)
         o_files = list(build_dir.rglob("*.o"))
         logging.info("_strip_tctmemtab_external: found %d .o files under %s", len(o_files), build_dir)
         for o_file in o_files:
             try:
-                result = subprocess.run(
-                    [str(objcopy), "--remove-section=.tctmemtab", str(o_file)],
-                    capture_output=True, text=True, check=False,
-                )
-                if result.returncode == 0:
-                    logging.info("stripped .tctmemtab from %s", o_file.name)
-                else:
-                    logging.debug(
-                        "strip .tctmemtab from %s: rc=%d stderr=%s",
-                        o_file, result.returncode, result.stderr.strip(),
+                if objcopy is not None:
+                    result = subprocess.run(
+                        [str(objcopy), "--remove-section=.tctmemtab", str(o_file)],
+                        capture_output=True, text=True, check=False,
                     )
+                    if result.returncode == 0:
+                        logging.info("stripped .tctmemtab from %s", o_file.name)
+                    else:
+                        logging.debug(
+                            "strip .tctmemtab from %s: rc=%d stderr=%s",
+                            o_file, result.returncode, result.stderr.strip(),
+                        )
+                else:
+                    # Pure-Python fallback: remove .tctmemtab from ELF.
+                    if _elf_remove_section(o_file, ".tctmemtab"):
+                        logging.info("stripped .tctmemtab from %s (python)", o_file.name)
+                    else:
+                        logging.debug("no .tctmemtab in %s (python)", o_file.name)
             except Exception as exc:
                 logging.debug("strip .tctmemtab from %s failed: %s", o_file, exc)
 
