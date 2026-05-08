@@ -412,6 +412,20 @@ python run.py --prompt "Hello world"
 
 ## 10. Известные проблемы и решения
 
+### `ModuleNotFoundError: No module named 'aie.iron.placers'`
+
+**Причина:** mlir-aie удалил `aie.iron.placers.SequentialPlacer` (PR #3016, апрель 2026). Если вы используете mlir-aie новее v1.3.1, IRON-windows должен быть на последней версии `devel`.
+
+**Решение:**
+```powershell
+cd IRON-windows
+git pull origin devel
+```
+
+Если вы пишете свой дизайн, не используйте `from aie.iron.placers import SequentialPlacer`. Placement теперь автоматический — компилятор расставляет тайлы через `--aie-place-tiles` pass.
+
+---
+
 ### `ERT_CMD_STATE_ERROR` при выполнении
 
 **Причина:** Несовместимость версии NPU driver и XRT.
