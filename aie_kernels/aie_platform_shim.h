@@ -21,6 +21,7 @@
 #define LLVM_LIBC_STDLIB_H
 #define LLVM_LIBC_STRING_H
 #define LLVM_LIBC_ERRNO_H
+#define LLVM_LIBC_MATH_H
 
 /* ---- Skip libc++ __mbstate_t.h ----
    Uses __has_include_next(<wchar.h>) which fails on bare-metal AIE. */
@@ -56,9 +57,18 @@ typedef __SIZE_TYPE__ size_t;
 typedef __PTRDIFF_TYPE__ ptrdiff_t;
 
 /* ---- div_t / ldiv_t / lldiv_t ---- */
+#ifndef __div_t_defined
+#define __div_t_defined
 typedef struct { int quot, rem; } div_t;
+#endif
+#ifndef __ldiv_t_defined
+#define __ldiv_t_defined
 typedef struct { long quot, rem; } ldiv_t;
+#endif
+#ifndef __lldiv_t_defined
+#define __lldiv_t_defined
 typedef struct { long long quot, rem; } lldiv_t;
+#endif
 
 /* ---- stdio macros (for libc++ cstdio / char_traits) ---- */
 #ifndef EOF
