@@ -23,7 +23,8 @@ from iron.common.utils import torch_to_numpy
 class AIESwiGLUPrefill(AIEOperatorBase):
 
     def __init__(
-        self, seq_len, embedding_dim, hidden_dim, prio_accuracy=False, context=None
+        self, seq_len, embedding_dim, hidden_dim, prio_accuracy=False,
+        tile_m=None, tile_n=None, context=None
     ):
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
@@ -34,6 +35,8 @@ class AIESwiGLUPrefill(AIEOperatorBase):
         self.weights_3 = None
 
         self.prio_accuracy = prio_accuracy
+        self._tile_m = tile_m
+        self._tile_n = tile_n
         # Artifacts created by set_up_artifacts()
         self.combined_xclbin = None
         self.gemm_1_xclbin = None
@@ -62,9 +65,14 @@ class AIESwiGLUPrefill(AIEOperatorBase):
                 "round_conv_even": True,
             }
 
-        gemm_1 = GEMM(
+        gemm_1_kwargs = dict(
             M=self.seq_len, K=self.embedding_dim, N=self.hidden_dim, **accuracy_flags
         )
+        if self._tile_m is not None:
+            gemm_1_kwargs["tile_m"] = self._tile_m
+        if self._tile_n is not None:
+            gemm_1_kwargs["tile_n"] = self._tile_n
+        gemm_1 = GEMM(**gemm_1_kwargs)
         self.gemm_1 = gemm_1
         self.seq_len_padded = gemm_1.M
         self.embedding_dim_padded = gemm_1.K
@@ -100,9 +108,14 @@ class AIESwiGLUPrefill(AIEOperatorBase):
         silu_mul_xclbin.dependencies.add(gemm_1_xclbin)
         artifacts.append(silu_mul_insts)
 
-        gemm_2 = GEMM(
+        gemm_2_kwargs = dict(
             M=self.seq_len, K=self.hidden_dim, N=self.embedding_dim, **accuracy_flags
         )
+        if self._tile_m is not None:
+            gemm_2_kwargs["tile_m"] = self._tile_m
+        if self._tile_n is not None:
+            gemm_2_kwargs["tile_n"] = self._tile_n
+        gemm_2 = GEMM(**gemm_2_kwargs)
         self.gemm_2 = gemm_2
         assert gemm_2.M == self.seq_len_padded
         assert gemm_2.K == self.hidden_dim_padded

@@ -91,7 +91,9 @@ class AIEFusedQKVProj(AIEOperatorBase):
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
-            kernel_name="fused_qkv",
+            # Use default "MLIR_AIE" kernel name — IRON-generated GEMV
+            # always produces an ELF with this symbol regardless of the
+            # --xclbin-kernel-name display label.
             depends=[
                 mlir_artifact,
                 KernelObjectArtifact.new(
