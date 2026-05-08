@@ -560,8 +560,51 @@ class AieccCompilationRule(CompilationRule):
         # find the Peano tools even when they live outside the default
         # win64.o/tools/peano directory (common on Windows pip installs).
         self._base_env = {**os.environ, "PEANO_INSTALL_DIR": str(peano_dir)}
+        # On Windows, create an ld.lld wrapper that forces
+        # --orphan-handling=place so that sections emitted by newer Peano
+        # (e.g. .tctmemtab) but missing from the aiecc-generated linker
+        # script do not cause a fatal link error.  The wrapper is placed
+        # in a temp directory that is prepended to PATH so aiecc picks it
+        # up instead of the real ld.lld.
+        self._wrapper_dir = None
+        if sys.platform == "win32":
+            self._wrapper_dir = self._create_ld_lld_wrapper(peano_dir)
+            self._base_env["PATH"] = (
+                str(self._wrapper_dir) + os.pathsep + self._base_env.get("PATH", "")
+            )
         self.aiecc_path = self._resolve_aiecc(mlir_aie_dir)
         super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _create_ld_lld_wrapper(peano_dir: Path) -> Path:
+        """Create a temp directory containing an ld.lld wrapper script.
+
+        The wrapper invokes the real ld.lld with ``--orphan-handling=place``
+        appended, ensuring that orphan sections (like .tctmemtab from newer
+        Peano builds) are placed instead of causing a link error.
+        """
+        import tempfile
+
+        real_lld = peano_dir / "bin" / ("ld.lld.exe" if sys.platform == "win32" else "ld.lld")
+        wrapper_dir = Path(tempfile.mkdtemp(prefix="iron_lld_"))
+
+        if sys.platform == "win32":
+            wrapper = wrapper_dir / "ld.lld.cmd"
+            # .cmd wrapper: pass all args + force orphan handling
+            wrapper.write_text(
+                f'@"{real_lld}" %* --orphan-handling=place\r\n',
+                encoding="utf-8",
+            )
+        else:
+            wrapper_dir = Path(tempfile.mkdtemp(prefix="iron_lld_"))
+            wrapper = wrapper_dir / "ld.lld"
+            wrapper.write_text(
+                f'#!/bin/sh\nexec "{real_lld}" "$@" --orphan-handling=place\n',
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+
+        return wrapper_dir
 
     @staticmethod
     def _resolve_aiecc(mlir_aie_dir: Path) -> Path:
@@ -864,20 +907,6 @@ class PeanoCompilationRule(CompilationRule):
             )
 
             commands.append(ShellCompilationCommand(cmd))
-            # On Windows/AIE2p, Peano may emit a .tctmemtab section that is
-            # not present in the aiecc-generated linker script.  With
-            # --orphan-handling=error this causes a fatal link error.
-            # Strip the section after compilation so linking succeeds.
-            if sys.platform == "win32":
-                try:
-                    objcopy = self._find_tool("llvm-objcopy")
-                    commands.append(
-                        ShellCompilationCommand(
-                            [objcopy, "--remove-section=.tctmemtab", artifact.filename]
-                        )
-                    )
-                except FileNotFoundError:
-                    pass  # best-effort; if objcopy is missing, skip silently
             if artifact.rename_symbols:
                 commands.extend(self._rename_symbols(artifact))
             if artifact.prefix_symbols:
