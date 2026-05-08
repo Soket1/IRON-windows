@@ -19,7 +19,6 @@ from aie.iron import (
     Buffer,
     WorkerRuntimeBarrier,
 )
-from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU2, Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
@@ -277,7 +276,6 @@ def fused_mha(
         names=[f"memQ{i}" for i in range(number_of_pipelines_join_distribute)],
         dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
         depths=[of_depth] * number_of_pipelines_join_distribute,
-        placement=Tile(col=6, row=1),
     )  # Split between N pipelines
     if number_of_pipelines > 6:
         inQ2 = ObjectFifo(
@@ -290,10 +288,9 @@ def fused_mha(
             names=[f"memQ2{i}" for i in range(number_of_pipelines_join_distribute)],
             dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
             depths=[of_depth] * number_of_pipelines_join_distribute,
-            placement=Tile(col=7, row=1),
         )  # Split between N pipelines
 
-    # VJUNG: The SequentialPlacer will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
+    # VJUNG: The compiler will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
     # I think the Sequential Placer will fail if we do a split/join with more than 6 I/Os cuz it tries to place them all on the same tile.
 
     # K is stored in column-major order
@@ -308,7 +305,6 @@ def fused_mha(
     memK = inK.cons().forward(
         name="memK",
         dims_to_stream=k_dims,
-        placement=Tile(col=3, row=1),
         depth=of_depth,
     )  # Broadcast, give this handle to N pipelines
 
@@ -324,7 +320,6 @@ def fused_mha(
     memV = inV.cons().forward(
         name="memV",
         dims_to_stream=v_dims,
-        placement=Tile(col=4, row=1),
         depth=of_depth,
     )  # Broadcast, give this handle to N pipelines
 
@@ -381,7 +376,6 @@ def fused_mha(
         obj_types=[q_ty] * number_of_pipelines_join_distribute,
         names=[f"outO{i}" for i in range(number_of_pipelines_join_distribute)],
         depths=[of_depth] * number_of_pipelines_join_distribute,
-        placement=Tile(col=6, row=1),
     )  # Join onto the output OF
     if number_of_pipelines > 6:
         memO2 = ObjectFifo(
@@ -394,7 +388,6 @@ def fused_mha(
             obj_types=[q_ty] * number_of_pipelines_join_distribute,
             names=[f"outO2{i}" for i in range(number_of_pipelines_join_distribute)],
             depths=[of_depth] * number_of_pipelines_join_distribute,
-            placement=Tile(col=7, row=1),
         )
 
     def batched_matmul_qk(
@@ -654,7 +647,6 @@ def fused_mha(
                     idx_buffer_qk,
                 ],
                 stack_size=0xD00,
-                placement=Tile(col=i, row=2),
                 while_true=False,
             )
         )
@@ -683,7 +675,6 @@ def fused_mha(
                     scale_buffer_softmax,
                 ],
                 stack_size=0xD00,
-                placement=Tile(col=i, row=3),
                 while_true=False,
             )
         )
@@ -708,7 +699,6 @@ def fused_mha(
                     idx_buffer_pv,
                 ],
                 stack_size=0xD00,
-                placement=Tile(col=i, row=4),
                 while_true=False,
             )
         )
@@ -813,7 +803,6 @@ def fused_mha(
                         tap=Q_tiles[
                             2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
                         ],
-                        placement=Tile(col=4, row=0),
                         task_group=tg,
                     )
                     rt.fill(
@@ -824,7 +813,6 @@ def fused_mha(
                             + q_block_idx * 2
                             + 1
                         ],
-                        placement=Tile(col=4, row=0),
                         task_group=tg,
                     )
                 else:
@@ -832,7 +820,6 @@ def fused_mha(
                         inQ.prod(),
                         Q,
                         tap=Q_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
-                        placement=Tile(col=4, row=0),
                         task_group=tg,
                     )
 
@@ -841,14 +828,12 @@ def fused_mha(
                     inK.prod(),
                     K,
                     tap=K_tiles[kv_head_idx],
-                    placement=Tile(col=5, row=0),
                     task_group=tg,
                 )
                 rt.fill(
                     inV.prod(),
                     V,
                     tap=V_tiles[kv_head_idx],
-                    placement=Tile(col=6, row=0),
                     task_group=tg,
                 )
 
@@ -860,7 +845,6 @@ def fused_mha(
                             2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
                         ],
                         wait=True,
-                        placement=Tile(col=7, row=0),
                         task_group=tg,
                     )
                     rt.drain(
@@ -872,7 +856,6 @@ def fused_mha(
                             + 1
                         ],
                         wait=True,
-                        placement=Tile(col=7, row=0),
                         task_group=tg,
                     )
                 else:
@@ -881,7 +864,6 @@ def fused_mha(
                         O,
                         tap=O_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
                         wait=True,
-                        placement=Tile(col=7, row=0),
                         task_group=tg,
                     )
 
@@ -892,5 +874,5 @@ def fused_mha(
     my_program = Program(dev_ty, rt)
 
     # Place components (assign them resources on the device) and generate an MLIR module
-    module = my_program.resolve_program(SequentialPlacer())
+    module = my_program.resolve_program()
     return module
