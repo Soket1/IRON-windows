@@ -1,17 +1,29 @@
 /*
  * Minimal C library shim for bare-metal AIE targets on Windows.
  *
- * Peano from the win64.o conda package does not ship a full C standard library.
- * libc++ (from llvm-aie) needs basic C primitives to compile.
+ * Peano from llvm-aie does not ship a full C standard library.
+ * libc++ needs basic C primitives to compile.
  * This header is included via -include before any other header.
+ *
+ * Strategy:
+ * - Define header guards for Peano's LLVM libc headers to skip them
+ *   (prevents ::remove conflict with std::remove from <algorithm>)
+ * - Provide minimal type/macro/function declarations needed by libc++
  */
 
 #ifndef _AIE_PLATFORM_SHIM_H
 #define _AIE_PLATFORM_SHIM_H
 
-/* ---- Skip libc++ __mbstate_t.h entirely ----
-   The file uses __has_include_next(<wchar.h>) which fails on bare-metal AIE.
-   We define its header guard and provide mbstate_t ourselves. */
+/* ---- Skip Peano's LLVM libc headers ----
+   These declare ::remove etc. which conflict with std::remove (algorithm).
+   By defining their guards, #include_next from libc++ wrappers is a no-op. */
+#define LLVM_LIBC_STDIO_H
+#define LLVM_LIBC_STDLIB_H
+#define LLVM_LIBC_STRING_H
+#define LLVM_LIBC_ERRNO_H
+
+/* ---- Skip libc++ __mbstate_t.h ----
+   Uses __has_include_next(<wchar.h>) which fails on bare-metal AIE. */
 #ifndef _LIBCPP___MBSTATE_T_H
 #define _LIBCPP___MBSTATE_T_H
 #endif
@@ -42,8 +54,6 @@ typedef __SIZE_TYPE__ size_t;
 #define __PTRDIFF_TYPE__ long
 #endif
 typedef __PTRDIFF_TYPE__ ptrdiff_t;
-
-/* Note: wchar_t is a built-in C++ keyword in Peano/Clang — no typedef needed. */
 
 /* ---- div_t / ldiv_t / lldiv_t ---- */
 typedef struct { int quot, rem; } div_t;
@@ -116,7 +126,7 @@ typedef struct { long long quot, rem; } lldiv_t;
 #define HUGE_VALL      __builtin_infl()
 #endif
 
-/* ---- C string / memory / stdio functions ---- */
+/* ---- C string / memory functions ---- */
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -134,12 +144,6 @@ int strcmp(const char *__s1, const char *__s2);
 int strncmp(const char *__s1, const char *__s2, size_t __n);
 char *strcat(char *__dst, const char *__src);
 char *strncat(char *__dst, const char *__src, size_t __n);
-
-/* stdio — declare so libc++ cstdio can import them via using declarations.
-   These will be provided by Peano's own <stdio.h> at link time. */
-typedef struct _FILE FILE;
-int remove(const char *__filename);
-int rename(const char *__old, const char *__new);
 
 /* ---- stdlib primitives ---- */
 int abs(int __n);
