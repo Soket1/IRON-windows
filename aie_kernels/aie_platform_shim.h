@@ -42,6 +42,20 @@ typedef __PTRDIFF_TYPE__ ptrdiff_t;
 
 /* Note: wchar_t is a built-in C++ keyword in Peano/Clang — no typedef needed. */
 
+/* ---- mbstate_t ----
+   libc++ __mbstate_t.h uses __has_include_next(<wchar.h>) which does not
+   work reliably on Windows bare-metal.  Define the header guard to skip
+   __mbstate_t.h entirely, and provide mbstate_t ourselves. */
+#ifndef _LIBCPP___MBSTATE_T_H
+#define _LIBCPP___MBSTATE_T_H
+#endif
+#ifndef __mbstate_t_defined
+#define __mbstate_t_defined
+typedef struct {
+    char __mbstate8[8];
+} mbstate_t;
+#endif
+
 /* ---- div_t / ldiv_t / lldiv_t ---- */
 typedef struct { int quot, rem; } div_t;
 typedef struct { long quot, rem; } ldiv_t;

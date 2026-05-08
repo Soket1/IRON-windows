@@ -832,12 +832,6 @@ class PeanoCompilationRule(CompilationRule):
                 _shim = Path(source_file.filename).parent.parent / "aie_platform_shim.h"
                 if _shim.is_file():
                     _platform_flags = [f"-include{_shim}"]
-                # libc++ __mbstate_t.h uses __has_include_next(<wchar.h>)
-                # which searches include paths AFTER the libc++ directory.
-                # Add aie_kernels/ as -isystem so our wchar.h shim is found.
-                _kernel_dir = Path(source_file.filename).parent.parent
-                if (_kernel_dir / "wchar.h").is_file():
-                    extra_include_flags += ["-isystem", str(_kernel_dir)]
 
             cmd = (
                 [
