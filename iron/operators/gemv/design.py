@@ -9,6 +9,7 @@ from aie.dialects.aie import T
 from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron.device import Tile
 
 """
 Matrix-vector design
@@ -122,6 +123,7 @@ def my_matvec(
                 C_L1L3_fifos[i].prod(),
                 matvec,
             ],
+            tile=Tile(i, 2),
         )
         for i in range(cols)
     ]
@@ -171,18 +173,20 @@ def my_matvec(
         tg_b = rt.task_group()
         for col in range(cols):
             # Simple linear transfer of B, includes all batches in sequence
-            rt.fill(B_L3L1_fifos[col].prod(), B, B_tap, task_group=tg_b)
+            rt.fill(B_L3L1_fifos[col].prod(), B, B_tap, tile=Tile(col, 0), task_group=tg_b)
         for batch in range(num_batches):
             tg_ac = rt.task_group()
             for col in range(cols):
                 rt.fill(
-                    A_L3L1_fifos[col].prod(), A, A_taps[col][batch], task_group=tg_ac
+                    A_L3L1_fifos[col].prod(), A, A_taps[col][batch],
+                    tile=Tile(col, 0), task_group=tg_ac,
                 )
             for col in range(cols):
                 rt.drain(
                     C_L1L3_fifos[col].cons(),
                     C,
                     C_taps[col][batch],
+                    tile=Tile(col, 0),
                     task_group=tg_ac,
                     wait=True,
                 )

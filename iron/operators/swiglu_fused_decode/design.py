@@ -11,7 +11,7 @@ from aie.dialects.aie import *
 from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU1, NPU2
+from aie.iron.device import NPU1, NPU2, Tile
 
 """
 Fused SwiGLU decode design: 2-stage tile pipeline.
@@ -217,6 +217,7 @@ def my_swiglu_fused_decode(
                 stage1_matvec,
                 stage1_silu_mul,
             ],
+            tile=Tile(i, 2),
         )
         for i in range(cols)
     ]
@@ -230,6 +231,7 @@ def my_swiglu_fused_decode(
                 C_fifos[i].prod(),
                 stage2_matvec,
             ],
+            tile=Tile(i, 3),
         )
         for i in range(cols)
     ]
@@ -284,11 +286,11 @@ def my_swiglu_fused_decode(
         rt.start(*stage1_workers, *stage2_workers)
         tg = rt.task_group()
         for i in range(cols):
-            rt.fill(A1_fifos[i].prod(), W, A1_taps[i], task_group=tg)
-            rt.fill(B_fifos[i].prod(), B, task_group=tg)
-            rt.fill(A2_fifos[i].prod(), W, A2_taps[i], task_group=tg)
+            rt.fill(A1_fifos[i].prod(), W, A1_taps[i], tile=Tile(i, 0), task_group=tg)
+            rt.fill(B_fifos[i].prod(), B, tile=Tile(i, 0), task_group=tg)
+            rt.fill(A2_fifos[i].prod(), W, A2_taps[i], tile=Tile(i, 0), task_group=tg)
         for i in range(cols):
-            rt.drain(C_fifos[i].cons(), C, C_taps[i], task_group=tg, wait=True)
+            rt.drain(C_fifos[i].cons(), C, C_taps[i], tile=Tile(i, 0), task_group=tg, wait=True)
         rt.finish_task_group(tg)
 
     return Program(dev_ty, rt).resolve_program()
