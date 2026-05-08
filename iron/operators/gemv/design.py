@@ -9,7 +9,8 @@ from aie.dialects.aie import T
 from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import Tile
+from aie.iron.placers import SequentialPlacer
+REMOVED
 
 """
 Matrix-vector design
@@ -123,7 +124,6 @@ def my_matvec(
                 C_L1L3_fifos[i].prod(),
                 matvec,
             ],
-            tile=Tile(i, 2),
         )
         for i in range(cols)
     ]
@@ -191,4 +191,4 @@ def my_matvec(
             rt.finish_task_group(tg_ac)
         rt.finish_task_group(tg_b)
 
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt).resolve_program(SequentialPlacer())

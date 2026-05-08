@@ -8,7 +8,8 @@ import argparse
 import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU1, NPU2, Tile
+from aie.iron.placers import SequentialPlacer
+from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -59,7 +60,6 @@ def my_silu_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_s
                 of_outs[i].prod(),
                 silu_mul_bf16,
             ],
-            tile=Tile(i, 2),
         )
         for i in range(num_columns)
     ]
@@ -109,7 +109,7 @@ def my_silu_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_s
         rt.finish_task_group(tg)
 
     # Place program components and generate an MLIR module
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt).resolve_program(SequentialPlacer())
 
 
 if __name__ == "__main__":

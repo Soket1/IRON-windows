@@ -11,7 +11,8 @@ from aie.dialects.aie import *
 from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU1, NPU2, Tile
+from aie.iron.placers import SequentialPlacer
+from aie.iron.device import NPU1, NPU2
 
 """
 Dual matrix-vector + SiLU + elementwise multiply design.
@@ -111,7 +112,6 @@ def my_dual_gemv_silu_mul(dev, cols, M, K, m_input, m_output=None):
                 matvec,
                 silu_mul_fn,
             ],
-            tile=Tile(i, 2),
         )
         for i in range(cols)
     ]
@@ -150,7 +150,7 @@ def my_dual_gemv_silu_mul(dev, cols, M, K, m_input, m_output=None):
             rt.drain(C_fifos[i].cons(), C, C_taps[i], task_group=tg, wait=True)
         rt.finish_task_group(tg)
 
-    return Program(dev_ty, rt).resolve_program()
+    return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
 if __name__ == "__main__":

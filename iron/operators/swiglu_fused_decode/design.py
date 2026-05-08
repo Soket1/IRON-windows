@@ -11,7 +11,8 @@ from aie.dialects.aie import *
 from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU1, NPU2, Tile
+from aie.iron.placers import SequentialPlacer
+from aie.iron.device import NPU1, NPU2
 
 """
 Fused SwiGLU decode design: 2-stage tile pipeline.
@@ -217,7 +218,6 @@ def my_swiglu_fused_decode(
                 stage1_matvec,
                 stage1_silu_mul,
             ],
-            tile=Tile(i, 2),
         )
         for i in range(cols)
     ]
@@ -231,7 +231,6 @@ def my_swiglu_fused_decode(
                 C_fifos[i].prod(),
                 stage2_matvec,
             ],
-            tile=Tile(i, 3),
         )
         for i in range(cols)
     ]
@@ -293,7 +292,7 @@ def my_swiglu_fused_decode(
             rt.drain(C_fifos[i].cons(), C, C_taps[i], task_group=tg, wait=True)
         rt.finish_task_group(tg)
 
-    return Program(dev_ty, rt).resolve_program()
+    return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
 if __name__ == "__main__":

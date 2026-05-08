@@ -10,6 +10,7 @@ from aie.dialects.aie import *
 from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2
 
 """
@@ -382,7 +383,7 @@ def my_flowkv_decode(
 
             rt.finish_task_group(tg)
 
-    return Program(dev_ty, rt).resolve_program()
+    return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
 if __name__ == "__main__":

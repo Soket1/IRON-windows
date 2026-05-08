@@ -5,7 +5,8 @@ from ml_dtypes import bfloat16
 import numpy as np
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU1, NPU2, Tile
+from aie.iron.placers import SequentialPlacer
+from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -71,7 +72,6 @@ def my_rms_norm(
                 of_outs[i * num_channels + j].prod(),
                 rms_norm_kernel,
             ],
-            tile=Tile(i, 2),
         )
         for i in range(num_columns)
         for j in range(num_channels)
@@ -123,4 +123,4 @@ def my_rms_norm(
         rt.finish_task_group(tg)
 
     # Place program components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt).resolve_program(SequentialPlacer())

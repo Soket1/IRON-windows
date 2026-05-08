@@ -5,6 +5,7 @@ from ml_dtypes import bfloat16
 import numpy as np
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -128,4 +129,4 @@ def channeled_unary_design(
         rt.finish_task_group(tg)
 
     # Place components and generate an MLIR module
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt).resolve_program(SequentialPlacer())

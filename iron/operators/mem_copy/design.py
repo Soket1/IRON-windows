@@ -15,6 +15,7 @@ from aie.iron import (
     Runtime,
     Worker,
 )
+from aie.iron.placers import SequentialPlacer
 from aie.iron.device import Tile, NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
@@ -403,4 +404,4 @@ def my_mem_copy(
                     objfifo_idx += partial_config.num_cores_with_full_tiles
 
     # Place components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt).resolve_program(SequentialPlacer())

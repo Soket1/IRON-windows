@@ -19,6 +19,7 @@ from aie.iron import (
     Buffer,
     WorkerRuntimeBarrier,
 )
+from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU2, Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
@@ -891,5 +892,5 @@ def fused_mha(
     my_program = Program(dev_ty, rt)
 
     # Place components (assign them resources on the device) and generate an MLIR module
-    module = my_program.resolve_program()
+    module = my_program.resolve_program(SequentialPlacer())
     return module
