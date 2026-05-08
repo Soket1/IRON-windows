@@ -78,7 +78,7 @@ class AIESwiGLUDecode(AIEOperatorBase):
             "--xclbin-kernel-id=0x902",
         ]
         gemv_2_xclbin.kernel_name = "swiglu_gemv_2"
-        gemv_2_xclbin.depends += [fused_xclbin]
+        gemv_2_xclbin.dependencies.add(fused_xclbin)
         artifacts.append(gemv_2_xclbin)
         artifacts.append(gemv_2_insts)
 

@@ -463,6 +463,13 @@ class ShellCompilationCommand(CompilationCommand):
                 file=sys.stderr,
             )
             return False
+        # On Windows, .py scripts cannot be launched directly via
+        # CreateProcess (WinError 193).  Prepend the current Python
+        # interpreter so the script is executed correctly.
+        if sys.platform == "win32" and exe.endswith(".py"):
+            self.command = [sys.executable] + self.command
+            exe = self.command[0]
+
         try:
             result = subprocess.run(
                 self.command,

@@ -97,7 +97,7 @@ class AIESwiGLUPrefill(AIEOperatorBase):
             "--xclbin-kernel-id=0x902",
         ]
         silu_mul_xclbin.kernel_name = "swiglu_silu_mul"
-        silu_mul_xclbin.depends += [gemm_1_xclbin]
+        silu_mul_xclbin.dependencies.add(gemm_1_xclbin)
         artifacts.append(silu_mul_insts)
 
         gemm_2 = GEMM(
@@ -115,7 +115,7 @@ class AIESwiGLUPrefill(AIEOperatorBase):
             "--xclbin-kernel-id=0x903",
         ]
         gemm_2_xclbin.kernel_name = "swiglu_gemm_2"
-        gemm_2_xclbin.depends += [silu_mul_xclbin]
+        gemm_2_xclbin.dependencies.add(silu_mul_xclbin)
         artifacts.append(gemm_2_xclbin)
         artifacts.append(gemm_2_insts)
 
