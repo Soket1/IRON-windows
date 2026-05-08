@@ -821,9 +821,6 @@ class PeanoCompilationRule(CompilationRule):
                 _generic_cxx = self._cxx_include.parent.parent.parent / "c++" / "v1"
                 if _generic_cxx.is_dir() and _generic_cxx != self._cxx_include:
                     extra_include_flags += ["-isystem", str(_generic_cxx)]
-                # Tell libc++ there is no C library (defines mbstate_t internally,
-                # uses _LIBCPP_USING_IF_EXISTS for missing symbols).
-                extra_include_flags += ["-D_LIBCPP_HAS_NO_LIBC"]
 
             # On Windows, include a minimal C library shim before any other
             # headers so that libc++ can find size_t, memcpy, mbstate_t, etc.

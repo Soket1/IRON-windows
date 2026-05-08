@@ -1,7 +1,7 @@
 /*
  * Minimal C library shim for bare-metal AIE targets on Windows.
  *
- * Peano from the win64.o conda package does not ship a C standard library.
+ * Peano from the win64.o conda package does not ship a full C standard library.
  * libc++ (from llvm-aie) needs basic C primitives to compile.
  * This header is included via -include before any other header.
  */
@@ -9,14 +9,17 @@
 #ifndef _AIE_PLATFORM_SHIM_H
 #define _AIE_PLATFORM_SHIM_H
 
-/* Tell libc++ there is no C library.  Must be defined BEFORE any libc++
-   header is included.  libc++ uses this to define mbstate_t internally
-   and to use _LIBCPP_USING_IF_EXISTS for missing C symbols. */
-#ifndef _LIBCPP_HAS_NO_LIBC
-#define _LIBCPP_HAS_NO_LIBC
+/* ---- Skip libc++ __mbstate_t.h entirely ----
+   The file uses __has_include_next(<wchar.h>) which fails on bare-metal AIE.
+   We define its header guard and provide mbstate_t ourselves. */
+#ifndef _LIBCPP___MBSTATE_T_H
+#define _LIBCPP___MBSTATE_T_H
 #endif
-#ifndef _LIBCPP_HAS_NO_WIDE_CHARACTERS
-#define _LIBCPP_HAS_NO_WIDE_CHARACTERS
+#ifndef __mbstate_t_defined
+#define __mbstate_t_defined
+typedef struct {
+    char __mbstate8[8];
+} mbstate_t;
 #endif
 
 /* ---- size_t ---- */
@@ -42,24 +45,40 @@ typedef __PTRDIFF_TYPE__ ptrdiff_t;
 
 /* Note: wchar_t is a built-in C++ keyword in Peano/Clang — no typedef needed. */
 
-/* ---- mbstate_t ----
-   libc++ __mbstate_t.h uses __has_include_next(<wchar.h>) which does not
-   work reliably on Windows bare-metal.  Define the header guard to skip
-   __mbstate_t.h entirely, and provide mbstate_t ourselves. */
-#ifndef _LIBCPP___MBSTATE_T_H
-#define _LIBCPP___MBSTATE_T_H
-#endif
-#ifndef __mbstate_t_defined
-#define __mbstate_t_defined
-typedef struct {
-    char __mbstate8[8];
-} mbstate_t;
-#endif
-
 /* ---- div_t / ldiv_t / lldiv_t ---- */
 typedef struct { int quot, rem; } div_t;
 typedef struct { long quot, rem; } ldiv_t;
 typedef struct { long long quot, rem; } lldiv_t;
+
+/* ---- stdio macros (for libc++ cstdio / char_traits) ---- */
+#ifndef EOF
+#define EOF (-1)
+#endif
+#ifndef BUFSIZ
+#define BUFSIZ 1024
+#endif
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
+#ifndef FILENAME_MAX
+#define FILENAME_MAX 260
+#endif
+#ifndef FOPEN_MAX
+#define FOPEN_MAX 20
+#endif
+#ifndef TMP_MAX
+#define TMP_MAX 238328
+#endif
+#ifndef L_tmpnam
+#define L_tmpnam 260
+#endif
+#ifndef _IOFBF
+#define _IOFBF 0
+#define _IOLBF 1
+#define _IONBF 2
+#endif
 
 /* ---- FP classification macros (for libc++ math.h) ---- */
 #ifndef FP_NAN
@@ -97,7 +116,7 @@ typedef struct { long long quot, rem; } lldiv_t;
 #define HUGE_VALL      __builtin_infl()
 #endif
 
-/* ---- C string / memory functions ---- */
+/* ---- C string / memory / stdio functions ---- */
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -115,6 +134,12 @@ int strcmp(const char *__s1, const char *__s2);
 int strncmp(const char *__s1, const char *__s2, size_t __n);
 char *strcat(char *__dst, const char *__src);
 char *strncat(char *__dst, const char *__src, size_t __n);
+
+/* stdio — declare so libc++ cstdio can import them via using declarations.
+   These will be provided by Peano's own <stdio.h> at link time. */
+typedef struct _FILE FILE;
+int remove(const char *__filename);
+int rename(const char *__old, const char *__new);
 
 /* ---- stdlib primitives ---- */
 int abs(int __n);
