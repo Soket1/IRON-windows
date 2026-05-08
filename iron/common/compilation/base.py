@@ -554,6 +554,12 @@ class AieccCompilationRule(CompilationRule):
     def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
         self.build_dir = build_dir
         self.peano_dir = peano_dir
+        self.mlir_aie_dir = mlir_aie_dir
+        # Build a base environment that includes PEANO_INSTALL_DIR so that
+        # the C++ aiecc binary (and child clang/opt/llc invocations) can
+        # find the Peano tools even when they live outside the default
+        # win64.o/tools/peano directory (common on Windows pip installs).
+        self._base_env = {**os.environ, "PEANO_INSTALL_DIR": str(peano_dir)}
         self.aiecc_path = self._resolve_aiecc(mlir_aie_dir)
         super().__init__(*args, **kwargs)
 
@@ -620,7 +626,7 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 os.path.abspath(artifact.mlir_input.filename),
             ]
             commands.append(
-                ShellCompilationCommand(compile_cmd, cwd=str(self.build_dir))
+                ShellCompilationCommand(compile_cmd, cwd=str(self.build_dir), env=self._base_env)
             )
             artifact.available = True
 
@@ -688,7 +694,7 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
             compile_cmd += [os.path.abspath(mlir_source.filename)]
 
             commands.append(
-                ShellCompilationCommand(compile_cmd, cwd=str(self.build_dir))
+                ShellCompilationCommand(compile_cmd, cwd=str(self.build_dir), env=self._base_env)
             )
 
             # There may be multiple targets that require an xclbin/insts.bin from the same MLIR with different names; copy them
