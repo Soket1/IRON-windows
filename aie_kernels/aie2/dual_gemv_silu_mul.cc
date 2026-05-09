@@ -13,8 +13,14 @@
 #include <stdint.h>
 #include <type_traits>
 
-static bfloat16 left_buf[2048] __attribute__((aligned(64)));
-static bfloat16 right_buf[2048] __attribute__((aligned(64)));
+// Buffer size must be >= m_output (= hidden_dim / num_aie_columns).
+// Overridden at compile time via -DM_OUTPUT_MAX=N by the operator.
+#ifndef M_OUTPUT_MAX
+#define M_OUTPUT_MAX 4096
+#endif
+
+static bfloat16 left_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
+static bfloat16 right_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
 
 template <uint32_t r>
 void matvec_vectorized(uint32_t m,
