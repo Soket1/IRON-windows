@@ -1,7 +1,7 @@
 # MLIR-AIE на Windows: полный гайд
 
 > Руководство по программированию AMD Ryzen AI NPU через MLIR-AIE / IRON на Windows (нативно, без WSL).
-> Актуально на май 2026, mlir_aie v1.3.1.
+> Актуально на май 2026, mlir_aie nightly 0.0.1.2026033104.
 
 ---
 
@@ -81,7 +81,7 @@
 | Компонент | Зачем | Откуда |
 |---|---|---|
 | **Python 3.10–3.14** | IRON, mlir_aie | [python.org](https://www.python.org/downloads/) или Microsoft Store |
-| **mlir_aie wheel** | MLIR Python bindings, aiecc | `pip install mlir_aie==1.3.1` |
+| **mlir_aie wheel** | MLIR Python bindings, aiecc | `pip install mlir_aie==0.0.1.2026033104+e4f35d6` |
 | **llvm-aie (Peano)** | AIE core compiler (clang++) | `pip install llvm-aie` |
 | **XRT (Xilinx Runtime)** | Доступ к NPU из хоста | [AMD Ryzen AI SDK](https://ryzenai.docs.amd.com/en/latest/inst/install.html) |
 | **NPU Driver** | Драйвер для Ryzen AI NPU | Там же, от AMD |
@@ -98,7 +98,7 @@
 
 ### Совместимость
 
-| Python | mlir_aie v1.3.1 | llvm-aie | XRT |
+| Python | mlir_aie nightly | llvm-aie | XRT |
 |---|---|---|---|
 | 3.10 | ✅ win_amd64 | ✅ | ✅ |
 | 3.11 | ✅ win_amd64 | ✅ | ✅ |
@@ -146,8 +146,8 @@ python -m pip install --upgrade pip
 ### 4.3. Установка mlir_aie и Peano
 
 ```powershell
-# MLIR-AIE (Windows wheel, v1.3.1)
-pip install mlir_aie==1.3.1 -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.3.1
+# MLIR-AIE (Windows wheel, nightly)
+pip install mlir_aie==0.0.1.2026033104+e4f35d6 -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-3
 
 # Peano (AIE core compiler — ставится как .exe)
 pip install llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
@@ -414,7 +414,33 @@ python run.py --prompt "Hello world"
 
 ### `ModuleNotFoundError: No module named 'aie.iron.placers'`
 
-**Причина:** mlir-aie удалил `aie.iron.placers.SequentialPlacer` (PR #3016, апрель 2026). Если вы используете mlir-aie новее v1.3.1, IRON-windows должен быть на последней версии `devel`.
+**Причина:** Используется stable `mlir_aie v1.3.1`, где `SequentialPlacer` удалён.
+
+**Решение:** IRON-windows работает с **nightly** версией (`0.0.1.2026033104+e4f35d6`), где `SequentialPlacer` присутствует:
+```powershell
+pip install mlir_aie==0.0.1.2026033104+e4f35d6 -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-3
+```
+
+---
+
+### `ObjectFifoHandle.split()/forward()/join() got an unexpected keyword argument 'tile'`
+
+**Причина:** В nightly `mlir_aie 0.0.1.2026033104` методы `ObjectFifo` не принимают параметр `tile`. В stable `v1.3.1` он использовался для ручного размещения.
+
+**Решение:** IRON-windows уже исправлен — `tile=` убран из всех design файлов. Если пишете свой дизайн:
+```python
+# ❌ Неправильно (TypeError)
+mem = fifo.cons().forward(obj_type=ty, name="mem", tile=Tile(col, 1))
+
+# ✅ Правильно (SequentialPlacer расставит автоматически)
+mem = fifo.cons().forward(obj_type=ty, name="mem")
+```
+
+---
+
+### `NameError: name 'REMOVED' is not defined`
+
+**Причина:** Остаточный токен `REMOVED` в design файле после миграции.
 
 **Решение:**
 ```powershell
@@ -422,7 +448,17 @@ cd IRON-windows
 git pull origin devel
 ```
 
-Если вы пишете свой дизайн, не используйте `from aie.iron.placers import SequentialPlacer`. Placement теперь автоматический — компилятор расставляет тайлы через `--aie-place-tiles` pass.
+---
+
+### Повторные попытки компиляции при каждом токене
+
+**Причина:** Если компиляция оператора (SwiGLU, QKV) падает, ggml-xdna пытается скомпилировать заново при каждом токене (45+ раз за генерацию).
+
+**Решение:** Исправлено в IRON-windows — неудачные компиляции кэшируются. Обновите:
+```powershell
+cd IRON-windows
+git pull origin devel
+```
 
 ---
 
@@ -462,7 +498,7 @@ call "C:\Xilinx\XRT\setup.bat"
 
 **Причина:** Peano не найден в PATH.
 
-**Решение:** mlir_aie v1.3.1 находит Peano автоматически через pip metadata. Если нет:
+**Решение:** mlir_aie nightly находит Peano автоматически через pip metadata. Если нет:
 ```powershell
 # Найти путь к Peano
 python -c "import pathlib, importlib; print(pathlib.Path(importlib.import_module('llvm_aie').__file__).parent / 'bin')"
@@ -505,7 +541,8 @@ $env:PATH += ";<путь_из_команды_выше>"
 - [Windows Setup (official docs)](https://xilinx.github.io/mlir-aie/buildHostWin.html)
 - [PR #2677: Windows wheels](https://github.com/Xilinx/mlir-aie/pull/2677)
 - [PR #3024: test_utils Windows fix](https://github.com/Xilinx/mlir-aie/pull/3024)
-- [v1.3.1 Release (Windows wheels)](https://github.com/Xilinx/mlir-aie/releases/tag/v1.3.1)
+- [Nightly wheels (latest)](https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-3)
+- [v1.3.1 Release (stable)](https://github.com/Xilinx/mlir-aie/releases/tag/v1.3.1)
 
 ### Архитектура
 
@@ -535,8 +572,8 @@ python -m venv ironenv
 ironenv\Scripts\activate
 pip install --upgrade pip
 
-# 5. Установить toolchain
-pip install mlir_aie==1.3.1 -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.3.1
+# 5. Установить toolchain (nightly)
+pip install mlir_aie==0.0.1.2026033104+e4f35d6 -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-3
 pip install llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 
 # 6. Зависимости
@@ -556,4 +593,4 @@ python .\run_mlir_aie_example.py run
 
 ---
 
-*Последнее обновление: май 2026. mlir_aie v1.3.1, IRON-windows devel.*
+*Последнее обновление: май 2026. mlir_aie nightly 0.0.1.2026033104, IRON-windows devel.*
