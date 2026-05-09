@@ -404,4 +404,4 @@ def my_mem_copy(
                     objfifo_idx += partial_config.num_cores_with_full_tiles
 
     # Place components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    return Program(dev, rt).resolve_program(SequentialPlacer(num_channels))
