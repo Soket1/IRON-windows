@@ -647,7 +647,6 @@ def fused_mha(
                     worker_barrier_list[0][i],
                     idx_buffer_qk,
                 ],
-                tile=Tile(col=i, row=2),
                 stack_size=0xD00,
                 while_true=False,
             )
@@ -676,7 +675,6 @@ def fused_mha(
                     idx_buffer_softmax,
                     scale_buffer_softmax,
                 ],
-                tile=Tile(col=i, row=3),
                 stack_size=0xD00,
                 while_true=False,
             )
@@ -701,7 +699,6 @@ def fused_mha(
                     worker_barrier_list[2][i],
                     idx_buffer_pv,
                 ],
-                tile=Tile(col=i, row=4),
                 stack_size=0xD00,
                 while_true=False,
             )

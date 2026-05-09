@@ -492,7 +492,6 @@ def my_matmul(
                         workerBarriers[row][col],
                         acc_buffer,
                     ],
-                    tile=Tile(tile_col, tile_row),
                     stack_size=0xD00,
                 )
             )
