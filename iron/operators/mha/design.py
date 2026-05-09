@@ -875,5 +875,5 @@ def fused_mha(
     my_program = Program(dev_ty, rt)
 
     # Place components (assign them resources on the device) and generate an MLIR module
-    module = my_program.resolve_program(SequentialPlacer())
+    module = my_program.resolve_program()
     return module
