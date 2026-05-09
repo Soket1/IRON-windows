@@ -306,7 +306,6 @@ def fused_mha(
     memK = inK.cons().forward(
         name="memK",
         dims_to_stream=k_dims,
-        tile=Tile(col=3, row=1),
         depth=of_depth,
     )  # Broadcast, give this handle to N pipelines
 
@@ -322,7 +321,6 @@ def fused_mha(
     memV = inV.cons().forward(
         name="memV",
         dims_to_stream=v_dims,
-        tile=Tile(col=4, row=1),
         depth=of_depth,
     )  # Broadcast, give this handle to N pipelines
 
@@ -379,7 +377,6 @@ def fused_mha(
         obj_types=[q_ty] * number_of_pipelines_join_distribute,
         names=[f"outO{i}" for i in range(number_of_pipelines_join_distribute)],
         depths=[of_depth] * number_of_pipelines_join_distribute,
-        tile=Tile(col=6, row=1),
     )  # Join onto the output OF
     if number_of_pipelines > 6:
         memO2 = ObjectFifo(
@@ -392,7 +389,6 @@ def fused_mha(
             obj_types=[q_ty] * number_of_pipelines_join_distribute,
             names=[f"outO2{i}" for i in range(number_of_pipelines_join_distribute)],
             depths=[of_depth] * number_of_pipelines_join_distribute,
-            tile=Tile(col=7, row=1),
         )
 
     def batched_matmul_qk(

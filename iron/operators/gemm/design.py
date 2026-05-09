@@ -400,7 +400,6 @@ def my_matmul(
                 obj_type=B_l1_ty,
                 name=f"B_L2L1_{col}",
                 dims_to_stream=dims_to_stream,
-                tile=Tile(col, 1),
             )
         )
 
@@ -426,7 +425,6 @@ def my_matmul(
                 obj_types=[C_l1_ty] * n_aie_rows,
                 names=[f"C_L1L2_{col}_{row}" for row in range(n_aie_rows)],
                 depths=[fifo_depth_out] * n_aie_rows,
-                tile=Tile(col, 1),
             )
         )
         for j in range(n_aie_rows):
