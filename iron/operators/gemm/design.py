@@ -380,9 +380,6 @@ def my_matmul(
                 obj_types=[A_l1_ty] * (stop_row - start_row),
                 names=[f"A_L2L1_{row}" for row in range(start_row, stop_row)],
                 dims_to_stream=dims_to_stream,
-                tile=Tile(
-                    2 * i if n_aie_cols == 8 else i, 1
-                ),  # alternate columns in full 4x8 NPU2 case
             )
         )
 

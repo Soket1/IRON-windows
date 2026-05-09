@@ -277,7 +277,6 @@ def fused_mha(
         names=[f"memQ{i}" for i in range(number_of_pipelines_join_distribute)],
         dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
         depths=[of_depth] * number_of_pipelines_join_distribute,
-        tile=Tile(col=6, row=1),
     )  # Split between N pipelines
     if number_of_pipelines > 6:
         inQ2 = ObjectFifo(
@@ -290,7 +289,6 @@ def fused_mha(
             names=[f"memQ2{i}" for i in range(number_of_pipelines_join_distribute)],
             dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
             depths=[of_depth] * number_of_pipelines_join_distribute,
-            tile=Tile(col=7, row=1),
         )  # Split between N pipelines
 
     # VJUNG: The compiler will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
