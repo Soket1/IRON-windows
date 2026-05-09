@@ -804,6 +804,7 @@ def fused_mha(
                         tap=Q_tiles[
                             2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
                         ],
+                        tile=Tile(col=4, row=0),
                         task_group=tg,
                     )
                     rt.fill(
@@ -814,6 +815,7 @@ def fused_mha(
                             + q_block_idx * 2
                             + 1
                         ],
+                        tile=Tile(col=4, row=0),
                         task_group=tg,
                     )
                 else:
@@ -821,6 +823,7 @@ def fused_mha(
                         inQ.prod(),
                         Q,
                         tap=Q_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
+                        tile=Tile(col=4, row=0),
                         task_group=tg,
                     )
 
@@ -829,12 +832,14 @@ def fused_mha(
                     inK.prod(),
                     K,
                     tap=K_tiles[kv_head_idx],
+                    tile=Tile(col=5, row=0),
                     task_group=tg,
                 )
                 rt.fill(
                     inV.prod(),
                     V,
                     tap=V_tiles[kv_head_idx],
+                    tile=Tile(col=6, row=0),
                     task_group=tg,
                 )
 
@@ -846,6 +851,7 @@ def fused_mha(
                             2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
                         ],
                         wait=True,
+                        tile=Tile(col=7, row=0),
                         task_group=tg,
                     )
                     rt.drain(
@@ -857,6 +863,7 @@ def fused_mha(
                             + 1
                         ],
                         wait=True,
+                        tile=Tile(col=7, row=0),
                         task_group=tg,
                     )
                 else:
@@ -865,6 +872,7 @@ def fused_mha(
                         O,
                         tap=O_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
                         wait=True,
+                        tile=Tile(col=7, row=0),
                         task_group=tg,
                     )
 
