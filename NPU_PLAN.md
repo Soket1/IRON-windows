@@ -228,3 +228,47 @@ PYTHON:      C:\Python313\python.exe
 MODEL:       models\llama-3.2-1b-instruct-BF16.gguf
 REPO:        https://github.com/Soket1/IRON-windows (branch: devel)
 ```
+
+---
+
+## Profiling results (2026-05-10, test_timing.bat, cached kernels)
+
+**Steady-state: 5.8 t/s** (1.0 t/s was including compilation)
+
+### Per-dispatch timing (decode M=1)
+
+| Operation | Count | Avg total | rl_wait (NPU compute) |
+|---|---|---|---|
+| QKV | 112 | 1165 µs | — |
+| SwiGLU | 115 | 3620 µs | ~3500 µs |
+| decode_batch | 112 | 1055 µs | — |
+
+### Per-token budget (12 layers, 172 ms/token at 5.8 t/s)
+
+| Component | Per layer | × 12 | Total | % |
+|---|---|---|---|---|
+| SwiGLU NPU | 3.62 ms | 12 | 43.4 ms | 25% |
+| QKV NPU | 1.17 ms | 12 | 14.0 ms | 8% |
+| decode_batch NPU | 1.06 ms | 12 | 12.7 ms | 7% |
+| **NPU subtotal** | | | **70 ms** | **41%** |
+| **CPU + overhead** | | | **102 ms** | **59%** |
+
+### Key findings
+
+1. **Steady-state is 5.8 t/s**, not 1.0 t/s (compilation was included in first measurement)
+2. **NPU = 70 ms/token (41%)** — SwiGLU dominates (43 ms)
+3. **CPU = 102 ms/token (59%)** — attention (Q@K^T, softmax, scores@V) + RMS_NORM + residual
+4. **tblock_match=0** still holds — decode transformer block not matching
+5. **decode_batch only captures 1 GEMV per flush** — CPU ops between GEMVs force flush
+
+### Revised priorities
+
+**Priority 1: Reduce CPU time (102 ms → target 30 ms)**
+- Attention on NPU: Q@K^T + softmax + scores@V (~60-70 ms savings)
+- RMSNorm on NPU: needs two-pass reduction (~10-15 ms savings)
+
+**Priority 2: Reduce NPU time (70 ms → target 40 ms)**
+- SwiGLU is 43 ms — already optimized (fused gate+up+down)
+- QKV + decode_batch = 27 ms — could merge into single dispatch (~5 ms savings)
+
+**Target: 172 ms → 70 ms → ~14 t/s**
