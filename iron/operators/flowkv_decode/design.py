@@ -64,7 +64,8 @@ def my_flowkv_decode(
     group_size = num_heads // num_kv_heads
     num_chunks = seq_len // chunk_size
     assert seq_len % chunk_size == 0, "seq_len must be divisible by chunk_size"
-    assert num_kv_heads % num_cols == 0, "num_kv_heads must be divisible by num_cols"
+    assert num_cols == 1 or num_kv_heads % num_cols == 0, \
+        "num_kv_heads must be divisible by num_cols (or num_cols=1 for per-head dispatch)"
 
     dtype_in = np.dtype[bfloat16]
 

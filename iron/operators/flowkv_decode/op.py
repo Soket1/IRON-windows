@@ -85,8 +85,8 @@ class AIEFlowKVDecode(AIEOperatorBase):
         ), "num_heads must be divisible by num_kv_heads"
         assert seq_len % chunk_size == 0, "seq_len must be divisible by chunk_size"
         assert (
-            num_kv_heads % num_cols == 0
-        ), "num_kv_heads must be divisible by num_cols"
+            num_cols == 1 or num_kv_heads % num_cols == 0
+        ), "num_kv_heads must be divisible by num_cols (or num_cols=1 for per-head dispatch)"
         assert head_dim == 64, "Only head_dim=64 is supported"
 
         self.num_heads = num_heads
