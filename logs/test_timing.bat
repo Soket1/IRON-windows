@@ -27,9 +27,9 @@ set XDNA_ENABLE_DECODE_BATCH=1
 
 set "MODEL_PATH=models\llama-3.2-1b-instruct-BF16.gguf"
 
-build\bin\Release\llama-cli.exe -m "%MODEL_PATH%" -p "Hello" -n 1 -c 512 -ngl 100 --no-mmap -fa off >nul 2>&1
-
-echo [1/2] Warmup done.
+echo Running warmup...
+build\bin\Release\llama-cli.exe -m "%MODEL_PATH%" -p "Hello" -n 1 -c 512 -ngl 100 --no-mmap -fa off
+echo Warmup exit code: %ERRORLEVEL%
 echo.
 echo [2/2] Running timing test (64 decode tokens)...
 
