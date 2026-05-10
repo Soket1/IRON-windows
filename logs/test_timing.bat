@@ -1,10 +1,7 @@
 @echo off
 setlocal
 
-:: ============================================================
-:: TEST 1: Compile-only run (warmup — discard timing)
-:: ============================================================
-echo [1/2] Warming up kernel cache (compilation run)...
+echo [1/2] Warming up kernel cache...
 
 set "AMD_DRIVER_DIR=C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_1a1aa059597c4810"
 set "PATH=%AMD_DRIVER_DIR%;%CD%;%PATH%"
@@ -30,15 +27,10 @@ set XDNA_ENABLE_DECODE_BATCH=1
 
 set "MODEL_PATH=models\llama-3.2-1b-instruct-BF16.gguf"
 
-:: Warmup: 1 token, no debug, discard output
 build\bin\Release\llama-cli.exe -m "%MODEL_PATH%" -p "Hello" -n 1 -c 512 -ngl 100 --no-mmap -fa off >nul 2>&1
 
-echo [1/2] Warmup done. Kernel cache populated.
+echo [1/2] Warmup done.
 echo.
-
-:: ============================================================
-:: TEST 2: Real timing run (compiled kernels, no compilation)
-:: ============================================================
 echo [2/2] Running timing test (64 decode tokens)...
 
 set XDNA_DEBUG=1
@@ -53,7 +45,7 @@ echo === Last 30 lines of XDNA debug ===
 powershell -Command "Get-Content xdna_timing.log -Tail 30"
 
 echo.
-echo === Per-token dispatch times (QKV + SwiGLU last 20 tokens) ===
+echo === Per-token dispatch times (QKV + SwiGLU, last 20 tokens) ===
 powershell -Command "Get-Content xdna_timing.log | Select-String 'qkv_prof.*M=1|swiglu_prof decode M=1' | Select-Object -Last 40"
 
 pause
