@@ -1,250 +1,224 @@
 # IRON-windows NPU Optimization Plan
 
+> Last updated: 2026-05-10, based on actual profiling data from `test_short1.bat`
+
 ## Status Summary
 
 | Component | Status | NPU? | Notes |
 |---|---|---|---|
-| RMSNorm | ❌ Broken | CPU (XDNA_ENABLE_RMS_NORM=0) | tile_size=32 normalizes per-chunk, not per-row |
-| Attention | 🔲 Not started | CPU | Priority #1 — 85% of decode latency |
-| FFN (gate/up/down GEMV) | 🔲 Not started | CPU | Priority #2 |
-| RoPE | 🔲 Not started | CPU | Small cost, low priority |
-| Softmax | 🔲 Not started | CPU | Needs reduction (like RMSNorm) |
-| QKV projection | 🔲 Not started | CPU | GEMV — similar to FFN |
+| QKV projection | ✅ Working | NPU | ~1.16 ms/dispatch |
+| SwiGLU (gate+up+silu+down) | ✅ Working | NPU | ~3.59 ms/dispatch |
+| Output projection (decode batch) | ✅ Working | NPU | ~1.7 ms/dispatch |
+| Attention (Q@K^T, softmax, scores@V) | ❌ CPU | CPU | Separate graph_compute calls |
+| RMSNorm | ❌ Broken | CPU | tile_size=32 bug |
+| Residual ADD | ❌ CPU | CPU | |
+| Transformer block fusion | ❌ Not matching | — | `tblock_match=0` for decode |
 
-## Current Performance
+## Profiling Data (Llama-3.2-1B-BF16, decode M=1)
 
-- **Decode speed**: ~2.5 t/s (llama-3.2-1b-bf16, NPU2/STX)
-- **Target**: 5-12 t/s
-- **Bottleneck**: Attention and FFN on CPU
+### Per-dispatch timing (average, 115 samples)
 
----
+| Operation | rl_build | rl_exec | rl_wait (NPU compute) | Total |
+|---|---|---|---|---|
+| SwiGLU decode | 54 µs | 51 µs | **3486 µs** | **3595 µs** |
+| QKV | — | — | — | **1157 µs** |
+| decode_batch flush | — | — | — | **~1700 µs** |
 
-## Phase 1: Attention → NPU (Priority #1)
+### Per-token budget (12 layers)
 
-**Expected gain**: 3-5× decode speed (2.5 → 8-12 t/s)
+| Component | Per layer | × 12 layers | % of 1000 ms |
+|---|---|---|---|
+| SwiGLU NPU | 3.59 ms | **43.1 ms** | 4.3% |
+| QKV NPU | 1.16 ms | **13.9 ms** | 1.4% |
+| decode_batch NPU | ~1.7 ms | **~20.4 ms** | 2.0% |
+| **NPU subtotal** | | **~77 ms** | **7.7%** |
+| CPU ops + overhead | | **~923 ms** | **92.3%** |
+| **Total** | | **~1000 ms** | **→ 1.0 t/s** |
 
-### What is attention?
+### Observed dispatch pattern per layer
 
-For each decode step:
 ```
-Q = x @ Wq          # [1, 2048] @ [2048, 2048] → [1, 2048]
-K = x @ Wk          # same
-V = x @ Wv          # same
-
-# Multi-head (32 heads × 64 dim each)
-scores = Q @ K^T / sqrt(64)    # [32, 1, seq_len]
-attn = softmax(scores)          # [32, 1, seq_len]
-out = attn @ V                  # [32, 1, 64]
-out = concat(heads) @ Wo        # [1, 2048]
-```
-
-### Sub-tasks
-
-#### 1a. QKV GEMV on NPU
-- `x @ Wq`, `x @ Wk`, `x @ Wv` — three matrix-vector products
-- Each: [1, 2048] × [2048, 2048]
-- Similar to FFN GEMV — reuse existing gemv_int8 infrastructure
-- **Challenge**: 3 separate GEMVs, need to batch or pipeline
-
-#### 1b. RoPE on NPU
-- Rotary position embedding on Q and K
-- Element-wise multiply with sin/cos tables
-- Simple kernel, low priority
-
-#### 1c. K cache management
-- KV cache: store K and V for all past tokens
-- For decode: append new K,V to cache, read full cache for attention
-- DMA pattern: write new KV, read full K cache
-
-#### 1d. Attention scores: Q @ K^T
-- Q: [n_heads, 1, head_dim] — single query per head
-- K: [n_heads, seq_len, head_dim] — full cache
-- Result: [n_heads, 1, seq_len] — scores per head
-- **This is a matrix-matrix multiply** (not GEMV) when seq_len > 1
-- For short seq_len (prefill): GEMV-like
-- For long seq_len: tiled GEMM on NPU
-
-#### 1e. Softmax on NPU
-- Input: [n_heads, 1, seq_len] — scores
-- Requires: max subtraction, exp, sum, divide
-- **Challenge**: reduction over seq_len dimension (like RMSNorm problem)
-- For short seq_len (≤32): single tile, works
-- For long seq_len: needs two-pass with reduction
-
-#### 1f. Attention: scores @ V
-- scores: [n_heads, 1, seq_len]
-- V: [n_heads, seq_len, head_dim]
-- Result: [n_heads, 1, head_dim]
-- Another matrix-matrix multiply
-
-#### 1g. Output projection
-- concat(heads) @ Wo — [1, 2048] × [2048, 2048]
-- Same as QKV GEMV
-
-### Attention implementation order
-
-1. **QKV GEMV** (1a) — biggest bang, reuse existing infra
-2. **Output projection GEMV** (1g) — same pattern
-3. **Q@K^T** (1d) — attention scores
-4. **scores@V** (1f) — attention output
-5. **Softmax** (1e) — needs reduction infra
-6. **RoPE** (1b) — low priority
-7. **KV cache DMA** (1c) — optimization
-
-### Key decision: fused vs staged
-
-**Option A — Fused attention kernel** (one NPU dispatch for all of attention):
-- Pros: minimal DMA round-trips, best latency
-- Cons: massive kernel, hard to debug, L1 memory pressure
-
-**Option B — Staged** (separate dispatch for each sub-op):
-- Pros: modular, debuggable, reuse components
-- Cons: more DMA overhead (5-6 round-trips per layer)
-
-**Recommendation**: Start with Option B (staged), fuse later when profiling shows DMA overhead matters.
-
----
-
-## Phase 2: FFN → NPU (Priority #2)
-
-**Expected gain**: 2-3× on FFN portion (~40% of decode)
-
-### Architecture (Llama-3.2-1B)
-```
-gate = x @ W_gate     # [1, 2048] → [1, 8192]
-up   = x @ W_up       # [1, 2048] → [1, 8192]
-h    = silu(gate) * up # element-wise
-out  = h @ W_down     # [1, 8192] → [1, 2048]
+graph_compute n_nodes=1   → SOFT_MAX (CPU, separate call)
+graph_compute n_nodes=32  → Main layer:
+  RMS_NORM    → CPU
+  MUL (gain)  → CPU
+  MUL_MAT ×3  → NPU via QKV dispatch (1.16 ms)
+  ROPE ×2     → CPU
+  SET_ROWS ×2 → CPU (KV cache writes)
+  ... (VIEW/RESHAPE/PERMUTE skipped) ...
+  MUL_MAT     → NPU via decode_batch (output proj, ~1.7 ms)
+  ADD         → CPU (residual)
+  RMS_NORM    → CPU
+  MUL (gain)  → CPU
+  GLU/SwiGLU  → NPU (3.59 ms)
+  ADD         → CPU (residual)
 ```
 
-### Sub-tasks
+### Token count discrepancy
 
-#### 2a. Gate/Up GEMV (fused)
-- Two GEMVs: [1, 2048] × [2048, 8192] each
-- Can fuse into single dispatch (already have fused gate/up infra in codebase)
-- Check if existing `fused_gemv_int8` works for this shape
+- Requested: 32 tokens
+- QKV M=1 dispatches: 112 ÷ 12 layers = **~9 decode tokens**
+- QKV M=2 dispatches: 32 ÷ 12 = **~3 warmup tokens**
+- SwiGLU M=2: 30, M=41: 15 (different code path)
+- **Only ~12 tokens actually generated** — not 32. Possible causes:
+  - Conversation mode (`-cnv`) generates fewer tokens
+  - Process exits early
+  - Compilation time included in 1.0 t/s measurement
 
-#### 2b. SiLU on NPU
-- Element-wise activation: silu(x) = x * sigmoid(x)
-- Already exists as `silu` kernel — verify it works for [1, 8192]
+## Critical unknowns (need profiling)
 
-#### 2c. Element-wise multiply
-- `silu(gate) * up` — simple element-wise
-- Already exists as `eltwise_mul` kernel
+1. **Where is the 923 ms?** CPU ops can't explain 923 ms for a 1B model. Possible:
+   - Compilation time included in measurement
+   - CPU↔NPU context switch overhead per dispatch (driver, DMA sync)
+   - CPU attention (Q@K^T, softmax, scores@V) is slower than expected
+   - Graph dispatch overhead (pattern matching per graph_compute call)
 
-#### 2d. Down GEMV
-- [1, 8192] × [8192, 2048]
-- Standard GEMV
+2. **Actual per-token steady-state time?** Need timing WITHOUT compilation.
 
-### FFN implementation order
+3. **CPU attention cost?** Need isolated measurement of Q@K^T + softmax + scores@V per layer.
 
-1. **Fused gate/up GEMV** (2a) — biggest gain
-2. **SiLU** (2b) — small kernel
-3. **Eltwise mul** (2c) — small kernel
-4. **Down GEMV** (2d) — same pattern as gate/up
+## What DOESN'T work (lessons learned)
 
----
+### ❌ Weighted RMSNorm patch (reverted)
+- `src[1]` is always NULL in this ggml version
+- Weight applied via separate `GGML_OP_MUL`, not inside `RMS_NORM`
+- Dead code, reverted in commit `a584e70`
 
-## Phase 3: RMSNorm → NPU (Low Priority)
+### ❌ RMSNorm on NPU (tile_size bug)
+- Kernel normalizes by `tile_size=32`, not by full row (2048)
+- Test passes because test tensor is (64, 32) — matches tile_size
+- Real model: hidden_dim=2048 >> 32 → wrong normalization
+- Fix needs two-pass with reduction — expensive, not worth it (~1% of time)
 
-**Expected gain**: <1% — not worth it until Phase 1+2 done
+### ❌ Transformer block fusion for decode
+- `tblock_match=0` because:
+  - Early-reject: `ne[1] < 32` blocks decode tokens (ne[1]=1)
+  - Gate: `seq_len >= 256` blocks decode (seq_len=1)
+  - Attention matcher requires `FLASH_ATTN_EXT` (decode uses expanded pattern)
+- **Even if fixed, impact is small**: RMSNorm can't be included (tile_size bug), so fusion only saves ~2 dispatches/layer (~3 ms), not 20
 
-### The bug
-Current kernel: `rms = sum(x²) / tile_size` where `tile_size=32`
-Correct: `rms = sum(x²) / full_row_size` (e.g., 2048)
+### ❌ Decode batch efficiency
+- Plans 4 batchable GEMVs but only captures 1 per flush
+- CPU ops between GEMVs force flush after each one
+- Same root cause: no block-level fusion
 
-### Fix: Two-pass RMSNorm
+## Revised priorities
 
-#### Pass 1: Partial sums
+### Priority 0: Profiling (MUST DO FIRST)
+
+Before optimizing, need to understand where 923 ms goes.
+
+**Action items:**
+1. Run with `XDNA_DEBUG=1` and add wall-clock timestamps to `ggml_backend_xdna_graph_compute`
+2. Measure per-graph_compute wall time
+3. Measure CPU attention ops isolation (disable NPU, pure CPU baseline)
+4. Measure steady-state per-token time (skip first 2 tokens as warmup)
+5. Check if 1.0 t/s includes compilation time
+
+**Env vars to add:**
 ```
-DMA → core0: sum(x²) over elements [0..255]
-DMA → core1: sum(x²) over elements [256..511]
-...
-DMA → core7: sum(x²) over elements [1792..2047]
-→ partial_sums[8] on host
-```
-
-#### Reduction
-```
-global_sum = sum(partial_sums)  // on host or single core
-```
-
-#### Pass 2: Normalize
-```
-DMA(global_sum) → all cores
-DMA(input) → all cores
-each core: output = input / sqrt(global_sum/2048 + eps)
-DMA ← output
-```
-
-### New files needed
-- `aie_kernels/aie2/rms_norm_pass1.cc` — partial sum kernel
-- `aie_kernels/aie2/rms_norm_pass2.cc` — normalize kernel
-- `iron/operators/rms_norm/design_two_pass.py` — two-pass DMA flow
-- `ggml-xdna.cpp` — two-pass dispatch logic with host-side reduction
-
-### Dependencies
-- Reduction infrastructure (may be shared with softmax reduction)
-- Only worth building when attention + FFN are on NPU
-
----
-
-## Phase 4: Remaining ops
-
-| Op | Strategy | Priority |
-|---|---|---|
-| RoPE | Simple element-wise, low cost | Low |
-| Softmax | Needs reduction (reuse RMSNorm infra) | Medium (needed for attention) |
-| Embedding lookup | Table lookup, DMA-bound | Low |
-| Argmax / sampling | Trivial, CPU is fine | None |
-
----
-
-## Infrastructure Needed
-
-### Reduction primitive (needed for RMSNorm + Softmax)
-
-Both RMSNorm and Softmax need global reduction across cores. Build once, reuse:
-
-```python
-# Generic reduction pattern
-def reduce_sum_across_cores(partial_values, num_cores):
-    # Option A: host-side (simple, adds 1 DMA round-trip)
-    # Option B: dedicated reduction core (faster, more complex)
-    # Option C: tree reduction via stream switches (fastest, hardest)
+# Add to test_short1.bat for profiling
+set XDNA_PROFILE=1       # if exists, enables wall-clock per-dispatch timing
 ```
 
-**Recommendation**: Start with host-side (Option A), optimize later.
+### Priority 1: Attention → NPU (if CPU attention is the bottleneck)
 
-### Existing kernels to reuse
+**Only if profiling confirms CPU attention > 500 ms/token.**
 
+Expected structure for decode attention on NPU:
+- Q@K^T: GEMV — [n_heads, 1, head_dim] × [n_heads, head_dim, seq_len]
+- Softmax: needs reduction over seq_len (like RMSNorm — same infra needed)
+- scores@V: GEMV — [n_heads, 1, seq_len] × [n_heads, seq_len, head_dim]
+
+**Blockers:**
+- Softmax needs global reduction (same problem as RMSNorm)
+- For short seq_len (≤32): single tile works
+- For long seq_len: two-pass needed
+
+**Possible shortcut:** If seq_len is small (≤64 during generation), softmax can fit in one tile. Start with seq_len ≤ 64 support, skip long-sequence for now.
+
+### Priority 2: Reduce dispatch overhead (if context switching is the bottleneck)
+
+**If profiling shows high per-dispatch overhead (>5 ms each):**
+
+Options:
+- Combine QKV + output_proj into single dispatch (save 1 dispatch/layer)
+- Combine SwiGLU dispatches (already done — fused gate+up+down)
+- Use `xrt::runlist` for back-to-back dispatches (already done for decode_batch)
+
+### Priority 3: RMSNorm → NPU (deferred)
+
+Only when:
+- Attention is on NPU (eliminates the 923 ms mystery)
+- Reduction infra built for softmax (reusable for RMSNorm)
+- All other ops on NPU — RMSNorm is last mile
+
+## Testing protocol
+
+### Quick baseline test (no NPU)
+```bat
+set XDNA_ENABLE_GEMV=0
+set XDNA_ENABLE_SWIGLU=0
+set XDNA_ENABLE_QKV=0
+set XDNA_ENABLE_RMS_NORM=0
+set XDNA_ENABLE_DECODE_BATCH=0
+```
+→ Pure CPU baseline. Compare with NPU enabled.
+
+### Steady-state timing test
+```bat
+set XDNA_ENABLE_GEMV=1
+set XDNA_ENABLE_SWIGLU=1
+set XDNA_ENABLE_QKV=1
+set XDNA_ENABLE_RMS_NORM=0
+set XDNA_ENABLE_DECODE_BATCH=1
+set XDNA_DEBUG=1
+```
+→ Look at last 5 tokens' dispatch times (skip warmup).
+
+### Isolate NPU vs CPU time
+Add wall-clock timestamps in `ggml_backend_xdna_graph_compute`:
+- Before/after each `xdna_delegate_range` (CPU range)
+- Before/after each QKV dispatch
+- Before/after each SwiGLU dispatch
+- Before/after each decode_batch flush
+
+## Existing infrastructure
+
+### Kernels (reuse as-is)
 | Kernel | File | Status |
 |---|---|---|
-| `rms_norm_bf16_vector` | `aie_kernels/aie2/rms_norm.cc` | Works per-tile |
-| `weighted_rms_norm` | same | Works per-tile |
-| `gemv_int8` | `aie_kernels/aie2/gemv_int8.cc` | Working |
-| `silu` | `aie_kernels/aie2/silu.cc` | Need to verify |
-| `eltwise_mul` | `aie_kernels/aie2/eltwise_mul.cc` | Need to verify |
-| `rope` | `aie_kernels/aie2/rope.cc` | Need to verify |
+| `rms_norm_bf16_vector` | `aie_kernels/aie2/rms_norm.cc` | Works per-tile (broken for full row) |
+| QKV | compiled xclbin | Working |
+| SwiGLU decode | compiled xclbin | Working |
+| SwiGLU prefill | compiled xclbin | Working |
+| decode_batch GEMV | via SwiGLU infra | Working (but only 1 per flush) |
 
----
+### Env vars
+```
+XDNA_ENABLE_GEMV=1            # GEMV on NPU
+XDNA_ENABLE_SWIGLU=1          # SiLU on NPU
+XDNA_ENABLE_QKV=1             # QKV on NPU
+XDNA_ENABLE_RMS_NORM=0        # CPU (broken on NPU)
+XDNA_ENABLE_SWIGLU_PREFILL=0  # prefill SiLU off
+XDNA_ENABLE_DECODE_BATCH=1    # batch GEMVs
+XDNA_ENABLE_TRANSFORMER_BLOCK=1  # tblock fusion (not matching for decode)
+XDNA_DEBUG=1                  # debug logs
+GGML_XDNA_NUM_COLS=8          # NPU2, 8 columns
+```
 
-## Milestones
+## Milestones (revised)
 
-| Milestone | Target | Expected t/s |
+| Milestone | Condition | Expected t/s |
 |---|---|---|
-| Baseline (all CPU) | Done | ~2.5 |
-| QKV GEMV on NPU | Phase 1a | ~4-5 |
-| Full attention on NPU | Phase 1 | ~6-8 |
-| FFN on NPU | Phase 2 | ~10-12 |
-| RMSNorm on NPU | Phase 3 | ~12-13 |
-| Full model on NPU | Phase 4 | ~15+ |
+| Baseline (all CPU) | Need measurement | ? |
+| Current (QKV+SwiGLU on NPU) | Done | ~1.0 (includes compilation) |
+| Steady-state measurement | Profiling | ~2-5? |
+| Attention on NPU | If CPU attention is bottleneck | ~5-8 |
+| Full model on NPU | All ops fused | ~10-15 |
 
----
+## Environment
 
-## Environment Notes
-
-### Windows build paths
 ```
 XRT_SDK:     C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt
 PEANO:       C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\win64.o\tools\peano
@@ -252,18 +226,5 @@ MLIR_AIE:    C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\mli
 DRIVER:      C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_*
 PYTHON:      C:\Python313\python.exe
 MODEL:       models\llama-3.2-1b-instruct-BF16.gguf
+REPO:        https://github.com/Soket1/IRON-windows (branch: devel)
 ```
-
-### Key env vars
-```
-XDNA_ENABLE_RMS_NORM=0       # CPU (broken on NPU)
-XDNA_ENABLE_GEMV=1           # GEMV on NPU
-XDNA_ENABLE_SWIGLU=1         # SiLU on NPU
-XDNA_ENABLE_QKV=1            # QKV on NPU
-XDNA_ENABLE_SWIGLU_PREFILL=0 # prefill SiLU off
-XDNA_DEBUG=1                 # debug logs
-GGML_XDNA_NUM_COLS=8         # use all 8 columns (NPU2)
-```
-
-### Test script
-`logs/test_short1.bat` — current test harness
