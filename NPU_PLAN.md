@@ -96,7 +96,7 @@ Mark Q@K^T + SCALE + ADD + SOFT_MAX + scores@V as dispatched
 Main loop skips dispatched nodes
 ```
 
-Compile: `python compile.py flowkv-decode --num-heads 4 --num-kv-heads 1 --head-dim 64 --seq-len 128 --num-cols 1`
+Compile (see [llama.cpp-xdna](https://github.com/Soket1/llama.cpp-xdna)): `python compile.py flowkv-decode --num-heads 4 --num-kv-heads 1 --head-dim 64 --seq-len 128 --num-cols 1`
 
 Test scripts:
 - `test_timing.ps1` — warmup + 64 tokens + timing

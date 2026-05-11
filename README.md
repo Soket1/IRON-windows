@@ -340,8 +340,8 @@ Based on [albiol2004/llama.cpp ggml-xdna branch](https://github.com/albiol2004/l
 - 🔜 INT8 SwiGLU (W8A16 decode, W8A8 prefill)
 
 ### Files
-- `compile.py` — Compilation bridge (Python, called by C++ backend)
-- `ggml-xdna.cpp` — ggml backend (C++, links against XRT)
+
+ggml-xdna backend перенесён в [llama.cpp-xdna](https://github.com/Soket1/llama.cpp-xdna) (`ggml/src/ggml-xdna/`).
 
 ## Community and Support
 
