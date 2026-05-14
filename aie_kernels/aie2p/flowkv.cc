@@ -77,17 +77,15 @@ void flowkv_score_init_bf16(int32_t num_q_heads)
     }
 }
 
-// Apply RoPE rotation to all Q heads and store in static buffer.
-// The Q FIFO buffer layout is [Q_heads (group_size * head_dim) | angles (head_dim) | actual_seq_len (1)]
-// where angles are interleaved [cos0, sin0, cos1, sin1, ...] for head_dim/2 pairs.
-// Uses the "two halves" method: for head_dim=64:
-//   rotated[0:32]  = q[0:32]  * cos - q[32:64] * sin
-//   rotated[32:64] = q[32:64] * cos + q[0:32]  * sin
+// Copy Q heads into static buffer. The host already provides post-RoPE Q
+// (the ggml ROPE node runs before FlowKV dispatch), so no rotation needed.
+// Also reads actual_seq_len from the angles region of the Q buffer.
 //
-// q_in: pointer to Q FIFO buffer (Q heads followed by angles)
+// Q buffer layout: [Q_heads (gs * hd) | angles (hd) | actual_seq_len (1)]
+// angles region is unused for rotation but actual_seq_len is read from
+// angles[head_dim] (bf16 encoded).
 void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_heads, int32_t head_dim)
 {
-    const int32_t half_dim = head_dim / 2;
     const bfloat16 *angles = q_in + num_q_heads * head_dim;
 
     // Read actual_seq_len encoded as bf16 at angles[head_dim] (= angles[64]).
@@ -97,37 +95,17 @@ void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_hea
 
     // Reset chunk counter for this attention computation.
     *(volatile int32_t *)&g_actual_seq_len; // force re-read (compiler barrier)
-    // g_score_chunk_counter is file-scope (C++ linkage) — just assign directly.
     g_score_chunk_counter = 0;
 
-    // Load cos and sin from interleaved angles: [cos0, sin0, cos1, sin1, ...]
-    // For head_dim=64, half_dim=32, we have 32 cos and 32 sin values
-    // packed in 64 interleaved bf16 values.
+    // Q is already post-RoPE — just copy into the static rotated_q buffer.
+    // No rotation applied. The angles region is skipped (not needed).
     for (int h = 0; h < num_q_heads; h++) {
         const bfloat16 *q_head = q_in + h * head_dim;
         bfloat16 *out_head = rotated_q + h * head_dim;
 
-        for (int v = 0; v < half_dim; v += 16) {
-            // Load first and second halves of Q
-            aie::vector<bfloat16, 16> x1 = aie::load_v<16>(q_head + v);
-            aie::vector<bfloat16, 16> x2 = aie::load_v<16>(q_head + v + half_dim);
-
-            // Load interleaved cos/sin angles and deinterleave
-            aie::vector<bfloat16, 32> ang = aie::load_v<32>(angles + 2 * v);
-            aie::vector<bfloat16, 16> cos_val = aie::filter_even(ang, 1);
-            aie::vector<bfloat16, 16> sin_val = aie::filter_odd(ang, 1);
-
-            // First half: x1*cos - x2*sin
-            aie::vector<bfloat16, 16> x1_cos = aie::mul(x1, cos_val);
-            aie::vector<bfloat16, 16> x2_sin = aie::mul(x2, sin_val);
-            aie::vector<bfloat16, 16> out_first = aie::sub(x1_cos, x2_sin);
-            aie::store_v(out_head + v, out_first);
-
-            // Second half: x2*cos + x1*sin
-            aie::vector<bfloat16, 16> x2_cos = aie::mul(x2, cos_val);
-            aie::vector<bfloat16, 16> x1_sin = aie::mul(x1, sin_val);
-            aie::vector<bfloat16, 16> out_second = aie::add(x2_cos, x1_sin);
-            aie::store_v(out_head + v + half_dim, out_second);
+        for (int v = 0; v < head_dim; v += 16) {
+            aie::vector<bfloat16, 16> q_vec = aie::load_v<16>(q_head + v);
+            aie::store_v(out_head + v, q_vec);
         }
     }
 }
