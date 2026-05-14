@@ -97,8 +97,7 @@ void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_hea
 
     // Reset chunk counter for this attention computation.
     *(volatile int32_t *)&g_actual_seq_len; // force re-read (compiler barrier)
-    // Use a separate static counter in score_chunk, reset here.
-    extern int32_t g_score_chunk_counter;
+    // g_score_chunk_counter is file-scope (C++ linkage) — just assign directly.
     g_score_chunk_counter = 0;
 
     // Load cos and sin from interleaved angles: [cos0, sin0, cos1, sin1, ...]
