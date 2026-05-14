@@ -317,6 +317,11 @@ void flowkv_value_normalize_bf16(bfloat16 *__restrict output, int32_t num_q_head
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
+    // === DIAG: write constant 42.0 to first element to verify kernel recompilation ===
+    output[0] = static_cast<bfloat16>(42.0f);
+    output[1] = static_cast<bfloat16>(42.0f);
+    // === END DIAG ===
+
     for (int h = 0; h < num_q_heads; h++) {
         float inv_l = aie::inv(saved_denom[h]);
         aie::vector<float, 16> inv_l_vec = aie::broadcast<float, 16>(inv_l);
