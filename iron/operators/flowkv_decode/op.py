@@ -158,7 +158,7 @@ class AIEFlowKVDecode(AIEOperatorBase):
 
         # Q buffer: query heads + RoPE angles packed per KV group
         # Layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
-        q_group_stride = self.group_size * self.head_dim + self.head_dim + 1  # +1 for actual_seq_len
+        q_group_stride = self.group_size * self.head_dim + self.head_dim + 2  # +2 for actual_seq_len + DMA alignment
         q_size = self.num_kv_heads * q_group_stride
         self.add_buffer("queries", q_size)
 

@@ -80,7 +80,7 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     # Query vectors for one KV group, plus RoPE angles (head_dim interleaved
     # cos/sin values) packed at the end.
-    L1_Q_ty = np.ndarray[(group_size * head_dim + head_dim + 1,), dtype_in]
+    L1_Q_ty = np.ndarray[(group_size * head_dim + head_dim + 2,), dtype_in]
 
     # K or V chunk
     L1_KV_chunk_ty = np.ndarray[(chunk_size * head_dim,), dtype_in]
@@ -98,8 +98,8 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     L3_KV_ty = np.ndarray[(num_kv_heads * seq_len * 2 * head_dim,), dtype_in]
     # Q DDR layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
-    # Each group block = group_size * head_dim + head_dim + 1 (for actual_seq_len) contiguous bf16 values.
-    q_group_stride = group_size * head_dim + head_dim + 1
+    # Each group block = group_size * head_dim + head_dim + 2 (for actual_seq_len + alignment) contiguous bf16 values.
+    q_group_stride = group_size * head_dim + head_dim + 2
     L3_Q_ty = np.ndarray[(num_kv_heads * q_group_stride,), dtype_in]
     L3_O_ty = np.ndarray[(num_heads * head_dim,), dtype_in]
 
