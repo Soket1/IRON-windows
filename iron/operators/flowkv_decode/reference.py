@@ -26,6 +26,24 @@ def interleave_kv_cache(k_cache, v_cache):
     return interleaved.reshape(-1)
 
 
+def contiguous_kv_cache(k_cache, v_cache):
+    """Create contiguous KV layout: [K_all | V_all].
+
+    Input shapes:
+        k_cache: (num_kv_heads, seq_len, head_dim)
+        v_cache: (num_kv_heads, seq_len, head_dim)
+
+    Output shape: (num_kv_heads * seq_len * 2 * head_dim,) flattened.
+    Layout: all K data first, then all V data.
+
+    This layout matches the kernel's expectation of contiguous K and V
+    regions, allowing the DMA to stream each with stride=head_dim.
+    """
+    k_flat = k_cache.reshape(-1)
+    v_flat = v_cache.reshape(-1)
+    return torch.cat([k_flat, v_flat])
+
+
 def apply_rope_two_halves(x, cos, sin):
     """Apply RoPE rotation using the two-halves method.
 
@@ -93,7 +111,7 @@ def generate_golden_reference(
             Q:              (num_heads, head_dim)           -- unrotated queries
             K_cache:        (num_kv_heads, seq_len, head_dim) -- rotated K cache
             V_cache:        (num_kv_heads, seq_len, head_dim) -- V cache
-            KV_interleaved: (num_kv_heads * seq_len * 2 * head_dim,)
+            KV_contiguous: (num_kv_heads * seq_len * 2 * head_dim,)
             q_angles:       (head_dim,)                     -- interleaved cos/sin
             O:              (num_heads, head_dim)           -- reference output
     """
@@ -184,14 +202,14 @@ def generate_golden_reference(
 
     O_bf16 = O.to(torch.bfloat16)
 
-    # Create interleaved KV cache for the design's DDR layout
-    kv_interleaved = interleave_kv_cache(K_cache, V_cache)
+    # Create contiguous KV cache for the design's DDR layout
+    kv_contiguous = contiguous_kv_cache(K_cache, V_cache)
 
     return {
         "Q": Q,
         "K_cache": K_cache,
         "V_cache": V_cache,
-        "KV_interleaved": kv_interleaved,
+        "KV_contiguous": kv_contiguous,
         "q_angles": q_angles,
         "O": O_bf16,
     }

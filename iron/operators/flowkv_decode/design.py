@@ -42,8 +42,9 @@ Layout: `num_cols` columns, each processing one KV head group. The runtime
 sequence iterates over batches of `num_cols` groups.
 
 DDR buffer layout (3 sequence args):
-  arg0: KV cache -- interleaved K and V per position per head.
-        Shape: (num_kv_heads, seq_len, 2, head_dim) flattened.
+  arg0: KV cache -- contiguous K then contiguous V regions.
+        Layout: [K_all (num_kv_heads * seq_len * head_dim) | V_all (num_kv_heads * seq_len * head_dim)]
+        Shape: (num_kv_heads * seq_len * 2 * head_dim,) flattened.
   arg1: Q vectors + RoPE angles -- per KV group: Q heads then interleaved cos/sin.
         Layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
         Shape: (num_kv_heads * (group_size * head_dim + head_dim),) flattened.
@@ -96,6 +97,8 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     # L3 (DDR) buffer types
     # -------------------------------------------------------------------------
+    # KV cache: contiguous K then contiguous V.
+    # Layout: [K_all (num_kv * seq * hd) | V_all (num_kv * seq * hd)]
     L3_KV_ty = np.ndarray[(num_kv_heads * seq_len * 2 * head_dim,), dtype_in]
     # Q DDR layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
     # Each group block = group_size * head_dim + head_dim + 2 (for actual_seq_len + alignment) contiguous bf16 values.
@@ -287,13 +290,10 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     # Tensor Access Patterns
     # -------------------------------------------------------------------------
-    # KV cache DDR layout: interleaved K and V per head per position.
+    # KV cache DDR layout: contiguous K then contiguous V.
     # For KV head h, position p:
-    #   K[h, p, :] at offset (h * seq_len * 2 + p * 2) * head_dim
-    #   V[h, p, :] at offset (h * seq_len * 2 + p * 2 + 1) * head_dim
-    #
-    # DMA streams chunk_size K rows (every other row in the interleaved layout)
-    # followed by chunk_size V rows.
+    #   K[h, p, :] at offset (h * seq_len + p) * head_dim
+    #   V[h, p, :] at offset num_kv_heads * seq_len * head_dim + (h * seq_len + p) * head_dim
 
     def make_q_tap(kv_head_idx):
         """Q tap: select group_size query heads + RoPE angles for this KV group.
@@ -310,24 +310,24 @@ def my_flowkv_decode(
         )
 
     def make_k_tap(kv_head_idx):
-        """K tap: stream K rows from interleaved KV cache."""
-        base = kv_head_idx * seq_len * 2 * head_dim
+        """K tap: stream K rows from contiguous K region."""
+        base = kv_head_idx * seq_len * head_dim
         return TensorAccessPattern(
             tensor_dims=(num_kv_heads * seq_len * 2 * head_dim,),
             offset=base,
-            # Read seq_len K rows (stride 2*head_dim to skip V rows)
             sizes=[1, seq_len, 1, head_dim],
-            strides=[0, 2 * head_dim, 0, 1],
+            strides=[0, head_dim, 0, 1],
         )
 
     def make_v_tap(kv_head_idx):
-        """V tap: stream V rows from interleaved KV cache."""
-        base = kv_head_idx * seq_len * 2 * head_dim + head_dim
+        """V tap: stream V rows from contiguous V region."""
+        kv_region_size = num_kv_heads * seq_len * head_dim
+        base = kv_region_size + kv_head_idx * seq_len * head_dim
         return TensorAccessPattern(
             tensor_dims=(num_kv_heads * seq_len * 2 * head_dim,),
             offset=base,
             sizes=[1, seq_len, 1, head_dim],
-            strides=[0, 2 * head_dim, 0, 1],
+            strides=[0, head_dim, 0, 1],
         )
 
     def make_o_tap(kv_head_idx):

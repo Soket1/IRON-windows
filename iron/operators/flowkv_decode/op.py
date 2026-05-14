@@ -13,7 +13,7 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
-from iron.operators.flowkv_decode.reference import interleave_kv_cache
+from iron.operators.flowkv_decode.reference import contiguous_kv_cache
 
 
 def pack_q_with_angles(q, angles, group_size, num_kv_heads):
@@ -60,14 +60,14 @@ class AIEFlowKVDecode(AIEOperatorBase):
     two tiles per KV head group.
 
     DDR buffer layout:
-        KV cache:  interleaved K and V rows per head per position.
-                   Shape: (num_kv_heads, seq_len, 2, head_dim) flattened.
+        KV cache:  contiguous K region followed by contiguous V region.
+                   Layout: [K_all | V_all], each (num_kv_heads, seq_len, head_dim) flattened.
         Q:         query heads + RoPE angles packed per KV group.
                    Layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 ...].
         Output:    attention output. Shape: (num_heads, head_dim) flattened.
 
-    Use `interleave_kv_cache(k_cache, v_cache)` from the reference module to
-    create the interleaved DDR layout.
+    Use `contiguous_kv_cache(k_cache, v_cache)` from the reference module to
+    create the contiguous DDR layout.
     """
 
     def __init__(
@@ -152,7 +152,7 @@ class AIEFlowKVDecode(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        # KV cache buffer: interleaved K and V
+        # KV cache buffer: contiguous K then V
         kv_size = self.num_kv_heads * self.seq_len * 2 * self.head_dim
         self.add_buffer("kv_cache", kv_size)
 
@@ -223,13 +223,13 @@ class AIEFlowKVDecode(AIEOperatorBase):
                 f"Expected q_angles shape ({self.head_dim},), " f"got {q_angles.shape}"
             )
 
-        # Interleave KV cache for DMA layout
-        kv_interleaved = interleave_kv_cache(k_cache, v_cache)
+        # Create contiguous KV layout: [K_all | V_all]
+        kv_contiguous = contiguous_kv_cache(k_cache, v_cache)
 
         # Pack Q buffer: [Q_group0 | angles | Q_group1 | angles | ...]
         q_packed = pack_q_with_angles(q, q_angles, self.group_size, self.num_kv_heads)
 
-        self.write_buffer("kv_cache", kv_interleaved)
+        self.write_buffer("kv_cache", kv_contiguous)
         self.write_buffer("queries", q_packed)
         self.run_runlist()
 

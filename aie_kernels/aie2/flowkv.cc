@@ -52,6 +52,9 @@ static inline int32_t bf16_to_int(const bfloat16 * buf, int idx) {
     uint16_t bits = *(const uint16_t *)&buf[idx];
     int exp = ((bits >> 7) & 0xFF) - 127;
     if (exp < 0) return 0;
+    // mant includes implicit 1 at bit position 7 (value 0x80=128).
+    // bf16 value = mant * 2^(exp-7) = mant << (exp-7).
+    // For integer bf16 values this is exact.
     uint32_t mant = (bits & 0x7F) | 0x80;
     return (int)(mant << (exp - 7));
 }
