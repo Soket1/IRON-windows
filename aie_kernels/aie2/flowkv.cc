@@ -42,6 +42,20 @@ static float score_running_sum[4] __attribute__((aligned(64)));
 // RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk)
 static bfloat16 rotated_q[4 * 64] __attribute__((aligned(64)));
 
+// Actual sequence length (number of filled KV positions).
+// Read from Q buffer element [num_q_heads*head_dim + head_dim] = angles[64].
+// The host encodes this as bf16 before dispatch.
+static int32_t g_actual_seq_len = 0;
+int32_t g_score_chunk_counter = 0;
+
+static inline int32_t bf16_to_int(const bfloat16 * buf, int idx) {
+    uint16_t bits = *(const uint16_t *)&buf[idx];
+    int exp = ((bits >> 7) & 0xFF) - 127;
+    if (exp < 0) return 0;
+    uint32_t mant = (bits & 0x7F) | 0x80;
+    return (int)(mant << (exp - 7));
+}
+
 // ---------------------------------------------------------------------------
 // Value tile: accumulated output in f32 for precision
 // ---------------------------------------------------------------------------
@@ -64,7 +78,7 @@ void flowkv_score_init_bf16(int32_t num_q_heads)
 }
 
 // Apply RoPE rotation to all Q heads and store in static buffer.
-// The Q FIFO buffer layout is [Q_heads (group_size * head_dim) | angles (head_dim)]
+// The Q FIFO buffer layout is [Q_heads (group_size * head_dim) | angles (head_dim) | actual_seq_len (1)]
 // where angles are interleaved [cos0, sin0, cos1, sin1, ...] for head_dim/2 pairs.
 // Uses the "two halves" method: for head_dim=64:
 //   rotated[0:32]  = q[0:32]  * cos - q[32:64] * sin
@@ -75,6 +89,17 @@ void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_hea
 {
     const int32_t half_dim = head_dim / 2;
     const bfloat16 *angles = q_in + num_q_heads * head_dim;
+
+    // Read actual_seq_len encoded as bf16 at angles[head_dim] (= angles[64]).
+    // The host writes this before dispatch. If absent (0), fall back to full seq_len.
+    g_actual_seq_len = bf16_to_int(angles, head_dim);
+    if (g_actual_seq_len <= 0) g_actual_seq_len = 32767;  // fallback: process all
+
+    // Reset chunk counter for this attention computation.
+    *(volatile int32_t *)&g_actual_seq_len; // force re-read (compiler barrier)
+    // Use a separate static counter in score_chunk, reset here.
+    extern int32_t g_score_chunk_counter;
+    g_score_chunk_counter = 0;
 
     // Load cos and sin from interleaved angles: [cos0, sin0, cos1, sin1, ...]
     // For head_dim=64, half_dim=32, we have 32 cos and 32 sin values
@@ -135,6 +160,32 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
     bfloat16 *correction_out = packed_out + scores_size;
     bfloat16 *denom_out = packed_out + scores_size + num_q_heads;
 
+    // Use actual_seq_len to skip empty KV positions that dilute softmax.
+    // g_actual_seq_len is set by flowkv_score_rope_q_bf16 from the Q buffer.
+    int32_t chunk_idx = g_score_chunk_counter++;
+    int32_t pos_start = chunk_idx * chunk_size;
+    int32_t actual_seq = g_actual_seq_len;
+
+    // If this entire chunk is beyond actual_seq_len, send zero scores
+    // (identity for online softmax: scores=0 → exp(0-m)=~0 when m>>0,
+    //  correction=1, denominator unchanged).
+    if (pos_start >= actual_seq) {
+        for (int i = 0; i < scores_size + num_q_heads * 2; i++)
+            packed_out[i] = static_cast<bfloat16>(0.0f);
+        // Set denominator to 1.0 to avoid division by zero in normalize.
+        for (int h = 0; h < num_q_heads; h++)
+            denom_out[h] = static_cast<bfloat16>(score_running_sum[h]);
+        for (int h = 0; h < num_q_heads; h++)
+            correction_out[h] = static_cast<bfloat16>(1.0f);
+        event1();
+        return;
+    }
+
+    // Clamp effective chunk_size for the last partial chunk.
+    int32_t eff_chunk = chunk_size;
+    if (pos_start + chunk_size > actual_seq)
+        eff_chunk = actual_seq - pos_start;
+
     for (int h = 0; h < num_q_heads; h++) {
         const bfloat16 *q_head = rotated_q + h * head_dim;
         float m_old = score_running_max[h];
@@ -145,7 +196,7 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         bfloat16 scores_bf16[32]; // chunk_size max = 32
         bfloat16 m_chunk_bf16 = static_cast<bfloat16>(-1e30f);
 
-        for (int pos = 0; pos < chunk_size; pos++) {
+        for (int pos = 0; pos < eff_chunk; pos++) {
             const bfloat16 *k_pos = k_chunk + pos * head_dim;
 
             // Vectorized dot product: head_dim=64 using single accum
@@ -182,7 +233,7 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         bfloat16 l_new_bf16 = static_cast<bfloat16>(c_correction * l_old);
 
         // Compute exp2 for each score position — one at a time, no float arrays
-        for (int pos = 0; pos < chunk_size; pos++) {
+        for (int pos = 0; pos < eff_chunk; pos++) {
             bfloat16 diff = static_cast<bfloat16>((static_cast<float>(scores_bf16[pos]) - m_new) * 1.4453125f);
             aie::vector<bfloat16, 16> diff_vec = aie::broadcast<bfloat16, 16>(diff);
             aie::accum<accfloat, 16> diff_acc(diff_vec);
@@ -190,6 +241,10 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
             bfloat16 f_bf16 = exp_result[0];
             l_new_bf16 = static_cast<bfloat16>(static_cast<float>(l_new_bf16) + static_cast<float>(f_bf16));
             scores_out[pos * num_q_heads + h] = f_bf16;
+        }
+        // Zero remaining scores for unused positions in this chunk.
+        for (int pos = eff_chunk; pos < chunk_size; pos++) {
+            scores_out[pos * num_q_heads + h] = static_cast<bfloat16>(0.0f);
         }
 
         // Update running state
