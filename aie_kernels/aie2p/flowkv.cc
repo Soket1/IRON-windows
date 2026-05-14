@@ -42,6 +42,11 @@ static float score_running_sum[4] __attribute__((aligned(64)));
 // RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk)
 static bfloat16 rotated_q[4 * 64] __attribute__((aligned(64)));
 
+// === DIAG: save first K chunk's first 64 values for host inspection ===
+static bfloat16 diag_k_first[64] __attribute__((aligned(64)));
+static int32_t diag_k_saved = 0;
+// === END DIAG ===
+
 // Actual sequence length (number of filled KV positions).
 // Read from Q buffer element [num_q_heads*head_dim + head_dim] = angles[64].
 // The host encodes this as bf16 before dispatch.
@@ -162,6 +167,15 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
     int32_t eff_chunk = chunk_size;
     if (pos_start + chunk_size > actual_seq)
         eff_chunk = actual_seq - pos_start;
+
+    // === DIAG: save first K chunk data ===
+    if (chunk_idx == 0 && diag_k_saved == 0) {
+        diag_k_saved = 1;
+        for (int d = 0; d < 64; d++) {
+            diag_k_first[d] = k_chunk[d];
+        }
+    }
+    // === END DIAG ===
 
     for (int h = 0; h < num_q_heads; h++) {
         const bfloat16 *q_head = rotated_q + h * head_dim;
@@ -317,11 +331,6 @@ void flowkv_value_normalize_bf16(bfloat16 *__restrict output, int32_t num_q_head
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
-    // === DIAG: write constant 42.0 to first element to verify kernel recompilation ===
-    output[0] = static_cast<bfloat16>(42.0f);
-    output[1] = static_cast<bfloat16>(42.0f);
-    // === END DIAG ===
-
     for (int h = 0; h < num_q_heads; h++) {
         float inv_l = aie::inv(saved_denom[h]);
         aie::vector<float, 16> inv_l_vec = aie::broadcast<float, 16>(inv_l);
@@ -336,6 +345,17 @@ void flowkv_value_normalize_bf16(bfloat16 *__restrict output, int32_t num_q_head
             aie::store_v(o_head + d, out_vec);
         }
     }
+
+    // === DIAG: overwrite last head's output with saved K[0] data ===
+    // This runs AFTER the normal computation, so it won't be overwritten.
+    // Host should read bo_out at offset (num_q_heads-1)*head_dim to see K[0] data.
+    if (diag_k_saved) {
+        bfloat16 *diag_out = output + (num_q_heads - 1) * head_dim;
+        for (int d = 0; d < 64; d++) {
+            diag_out[d] = diag_k_first[d];
+        }
+    }
+    // === END DIAG ===
 }
 
 } // extern "C"
