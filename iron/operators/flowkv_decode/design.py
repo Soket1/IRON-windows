@@ -311,9 +311,9 @@ def my_flowkv_decode(
 
     def make_k_tap(kv_head_idx):
         """K tap: stream K rows from contiguous K region."""
-        base = kv_head_idx * seq_len * head_dim + 1  # DIAG: +1 to test if offset=0 is broken
+        base = kv_head_idx * seq_len * head_dim
         return TensorAccessPattern(
-            tensor_dims=(num_kv_heads * seq_len * 2 * head_dim + 1,),
+            tensor_dims=(num_kv_heads * seq_len * 2 * head_dim,),
             offset=base,
             sizes=[1, seq_len, 1, head_dim],
             strides=[0, head_dim, 0, 1],
@@ -351,7 +351,10 @@ def my_flowkv_decode(
         rt.start(*all_workers)
 
         for batch_idx in range(num_batches):
-            tg = rt.task_group()
+            # DIAG: separate K and V into different task_groups to test
+            # if concurrent DMA from same buffer causes offset corruption
+            tg_k = rt.task_group()
+            tg_v = rt.task_group()
 
             for col in range(num_cols):
                 kv_head_idx = batch_idx * num_cols + col
@@ -360,21 +363,28 @@ def my_flowkv_decode(
                     Q_fifos[col].prod(),
                     Q,
                     make_q_tap(kv_head_idx),
-                    task_group=tg,
+                    task_group=tg_k,
                 )
                 rt.fill(
                     K_fifos[col].prod(),
                     KV,
                     make_k_tap(kv_head_idx),
-                    task_group=tg,
+                    task_group=tg_k,
                 )
+
+            rt.finish_task_group(tg_k)
+
+            for col in range(num_cols):
+                kv_head_idx = batch_idx * num_cols + col
+
                 rt.fill(
                     V_fifos[col].prod(),
                     KV,
                     make_v_tap(kv_head_idx),
-                    task_group=tg,
+                    task_group=tg_v,
                 )
 
+            tg_out = rt.task_group()
             for col in range(num_cols):
                 kv_head_idx = batch_idx * num_cols + col
 
@@ -382,11 +392,12 @@ def my_flowkv_decode(
                     O_fifos[col].cons(),
                     O,
                     make_o_tap(kv_head_idx),
-                    task_group=tg,
+                    task_group=tg_out,
                     wait=True,
                 )
 
-            rt.finish_task_group(tg)
+            rt.finish_task_group(tg_v)
+            rt.finish_task_group(tg_out)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
