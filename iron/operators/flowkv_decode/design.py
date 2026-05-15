@@ -311,9 +311,9 @@ def my_flowkv_decode(
 
     def make_k_tap(kv_head_idx):
         """K tap: stream K rows from contiguous K region."""
-        base = kv_head_idx * seq_len * head_dim
+        base = kv_head_idx * seq_len * head_dim + 1  # DIAG: +1 to test if offset=0 is broken
         return TensorAccessPattern(
-            tensor_dims=(num_kv_heads * seq_len * 2 * head_dim,),
+            tensor_dims=(num_kv_heads * seq_len * 2 * head_dim + 1,),
             offset=base,
             sizes=[1, seq_len, 1, head_dim],
             strides=[0, head_dim, 0, 1],
