@@ -350,7 +350,7 @@ def my_flowkv_decode(
     num_batches = num_kv_heads // num_cols
 
     rt = Runtime()
-    with rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty) as (K, V, Q, O):
+    with rt.sequence(L3_V_ty, L3_K_ty, L3_Q_ty, L3_O_ty) as (V, K, Q, O):
         rt.start(*all_workers)
 
         for batch_idx in range(num_batches):
