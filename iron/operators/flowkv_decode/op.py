@@ -59,15 +59,14 @@ class AIEFlowKVDecode(AIEOperatorBase):
     in chunks, with score computation and value accumulation pipelined across
     two tiles per KV head group.
 
-    DDR buffer layout:
-        KV cache:  contiguous K region followed by contiguous V region.
-                   Layout: [K_all | V_all], each (num_kv_heads, seq_len, head_dim) flattened.
-        Q:         query heads + RoPE angles packed per KV group.
-                   Layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 ...].
-        Output:    attention output. Shape: (num_heads, head_dim) flattened.
-
-    Use `contiguous_kv_cache(k_cache, v_cache)` from the reference module to
-    create the contiguous DDR layout.
+    DDR buffer layout (4 sequence args):
+        arg0: K cache -- contiguous K region.
+              Shape: (num_kv_heads * seq_len * head_dim,) flattened.
+        arg1: V cache -- contiguous V region.
+              Shape: (num_kv_heads * seq_len * head_dim,) flattened.
+        arg2: Q vectors + RoPE angles packed per KV group.
+              Layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 ...].
+        arg3: Output -- attention result. Shape: (num_heads, head_dim) flattened.
     """
 
     def __init__(
@@ -152,9 +151,13 @@ class AIEFlowKVDecode(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        # KV cache buffer: contiguous K then V
-        kv_size = self.num_kv_heads * self.seq_len * 2 * self.head_dim
-        self.add_buffer("kv_cache", kv_size)
+        # K cache buffer: contiguous K data
+        k_size = self.num_kv_heads * self.seq_len * self.head_dim
+        self.add_buffer("k_cache", k_size)
+
+        # V cache buffer: contiguous V data
+        v_size = self.num_kv_heads * self.seq_len * self.head_dim
+        self.add_buffer("v_cache", v_size)
 
         # Q buffer: query heads + RoPE angles packed per KV group
         # Layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
@@ -172,7 +175,7 @@ class AIEFlowKVDecode(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_to_runlist("flowkv_decode", "kv_cache", "queries", "output")
+        self.add_to_runlist("flowkv_decode", "k_cache", "v_cache", "queries", "output")
 
     def forward(self, q, k_cache, v_cache, q_angles):
         """Run FlowKV decode attention with fused RoPE on Q.
@@ -223,13 +226,15 @@ class AIEFlowKVDecode(AIEOperatorBase):
                 f"Expected q_angles shape ({self.head_dim},), " f"got {q_angles.shape}"
             )
 
-        # Create contiguous KV layout: [K_all | V_all]
-        kv_contiguous = contiguous_kv_cache(k_cache, v_cache)
+        # Flatten K and V into separate contiguous buffers
+        k_flat = k_cache.reshape(-1)
+        v_flat = v_cache.reshape(-1)
 
         # Pack Q buffer: [Q_group0 | angles | Q_group1 | angles | ...]
         q_packed = pack_q_with_angles(q, q_angles, self.group_size, self.num_kv_heads)
 
-        self.write_buffer("kv_cache", kv_contiguous)
+        self.write_buffer("k_cache", k_flat)
+        self.write_buffer("v_cache", v_flat)
         self.write_buffer("queries", q_packed)
         self.run_runlist()
 

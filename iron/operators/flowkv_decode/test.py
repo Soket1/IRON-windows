@@ -82,7 +82,8 @@ def test_flowkv_decode(
     )
 
     input_buffers = {
-        "kv_cache": golden_ref["KV_contiguous"],
+        "k_cache": golden_ref["K_cache"].reshape(-1),
+        "v_cache": golden_ref["V_cache"].reshape(-1),
         "queries": q_packed,
     }
     output_buffers = {"output": golden_ref["O"]}

@@ -41,14 +41,17 @@ DMA channel budget per tile:
 Layout: `num_cols` columns, each processing one KV head group. The runtime
 sequence iterates over batches of `num_cols` groups.
 
-DDR buffer layout (3 sequence args):
-  arg0: KV cache -- contiguous K then contiguous V regions.
-        Layout: [K_all (num_kv_heads * seq_len * head_dim) | V_all (num_kv_heads * seq_len * head_dim)]
-        Shape: (num_kv_heads * seq_len * 2 * head_dim,) flattened.
-  arg1: Q vectors + RoPE angles -- per KV group: Q heads then interleaved cos/sin.
+DDR buffer layout (4 sequence args):
+  arg0: K cache -- contiguous K region.
+        Layout: [K_all (num_kv_heads * seq_len * head_dim)]
+        Shape: (num_kv_heads * seq_len * head_dim,) flattened.
+  arg1: V cache -- contiguous V region.
+        Layout: [V_all (num_kv_heads * seq_len * head_dim)]
+        Shape: (num_kv_heads * seq_len * head_dim,) flattened.
+  arg2: Q vectors + RoPE angles -- per KV group: Q heads then interleaved cos/sin.
         Layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
         Shape: (num_kv_heads * (group_size * head_dim + head_dim),) flattened.
-  arg2: Output -- attention result.
+  arg3: Output -- attention result.
         Shape: (num_heads, head_dim) flattened.
 """
 
@@ -97,9 +100,10 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     # L3 (DDR) buffer types
     # -------------------------------------------------------------------------
-    # KV cache: contiguous K then contiguous V.
-    # Layout: [K_all (num_kv * seq * hd) | V_all (num_kv * seq * hd)]
-    L3_KV_ty = np.ndarray[(num_kv_heads * seq_len * 2 * head_dim,), dtype_in]
+    # K and V caches in SEPARATE buffers (workaround for DMA offset corruption
+    # when K and V share same buffer with different offsets on XDNA2).
+    L3_K_ty = np.ndarray[(num_kv_heads * seq_len * head_dim,), dtype_in]
+    L3_V_ty = np.ndarray[(num_kv_heads * seq_len * head_dim,), dtype_in]
     # Q DDR layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
     # Each group block = group_size * head_dim + head_dim + 2 (for actual_seq_len + alignment) contiguous bf16 values.
     q_group_stride = group_size * head_dim + head_dim + 2
@@ -310,21 +314,20 @@ def my_flowkv_decode(
         )
 
     def make_k_tap(kv_head_idx):
-        """K tap: stream K rows from contiguous K region."""
+        """K tap: stream K rows from K buffer."""
         base = kv_head_idx * seq_len * head_dim
         return TensorAccessPattern(
-            tensor_dims=(num_kv_heads * seq_len * 2 * head_dim,),
+            tensor_dims=(num_kv_heads * seq_len * head_dim,),
             offset=base,
             sizes=[1, seq_len, 1, head_dim],
             strides=[0, head_dim, 0, 1],
         )
 
     def make_v_tap(kv_head_idx):
-        """V tap: stream V rows from contiguous V region."""
-        kv_region_size = num_kv_heads * seq_len * head_dim
-        base = kv_region_size + kv_head_idx * seq_len * head_dim
+        """V tap: stream V rows from V buffer."""
+        base = kv_head_idx * seq_len * head_dim
         return TensorAccessPattern(
-            tensor_dims=(num_kv_heads * seq_len * 2 * head_dim,),
+            tensor_dims=(num_kv_heads * seq_len * head_dim,),
             offset=base,
             sizes=[1, seq_len, 1, head_dim],
             strides=[0, head_dim, 0, 1],
@@ -347,12 +350,12 @@ def my_flowkv_decode(
     num_batches = num_kv_heads // num_cols
 
     rt = Runtime()
-    with rt.sequence(L3_KV_ty, L3_Q_ty, L3_O_ty) as (KV, Q, O):
+    with rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty) as (K, V, Q, O):
         rt.start(*all_workers)
 
         for batch_idx in range(num_batches):
-            # DIAG: separate K and V into different task_groups to test
-            # if concurrent DMA from same buffer causes offset corruption
+            # K and V use SEPARATE buffers (arg0=K, arg1=V) to avoid
+            # DMA offset corruption seen when sharing one buffer.
             tg_k = rt.task_group()
             tg_v = rt.task_group()
 
@@ -367,7 +370,7 @@ def my_flowkv_decode(
                 )
                 rt.fill(
                     K_fifos[col].prod(),
-                    KV,
+                    K,
                     make_k_tap(kv_head_idx),
                     task_group=tg_k,
                 )
@@ -379,7 +382,7 @@ def my_flowkv_decode(
 
                 rt.fill(
                     V_fifos[col].prod(),
-                    KV,
+                    V,
                     make_v_tap(kv_head_idx),
                     task_group=tg_v,
                 )
