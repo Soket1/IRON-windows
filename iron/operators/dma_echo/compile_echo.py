@@ -1,46 +1,62 @@
 """Compile DMA echo test using IRON's compilation framework.
 
-Uses aiecc.py (not aiecc.exe which hangs on Windows due to PyInstaller).
-
-Usage:
-    C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\python.exe compile_echo.py --version 1
+Usage (from IRON-windows root):
+    conda activate ryzen-ai-1.7.1
+    python iron\operators\dma_echo\compile_echo.py --version 1
 """
 import os
 import sys
 from pathlib import Path
 
-# ===== Environment setup (MUST be before any iron imports) =====
+# ===== 1. Paths — MUST be before any imports =====
 
-# 1. XRT SDK — pyxrt Python bindings
+# IRON-windows root (4 levels up from this script)
+IRON_DIR = str(Path(__file__).resolve().parent.parent.parent.parent)
+assert IRON_DIR.endswith("IRON-windows"), f"Bad IRON_DIR: {IRON_DIR}"
+
+# XRT SDK Python bindings (pyxrt)
 XRT_PYTHON = r"C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python"
+# XRT runtime DLLs
+XRT_BIN = r"C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt"
+# AMD NPU driver
+AMD_DRIVER = r"C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_1a1aa059597c4810"
+
+# ===== 2. Fix sys.path BEFORE any iron import =====
+
+# Add XRT python bindings
 if os.path.isdir(XRT_PYTHON) and XRT_PYTHON not in sys.path:
     sys.path.insert(0, XRT_PYTHON)
 
-# 2. XRT runtime DLLs — needed for pyxrt DLL load
-XRT_BIN = r"C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt"
-if os.path.isdir(XRT_BIN):
-    os.environ["PATH"] = XRT_BIN + os.pathsep + os.environ.get("PATH", "")
+# Add XRT + driver DLLs to PATH (pyxrt needs them at DLL load time)
+for d in [XRT_BIN, AMD_DRIVER]:
+    if os.path.isdir(d) and d not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
 
-# 3. AMD NPU driver — needed for XRT runtime
-AMD_DRIVER = r"C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_1a1aa059597c4810"
-if os.path.isdir(AMD_DRIVER):
-    os.environ["PATH"] = AMD_DRIVER + os.pathsep + os.environ.get("PATH", "")
+# Nuke ALL iron_repo references from sys.path
+sys.path = [p for p in sys.path if "iron_repo" not in p]
 
-# 4. IRON-windows — must be FIRST to beat iron_repo
-IRON_DIR = str(Path(__file__).resolve().parent.parent.parent)
+# IRON-windows FIRST
 if IRON_DIR not in sys.path:
     sys.path.insert(0, IRON_DIR)
 
-# 5. Kill iron_repo entries — it shadows IRON-windows
-sys.path = [p for p in sys.path if "iron_repo" not in p.replace("\\", "/").lower()]
+# ===== 3. Debug: verify where iron comes from =====
+print(f"IRON_DIR   = {IRON_DIR}")
+print(f"sys.path[0] = {sys.path[0]}")
 
-# 6. Verify
-print(f"IRON_DIR = {IRON_DIR}")
-print(f"XRT_PYTHON = {XRT_PYTHON}")
-print(f"iron_repo filtered = {'iron_repo' not in '|'.join(sys.path).lower()}")
+# Dry-run import to confirm it picks up IRON-windows
+import importlib
+_spec = importlib.util.find_spec("iron")
+if _spec is None:
+    print("ERROR: 'iron' package not found at all")
+    sys.exit(1)
+_origin = _spec.origin or _spec.submodule_search_locations
+print(f"iron       = {_origin}")
+if "iron_repo" in str(_origin):
+    print("ERROR: iron still resolves to iron_repo!")
+    sys.exit(1)
 print()
 
-# ===== Now import =====
+# ===== 4. Import IRON compilation framework =====
 import argparse
 from iron.common.compilation import base as comp
 
@@ -70,7 +86,7 @@ def compile_echo(version: int):
     print()
 
     file_base = f"echo_v{version}"
-    design_dir = Path(__file__).resolve().parent
+    design_dir = Path(IRON_DIR) / "iron" / "operators" / "dma_echo"
     kernel_src = Path(IRON_DIR) / "aie_kernels" / "aie2p" / "echo.cc"
 
     mlir_artifact = comp.PythonGeneratedMLIRArtifact.new(
