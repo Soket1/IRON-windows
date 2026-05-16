@@ -2,20 +2,19 @@
 setlocal
 
 REM ============================================================
-REM Build & Run DMA Echo Test for XDNA NPU debugging.
+REM DMA Echo Test — Build + Run using IRON test framework.
 REM
-REM Uses C:\Python313 (same as debug_flowkv.bat) with XRT SDK
-REM on PYTHONPATH. Conda env only for Peano/mlir_aie tools.
-REM
-REM Usage: run_echo.bat [1|2]
-REM   1 = single ObjectFifo (default)
-REM   2 = dual ObjectFifo (K+V concat pattern)
+REM Usage: run_echo.bat [1|2|all]
+REM   1   = single ObjectFifo (v1, default)
+REM   2   = dual ObjectFifo (v2)
+REM   all = both tests
 REM ============================================================
 
 set "VERSION=%~1"
 if "%VERSION%"=="" set "VERSION=1"
 
 set "IRON_DIR=C:\llama.cpp-xdna\IRON-windows"
+set "CONDA_PYTHON=C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\python.exe"
 set "ECHO_DIR=%IRON_DIR%\iron\operators\dma_echo"
 
 REM Same env as debug_flowkv.bat
@@ -29,32 +28,19 @@ set "XRT_BIN_DIR=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt"
 set "MLIR_AIE_BIN_DIR=C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\mlir_aie\bin"
 set "PATH=%PEANO_INSTALL_DIR%\bin;%LLVM_AIE_BIN%;%XRT_BIN_DIR%;%MLIR_AIE_BIN_DIR%;%PATH%"
 
-set "PYTHON=C:\Python313\python.exe"
+cd /d "%IRON_DIR%"
 
 echo ============================================================
-echo DMA Echo Test v%VERSION% — Build + Run
+echo DMA Echo Test v%VERSION% — IRON test framework
 echo ============================================================
 echo.
 
-REM ===== Compile =====
-echo === STEP 1: Compile ===
-"%PYTHON%" "%ECHO_DIR%\compile_echo.py" --version %VERSION%
-if errorlevel 1 (
-    echo.
-    echo COMPILATION FAILED
-    pause
-    exit /b 1
-)
-
-echo.
-echo === STEP 2: Test on NPU ===
-"%PYTHON%" "%ECHO_DIR%\test_echo.py" --version %VERSION%
-if errorlevel 1 (
-    echo.
-    echo TEST FAILED
+if "%VERSION%"=="all" (
+    echo Running all echo tests...
+    "%CONDA_PYTHON%" -m pytest "%ECHO_DIR%\test.py" -v --iterations 1 --tb=short 2>&1
 ) else (
-    echo.
-    echo TEST PASSED
+    echo Running echo v%VERSION%...
+    "%CONDA_PYTHON%" -m pytest "%ECHO_DIR%\test.py" -v --iterations 1 --tb=short -k "test_echo_v%VERSION%" 2>&1
 )
 
 echo.
