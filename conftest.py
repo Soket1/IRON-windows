@@ -16,10 +16,60 @@ import aie.utils as aie_utils
 # Workaround: pyxrt.bo.cacheable crashes on XDNA NPU driver.
 # CachedXRTRuntime (DefaultNPURuntime) uses cacheable for insts buffers.
 # Patch it to host_only which works on XDNA.
+# BUT: host_only buffers are NOT visible to NPU without explicit sync.
+# The hostruntime does NOT call sync_bo() (it assumes cacheable = coherent).
+# We wrap XRTRuntime.run to add sync for insts_bo after creation.
 try:
     import pyxrt
     if hasattr(pyxrt, 'bo') and hasattr(pyxrt.bo, 'cacheable'):
         pyxrt.bo.cacheable = pyxrt.bo.host_only
+
+    from aie.utils.hostruntime.xrtruntime import hostruntime as _hostrt
+    _orig_xrt_run = _hostrt.XRTRuntime.run
+
+    def _xrt_run_with_sync(self, kernel_handle, args, trace_config=None,
+                           fail_on_error=True, **kwargs):
+        """Wrap XRTRuntime.run to sync host_only insts_bo to device."""
+        import time as _time
+        self.check_device_consistency()
+        args = [a for a in args if not callable(a)]
+        [a.to("npu") for a in args]
+        buffers = [a.buffer_object() for a in args]
+
+        insts_bo = None
+        insts_bytes = 0
+        is_module = hasattr(pyxrt, "module") and isinstance(
+            kernel_handle.insts, pyxrt.module
+        )
+        if not is_module:
+            insts_bytes = kernel_handle.insts.nbytes
+            if kernel_handle.insts_bo:
+                insts_bo = kernel_handle.insts_bo
+            else:
+                insts_bo = self._tensor_class(
+                    kernel_handle.insts,
+                    flags=pyxrt.bo.cacheable,
+                    group_id=kernel_handle.kernel.group_id(1),
+                ).buffer_object()
+                # KEY FIX: host_only needs explicit sync to be visible to NPU
+                insts_bo.sync(
+                    pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE,
+                    insts_bytes, 0,
+                )
+
+        start = _time.time_ns()
+        h = kernel_handle.kernel(3, insts_bo, insts_bytes, *buffers)
+        r = h.wait()
+        stop = _time.time_ns()
+
+        if fail_on_error and r != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+            raise _hostrt.HostRuntimeError(f"Kernel returned {str(r)}")
+
+        npu_time = stop - start
+        return _hostrt.XRTKernelResult(r, npu_time)
+
+    _hostrt.XRTRuntime.run = _xrt_run_with_sync
+
 except Exception:
     pass
 
