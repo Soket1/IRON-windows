@@ -52,12 +52,12 @@ try:
                     flags=pyxrt.bo.cacheable,
                     group_id=kernel_handle.kernel.group_id(1),
                 ).buffer_object()
-                # KEY FIX: host_only needs explicit sync to be visible to NPU
-                insts_bo.sync(
-                    pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE,
-                    insts_bytes, 0,
-                )
-                print(f"[CONFTEST] insts_bo synced to device ({insts_bytes} bytes)", flush=True)
+            # KEY FIX: host_only buffers need explicit sync to be visible to NPU
+            insts_bo.sync(
+                pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE,
+                insts_bytes, 0,
+            )
+            print(f"[CONFTEST] insts_bo synced to device ({insts_bytes} bytes)", flush=True)
 
         start = _time.time_ns()
         h = kernel_handle.kernel(3, insts_bo, insts_bytes, *buffers)
