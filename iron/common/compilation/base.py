@@ -568,6 +568,8 @@ class ShellCompilationCommand(CompilationCommand):
                 text=True,
                 cwd=self.cwd,
                 env={**self.env, "PYTHONUNBUFFERED": "1"},
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except FileNotFoundError as exc:
             print(
