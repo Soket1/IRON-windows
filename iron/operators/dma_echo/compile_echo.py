@@ -21,15 +21,20 @@ XRT_BIN = r"C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt"
 if os.path.isdir(XRT_BIN):
     os.environ["PATH"] = XRT_BIN + os.pathsep + os.environ.get("PATH", "")
 
-# 3. IRON-windows — must be FIRST to beat iron_repo
+# 3. AMD NPU driver — needed for XRT runtime
+AMD_DRIVER = r"C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_1a1aa059597c4810"
+if os.path.isdir(AMD_DRIVER):
+    os.environ["PATH"] = AMD_DRIVER + os.pathsep + os.environ.get("PATH", "")
+
+# 4. IRON-windows — must be FIRST to beat iron_repo
 IRON_DIR = str(Path(__file__).resolve().parent.parent.parent)
 if IRON_DIR not in sys.path:
     sys.path.insert(0, IRON_DIR)
 
-# 4. Kill iron_repo entries — it shadows IRON-windows
+# 5. Kill iron_repo entries — it shadows IRON-windows
 sys.path = [p for p in sys.path if "iron_repo" not in p.replace("\\", "/").lower()]
 
-# 5. Verify
+# 6. Verify
 print(f"IRON_DIR = {IRON_DIR}")
 print(f"XRT_PYTHON = {XRT_PYTHON}")
 print(f"iron_repo filtered = {'iron_repo' not in '|'.join(sys.path).lower()}")
