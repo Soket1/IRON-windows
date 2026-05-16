@@ -3,7 +3,7 @@
 Verifies that DMA path works correctly by sending known data through
 a minimal kernel (memcpy or concat) and checking the output.
 
-Uses ELF path (insts.bin) for NPU dispatch, same as IRON's fusion.py.
+Uses full ELF path for NPU dispatch (pyxrt.elf + hw_context).
 
 Usage:
     python test_echo.py --version 1  # single ObjectFifo (bo_in -> tile -> bo_out)
@@ -20,43 +20,37 @@ from ml_dtypes import bfloat16
 import pyxrt
 
 
-def run_echo_test(version: int, n: int = 256):
-    build_dir = Path(__file__).resolve().parent.parent.parent.parent / f"build_echo_v{version}"
-    xclbin_path = build_dir / f"echo_v{version}.xclbin"
-    insts_path = build_dir / f"echo_v{version}.bin"
-
-    if not xclbin_path.exists():
-        print(f"ERROR: xclbin not found: {xclbin_path}")
-        sys.exit(1)
-    if not insts_path.exists():
-        print(f"ERROR: insts.bin not found: {insts_path}")
-        sys.exit(1)
-
-    print(f"=== DMA Echo Test v{version} (N={n}) ===")
-    print(f"XCLBIN: {xclbin_path}")
-    print(f"INSTS:  {insts_path}")
-    print()
-
-    # ===== Open device =====
-    device = pyxrt.device(0)
-
-    # ===== Load ELF from insts.bin for NPU dispatch =====
-    # NOTE: XDNA NPU does NOT support device.load_xclbin().
-    #       The ELF (insts.bin) is loaded directly via pyxrt.elf + hw_context.
-
-    # ===== Load ELF from insts.bin for NPU dispatch =====
-    insts_data = insts_path.read_bytes()
-    insts_u8 = np.frombuffer(insts_data, dtype=np.uint8)
+def load_elf_to_pyxrt(elf_path: Path):
+    """Load ELF file and create pyxrt.elf object."""
+    elf_data = elf_path.read_bytes()
+    elf_u8 = np.frombuffer(elf_data, dtype=np.uint8)
     ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
     ctypes.pythonapi.PyCapsule_New.argtypes = [
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p,
     ]
-    capsule = ctypes.pythonapi.PyCapsule_New(insts_u8.ctypes.data, None, None)
-    xrt_elf = pyxrt.elf(capsule, len(insts_data))
+    capsule = ctypes.pythonapi.PyCapsule_New(elf_u8.ctypes.data, None, None)
+    return pyxrt.elf(capsule, len(elf_data))
+
+
+def run_echo_test(version: int, n: int = 256):
+    build_dir = Path(__file__).resolve().parent.parent.parent.parent / f"build_echo_v{version}"
+    elf_path = build_dir / f"echo_v{version}.elf"
+
+    if not elf_path.exists():
+        print(f"ERROR: ELF not found: {elf_path}")
+        print(f"Run compile_echo.py --version {version} first.")
+        sys.exit(1)
+
+    print(f"=== DMA Echo Test v{version} (N={n}) ===")
+    print(f"ELF: {elf_path}")
+    print()
+
+    # ===== Open device + load ELF =====
+    device = pyxrt.device(0)
+    xrt_elf = load_elf_to_pyxrt(elf_path)
 
     # ===== Create hw_context + kernel =====
     hw_ctx = pyxrt.hw_context(device, xrt_elf)
-    # kernel name: "main:sequence" is the IRON default runtime sequence name
     kernel = pyxrt.ext.kernel(hw_ctx, "main:sequence")
     print(f"Kernel loaded: main:sequence")
 

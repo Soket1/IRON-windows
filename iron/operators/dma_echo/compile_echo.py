@@ -85,24 +85,20 @@ def compile_echo(version: int):
         depends=[comp.SourceArtifact.new(kernel_src)],
     )
 
-    xclbin_artifact = comp.XclbinArtifact.new(
-        f"{file_base}.xclbin",
-        depends=[mlir_artifact, kernel_artifact],
-    )
-
-    insts_artifact = comp.InstsBinArtifact.new(
-        f"{file_base}.bin",
-        depends=[mlir_artifact],
+    # Full ELF for NPU dispatch (pyxrt.elf path, not xclbin + insts.bin)
+    elf_artifact = comp.FullElfArtifact(
+        f"{file_base}.elf",
+        mlir_input=mlir_artifact,
+        dependencies=[mlir_artifact, kernel_artifact],
     )
 
     graph = comp.CompilationArtifactGraph()
-    graph.add(xclbin_artifact)
-    graph.add(insts_artifact)
+    graph.add(elf_artifact)
 
     rules = [
         comp.GenerateMLIRFromPythonCompilationRule(),
         comp.PeanoCompilationRule(peano_dir, mlir_aie_dir),
-        comp.AieccXclbinInstsCompilationRule(build_dir, llvm_aie_dir, mlir_aie_dir),
+        comp.AieccFullElfCompilationRule(build_dir, llvm_aie_dir, mlir_aie_dir),
     ]
 
     try:
@@ -111,17 +107,14 @@ def compile_echo(version: int):
         print(f"\nCOMPILATION FAILED: {e}")
         sys.exit(1)
 
-    xclbin_path = build_dir / f"{file_base}.xclbin"
-    insts_path = build_dir / f"{file_base}.bin"
+    elf_path = build_dir / f"{file_base}.elf"
 
     print()
     print("=" * 60)
     print("BUILD SUCCESS")
     print("=" * 60)
-    if xclbin_path.exists():
-        print(f"  XCLBIN: {xclbin_path} ({xclbin_path.stat().st_size} bytes)")
-    if insts_path.exists():
-        print(f"  INSTS:  {insts_path} ({insts_path.stat().st_size} bytes)")
+    if elf_path.exists():
+        print(f"  ELF: {elf_path} ({elf_path.stat().st_size} bytes)")
     print()
     print(f"Test: python test_echo.py --version {version}")
 
