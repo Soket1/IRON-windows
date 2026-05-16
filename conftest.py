@@ -23,6 +23,7 @@ try:
     import pyxrt
     if hasattr(pyxrt, 'bo') and hasattr(pyxrt.bo, 'cacheable'):
         pyxrt.bo.cacheable = pyxrt.bo.host_only
+        print("[CONFTEST] pyxrt.bo.cacheable patched to host_only", flush=True)
 
     from aie.utils.hostruntime.xrtruntime import hostruntime as _hostrt
     _orig_xrt_run = _hostrt.XRTRuntime.run
@@ -56,6 +57,7 @@ try:
                     pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE,
                     insts_bytes, 0,
                 )
+                print(f"[CONFTEST] insts_bo synced to device ({insts_bytes} bytes)", flush=True)
 
         start = _time.time_ns()
         h = kernel_handle.kernel(3, insts_bo, insts_bytes, *buffers)
@@ -69,9 +71,10 @@ try:
         return _hostrt.XRTKernelResult(r, npu_time)
 
     _hostrt.XRTRuntime.run = _xrt_run_with_sync
+    print("[CONFTEST] XRTRuntime.run patched with insts_bo sync", flush=True)
 
-except Exception:
-    pass
+except Exception as _e:
+    print(f"[CONFTEST] WARNING: monkey-patch failed: {_e}", flush=True)
 
 
 @pytest.fixture
