@@ -3,23 +3,33 @@
 Uses aiecc.py (not aiecc.exe which hangs on Windows due to PyInstaller).
 
 Usage:
-    python compile_echo.py --version 1
-    python compile_echo.py --version 2
+    C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\python.exe compile_echo.py --version 1
+    C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\python.exe compile_echo.py --version 2
 """
 import argparse
 import os
 import sys
 from pathlib import Path
 
-# Ensure IRON is importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+# ===== Environment setup (must be before iron imports) =====
+# XRT SDK Python bindings (pyxrt)
+XRT_PYTHON = Path(r"C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python")
+if XRT_PYTHON.exists() and str(XRT_PYTHON) not in sys.path:
+    sys.path.insert(0, str(XRT_PYTHON))
+
+# IRON-windows must be FIRST in sys.path to avoid iron_repo conflict
+IRON_DIR = Path(__file__).resolve().parent.parent.parent
+if str(IRON_DIR) not in sys.path:
+    sys.path.insert(0, str(IRON_DIR))
+
+# Remove iron_repo from sys.path if present (conflicts with IRON-windows)
+sys.path = [p for p in sys.path if "iron_repo" not in p]
 
 from iron.common.compilation import base as comp
 
 
 def compile_echo(version: int):
-    iron_dir = Path(__file__).resolve().parent.parent.parent
-    build_dir = iron_dir / f"build_echo_v{version}"
+    build_dir = IRON_DIR / f"build_echo_v{version}"
     build_dir.mkdir(exist_ok=True)
 
     # Detect env paths
@@ -38,15 +48,17 @@ def compile_echo(version: int):
         sys.exit(1)
 
     print(f"=== Compiling Echo v{version} ===")
+    print(f"IRON:     {IRON_DIR}")
     print(f"Peano:    {peano_dir}")
     print(f"mlir_aie: {mlir_aie_dir}")
+    print(f"XRT:     {XRT_PYTHON} ({'OK' if XRT_PYTHON.exists() else 'MISSING'})")
     print(f"Build:    {build_dir}")
     print()
 
     # ===== Set up artifacts =====
     file_base = f"echo_v{version}"
     design_dir = Path(__file__).resolve().parent
-    kernel_src = iron_dir / "aie_kernels" / "aie2p" / "echo.cc"
+    kernel_src = IRON_DIR / "aie_kernels" / "aie2p" / "echo.cc"
 
     # 1. MLIR from design.py
     callback_fn = f"echo_v{version}"
