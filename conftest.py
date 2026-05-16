@@ -130,11 +130,11 @@ def pytest_runtest_makereport(item, call):
             # iron/operators/dequant/test.py::test_dequant[iter0-dequant_8_cols_2_channels_2048_tile_128]
             # Extract only the stem out of that.
             nodeid_components = re.match(
-                r"^(.+?)::(.+?)\[(iter\d+-)?(.+?)\]$", item.nodeid
+                r"^(.+?)::(.+?)(?:\[(iter\d+-)?(.+?)\])?$", item.nodeid
             )
             if not nodeid_components:
                 raise RuntimeError(f"Unexpected test nodeid format: {item.nodeid}")
-            test_name = nodeid_components.group(4)
+            test_name = nodeid_components.group(4) or nodeid_components.group(2)
 
             passed = report.outcome == "passed"
             captured = report.capstdout
