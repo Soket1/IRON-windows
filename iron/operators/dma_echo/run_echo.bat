@@ -24,9 +24,10 @@ set "PATH=%AMD_DRIVER_DIR%;%CD%;%PATH%"
 
 set "PYTHONPATH=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python;C:\Python313\Lib\site-packages;%PYTHONPATH%"
 set "PEANO_INSTALL_DIR=C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\win64.o\tools\peano"
+set "LLVM_AIE_BIN=C:\Python313\Lib\site-packages\llvm-aie\bin"
 set "XRT_BIN_DIR=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt"
 set "MLIR_AIE_BIN_DIR=C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\mlir_aie\bin"
-set "PATH=%PEANO_INSTALL_DIR%\bin;%XRT_BIN_DIR%;%MLIR_AIE_BIN_DIR%;%PATH%"
+set "PATH=%PEANO_INSTALL_DIR%\bin;%LLVM_AIE_BIN%;%XRT_BIN_DIR%;%MLIR_AIE_BIN_DIR%;%PATH%"
 
 set "PYTHON=C:\Python313\python.exe"
 

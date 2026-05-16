@@ -45,8 +45,11 @@ def compile_echo(version: int):
         "CONDA_PREFIX",
         r"C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1"
     ))
+    # win64.o peano has AIE-targeted clang (for kernel compilation)
     peano_dir = conda_prefix / "Lib" / "site-packages" / "win64.o" / "tools" / "peano"
     mlir_aie_dir = conda_prefix / "Lib" / "site-packages" / "mlir_aie"
+    # llvm-aie has opt/llc (for aiecc.py xclbin/insts compilation)
+    llvm_aie_dir = Path(r"C:\Python313\Lib\site-packages\llvm-aie")
 
     if not peano_dir.exists():
         print(f"ERROR: Peano not found at {peano_dir}")
@@ -54,11 +57,16 @@ def compile_echo(version: int):
     if not mlir_aie_dir.exists():
         print(f"ERROR: mlir_aie not found at {mlir_aie_dir}")
         sys.exit(1)
+    if not llvm_aie_dir.exists():
+        print(f"ERROR: llvm-aie not found at {llvm_aie_dir}")
+        print("Install: pip install llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly")
+        sys.exit(1)
 
     print(f"=== Compiling Echo v{version} ===")
-    print(f"Peano:    {peano_dir}")
-    print(f"mlir_aie: {mlir_aie_dir}")
-    print(f"Build:    {build_dir}")
+    print(f"Peano (clang):  {peano_dir}")
+    print(f"LLVM-AIE (opt): {llvm_aie_dir}")
+    print(f"mlir_aie:       {mlir_aie_dir}")
+    print(f"Build:          {build_dir}")
     print()
 
     file_base = f"echo_v{version}"
@@ -94,7 +102,7 @@ def compile_echo(version: int):
     rules = [
         comp.GenerateMLIRFromPythonCompilationRule(),
         comp.PeanoCompilationRule(peano_dir, mlir_aie_dir),
-        comp.AieccXclbinInstsCompilationRule(build_dir, peano_dir, mlir_aie_dir),
+        comp.AieccXclbinInstsCompilationRule(build_dir, llvm_aie_dir, mlir_aie_dir),
     ]
 
     try:
