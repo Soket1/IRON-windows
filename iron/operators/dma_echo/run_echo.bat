@@ -21,7 +21,7 @@ REM Same env as debug_flowkv.bat
 set "AMD_DRIVER_DIR=C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_1a1aa059597c4810"
 set "PATH=%AMD_DRIVER_DIR%;%CD%;%PATH%"
 
-set "PYTHONPATH=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python;C:\Python313\Lib\site-packages\llvm-aie;C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages;%PYTHONPATH%"
+set "PYTHONPATH=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python;C:\Python313\Lib\site-packages\llvm-aie;C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\mlir_aie\python;%PYTHONPATH%"
 set "PEANO_INSTALL_DIR=C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\win64.o\tools\peano"
 set "LLVM_AIE_BIN=C:\Python313\Lib\site-packages\llvm-aie\bin"
 set "XRT_BIN_DIR=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt"
