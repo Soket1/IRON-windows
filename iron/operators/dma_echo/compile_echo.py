@@ -1,62 +1,39 @@
 """Compile DMA echo test using IRON's compilation framework.
 
-Usage (from IRON-windows root):
-    conda activate ryzen-ai-1.7.1
-    python iron\operators\dma_echo\compile_echo.py --version 1
+Must be run with C:\Python313\python.exe + PYTHONPATH including XRT SDK.
+Use run_echo.bat which sets up the environment correctly.
+
+Usage (manual, from IRON-windows root):
+    set PYTHONPATH=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python;%PYTHONPATH%
+    C:\Python313\python.exe iron\operators\dma_echo\compile_echo.py --version 1
 """
 import os
 import sys
 from pathlib import Path
 
-# ===== 1. Paths — MUST be before any imports =====
-
 # IRON-windows root (4 levels up from this script)
 IRON_DIR = str(Path(__file__).resolve().parent.parent.parent.parent)
-assert IRON_DIR.endswith("IRON-windows"), f"Bad IRON_DIR: {IRON_DIR}"
 
-# XRT SDK Python bindings (pyxrt)
-XRT_PYTHON = r"C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python"
-# XRT runtime DLLs
-XRT_BIN = r"C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt"
-# AMD NPU driver
-AMD_DRIVER = r"C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_1a1aa059597c4810"
-
-# ===== 2. Fix sys.path BEFORE any iron import =====
-
-# Add XRT python bindings
-if os.path.isdir(XRT_PYTHON) and XRT_PYTHON not in sys.path:
-    sys.path.insert(0, XRT_PYTHON)
-
-# Add XRT + driver DLLs to PATH (pyxrt needs them at DLL load time)
-for d in [XRT_BIN, AMD_DRIVER]:
-    if os.path.isdir(d) and d not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
-
-# Nuke ALL iron_repo references from sys.path
+# Nuke iron_repo from sys.path — it shadows IRON-windows
 sys.path = [p for p in sys.path if "iron_repo" not in p]
 
 # IRON-windows FIRST
 if IRON_DIR not in sys.path:
     sys.path.insert(0, IRON_DIR)
 
-# ===== 3. Debug: verify where iron comes from =====
-print(f"IRON_DIR   = {IRON_DIR}")
-print(f"sys.path[0] = {sys.path[0]}")
-
-# Dry-run import to confirm it picks up IRON-windows
+# Verify iron resolves correctly
 import importlib
 _spec = importlib.util.find_spec("iron")
 if _spec is None:
-    print("ERROR: 'iron' package not found at all")
+    print("ERROR: 'iron' package not found. Is IRON-windows cloned correctly?")
     sys.exit(1)
-_origin = _spec.origin or _spec.submodule_search_locations
-print(f"iron       = {_origin}")
-if "iron_repo" in str(_origin):
-    print("ERROR: iron still resolves to iron_repo!")
+_origin = str(_spec.origin or _spec.submodule_search_locations)
+if "iron_repo" in _origin:
+    print(f"ERROR: iron resolves to iron_repo: {_origin}")
+    print("Remove or rename C:\\llama.cpp-xdna\\iron_repo")
     sys.exit(1)
-print()
+print(f"iron = {_origin}")
 
-# ===== 4. Import IRON compilation framework =====
 import argparse
 from iron.common.compilation import base as comp
 
