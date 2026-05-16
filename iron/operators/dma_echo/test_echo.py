@@ -3,6 +3,8 @@
 Verifies that DMA path works correctly by sending known data through
 a minimal kernel (memcpy or concat) and checking the output.
 
+Uses ELF path (insts.bin) for NPU dispatch, same as IRON's fusion.py.
+
 Usage:
     python test_echo.py --version 1  # single ObjectFifo (bo_in -> tile -> bo_out)
     python test_echo.py --version 2  # dual ObjectFifo (bo_a + bo_b -> tile -> bo_out)
@@ -25,40 +27,41 @@ def run_echo_test(version: int, n: int = 256):
 
     if not xclbin_path.exists():
         print(f"ERROR: xclbin not found: {xclbin_path}")
-        print(f"Run build_echo.bat {version} first.")
+        sys.exit(1)
+    if not insts_path.exists():
+        print(f"ERROR: insts.bin not found: {insts_path}")
         sys.exit(1)
 
     print(f"=== DMA Echo Test v{version} (N={n}) ===")
     print(f"XCLBIN: {xclbin_path}")
+    print(f"INSTS:  {insts_path}")
     print()
 
-    # ===== Open device & load xclbin =====
+    # ===== Open device =====
     device = pyxrt.device(0)
-    xclbin_uuid = device.load_xclbin(str(xclbin_path))
-    print(f"XCLBIN loaded: {xclbin_uuid}")
 
-    # ===== Read instruction binary =====
+    # ===== Load ELF from insts.bin for NPU dispatch =====
+    # NOTE: XDNA NPU does NOT support device.load_xclbin().
+    #       The ELF (insts.bin) is loaded directly via pyxrt.elf + hw_context.
+
+    # ===== Load ELF from insts.bin for NPU dispatch =====
     insts_data = insts_path.read_bytes()
-    insts_size = len(insts_data)
-
-    # ===== Create ELF from insts.bin for NPU dispatch =====
     insts_u8 = np.frombuffer(insts_data, dtype=np.uint8)
     ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
     ctypes.pythonapi.PyCapsule_New.argtypes = [
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p,
     ]
     capsule = ctypes.pythonapi.PyCapsule_New(insts_u8.ctypes.data, None, None)
-    xrt_elf = pyxrt.elf(capsule, insts_size)
-    hw_ctx = pyxrt.hw_context(device, xrt_elf)
+    xrt_elf = pyxrt.elf(capsule, len(insts_data))
 
-    # Determine kernel name (IRON uses "sequence" as default runtime sequence name)
-    # The kernel_name in the xclbin depends on the IRON-generated MLIR
+    # ===== Create hw_context + kernel =====
+    hw_ctx = pyxrt.hw_context(device, xrt_elf)
+    # kernel name: "main:sequence" is the IRON default runtime sequence name
     kernel = pyxrt.ext.kernel(hw_ctx, "main:sequence")
     print(f"Kernel loaded: main:sequence")
 
     # ===== Allocate BOs =====
-    dtype = np.dtype(bfloat16)
-    elem_bytes = 2  # bf16 = 2 bytes
+    elem_bytes = 2  # bf16
 
     if version == 1:
         bo_in = pyxrt.bo(device, n * elem_bytes, pyxrt.bo.normal, kernel.group_id(0))
@@ -126,15 +129,12 @@ def run_echo_test(version: int, n: int = 256):
     print(f"Kernel finished, state={state}")
 
     if state != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
-        print(f"❌ Kernel execution failed: {state}")
+        print(f"Kernel execution failed: {state}")
         return False
 
     # ===== Read back output =====
     out_size = (2 * n * elem_bytes) if version == 2 else (n * elem_bytes)
-    if version == 1:
-        bo_out.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE, out_size, 0)
-    elif version == 2:
-        bo_out.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE, out_size, 0)
+    bo_out.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE, out_size, 0)
 
     out_map = bo_out.map()
     out_arr = np.frombuffer(out_map, dtype=np.uint16)
@@ -150,21 +150,21 @@ def run_echo_test(version: int, n: int = 256):
         match_count = np.sum(out_arr[:n] == PATTERN)
         print(f"Match with input pattern (0x{PATTERN:04X}): {match_count}/{n}")
         if out_arr[0] == 0x3E39:
-            print(f"Output[0] = 0x3E39 ✓ (matches input[0])")
+            print(f"Output[0] = 0x3E39 (matches input[0])")
         else:
-            print(f"Output[0] = 0x{out_arr[0]:04X} ✗ (expected 0x3E39)")
+            print(f"Output[0] = 0x{out_arr[0]:04X} (expected 0x3E39)")
 
         if match_count == n:
-            print("✅ DMA ECHO v1 PASSED — output matches input!")
+            print("DMA ECHO v1 PASSED - output matches input!")
         elif match_count > n * 0.9:
-            print("⚠️  MOSTLY OK — some data corruption")
+            print("MOSTLY OK - some data corruption")
         else:
             zero_count = np.sum(out_arr[:n] == 0)
             if zero_count == n:
-                print("❌ FAILED — output is all zeros (DMA didn't write)")
+                print("FAILED - output is all zeros (DMA didn't write)")
             else:
-                print(f"❌ FAILED — DMA reads/writes wrong data")
-                print(f"   Expected: 0x{PATTERN:04X} × {n}")
+                print(f"FAILED - DMA reads/writes wrong data")
+                print(f"   Expected: 0x{PATTERN:04X} x {n}")
                 print(f"   Got:      {match_count} matches, {n - match_count} mismatches")
             success = False
 
@@ -174,13 +174,13 @@ def run_echo_test(version: int, n: int = 256):
         a_marker_ok = out_arr[0] == MARKER_A
         b_marker_ok = out_arr[n] == MARKER_B
 
-        print(f"A region match: {a_match}/{n}  marker[0]: 0x{out_arr[0]:04X} {'✓' if a_marker_ok else '✗'}")
-        print(f"B region match: {b_match}/{n}  marker[N]: 0x{out_arr[n]:04X} {'✓' if b_marker_ok else '✗'}")
+        print(f"A region match: {a_match}/{n}  marker[0]: 0x{out_arr[0]:04X} {'OK' if a_marker_ok else 'FAIL'}")
+        print(f"B region match: {b_match}/{n}  marker[N]: 0x{out_arr[n]:04X} {'OK' if b_marker_ok else 'FAIL'}")
 
         if a_match == n and b_match == n:
-            print("✅ DMA ECHO v2 PASSED — dual ObjectFifo concat works!")
+            print("DMA ECHO v2 PASSED - dual ObjectFifo concat works!")
         else:
-            print("❌ FAILED — dual DMA path broken")
+            print("FAILED - dual DMA path broken")
             success = False
 
     print()
