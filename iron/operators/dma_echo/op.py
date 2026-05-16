@@ -6,8 +6,12 @@ import numpy as np
 from pathlib import Path
 from ml_dtypes import bfloat16
 
+import aie.utils as aie_utils
+from aie.utils.npukernel import NPUKernel
+
 from iron.common import (
     AIEOperatorBase,
+    AIERuntimeArgSpec,
     XclbinArtifact,
     InstsBinArtifact,
     KernelObjectArtifact,
@@ -55,17 +59,27 @@ class AIEEchoV1(AIEOperatorBase):
         )
 
         self.xclbin_artifact = xclbin_artifact
+        self.insts_artifact = insts_artifact
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
-    def set_up_runtime(self):
-        self.add_buffer("input", self.size)
-        self.add_buffer("output", self.size)
-        self.add_kernel(
-            "echo_v1",
-            self.xclbin_artifact,
-            self.xclbin_artifact.kernel_name,
+    def get_arg_spec(self):
+        return [
+            AIERuntimeArgSpec("in", (self.size,)),
+            AIERuntimeArgSpec("out", (self.size,)),
+        ]
+
+    def get_callable(self):
+        npu_kernel = NPUKernel(
+            xclbin_path=self.xclbin_artifact.filename,
+            kernel_name=self.xclbin_artifact.kernel_name,
+            insts_path=self.insts_artifact.filename,
         )
-        self.add_to_runlist("echo_v1", "input", "output")
+        handle = aie_utils.DefaultNPURuntime.load(npu_kernel)
+
+        def call(*args):
+            return aie_utils.DefaultNPURuntime.run(handle, list(args))
+
+        return call
 
     def forward(self, input_data):
         return self.run(input_data)
@@ -110,18 +124,28 @@ class AIEEchoV2(AIEOperatorBase):
         )
 
         self.xclbin_artifact = xclbin_artifact
+        self.insts_artifact = insts_artifact
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
-    def set_up_runtime(self):
-        self.add_buffer("input_a", self.size)
-        self.add_buffer("input_b", self.size)
-        self.add_buffer("output", 2 * self.size)
-        self.add_kernel(
-            "echo_v2",
-            self.xclbin_artifact,
-            self.xclbin_artifact.kernel_name,
+    def get_arg_spec(self):
+        return [
+            AIERuntimeArgSpec("in", (self.size,)),
+            AIERuntimeArgSpec("in", (self.size,)),
+            AIERuntimeArgSpec("out", (2 * self.size,)),
+        ]
+
+    def get_callable(self):
+        npu_kernel = NPUKernel(
+            xclbin_path=self.xclbin_artifact.filename,
+            kernel_name=self.xclbin_artifact.kernel_name,
+            insts_path=self.insts_artifact.filename,
         )
-        self.add_to_runlist("echo_v2", "input_a", "input_b", "output")
+        handle = aie_utils.DefaultNPURuntime.load(npu_kernel)
+
+        def call(*args):
+            return aie_utils.DefaultNPURuntime.run(handle, list(args))
+
+        return call
 
     def forward(self, input_a, input_b):
         return self.run(input_a, input_b)
