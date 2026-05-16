@@ -294,10 +294,14 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     # Tensor Access Patterns
     # -------------------------------------------------------------------------
-    # KV cache DDR layout: contiguous K then contiguous V.
+    # KV cache DDR layout: K and V combined in arg1 (single buffer).
+    # IRON compiler bug: both K_fifos and V_fifos DMA read from arg1.
+    # Workaround: put K+V in one buffer, offset V TAP past K region.
+    #
+    # bo_v layout: [K_all (num_kv*seq*hd) | V_all (num_kv*seq*hd)]
     # For KV head h, position p:
     #   K[h, p, :] at offset (h * seq_len + p) * head_dim
-    #   V[h, p, :] at offset num_kv_heads * seq_len * head_dim + (h * seq_len + p) * head_dim
+    #   V[h, p, :] at offset kv_region_size + (h * seq_len + p) * head_dim
 
     def make_q_tap(kv_head_idx):
         """Q tap: select group_size query heads + RoPE angles for this KV group.
@@ -324,10 +328,13 @@ def my_flowkv_decode(
         )
 
     def make_v_tap(kv_head_idx):
-        """V tap: stream V rows from V buffer."""
-        base = kv_head_idx * seq_len * head_dim
+        """V tap: stream V rows from combined K+V buffer (arg1).
+        V data starts after K region: offset = kv_region_size + kv_head_idx * seq * hd.
+        """
+        kv_region_size = num_kv_heads * seq_len * head_dim
+        base = kv_region_size + kv_head_idx * seq_len * head_dim
         return TensorAccessPattern(
-            tensor_dims=(num_kv_heads * seq_len * head_dim,),
+            tensor_dims=(2 * num_kv_heads * seq_len * head_dim,),
             offset=base,
             sizes=[1, seq_len, 1, head_dim],
             strides=[0, head_dim, 0, 1],
