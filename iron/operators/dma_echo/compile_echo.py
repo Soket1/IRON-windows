@@ -1,12 +1,11 @@
-"""Compile DMA echo test using IRON's compilation framework.
-
-Must be run with C:\Python313\python.exe + PYTHONPATH including XRT SDK.
-Use run_echo.bat which sets up the environment correctly.
-
-Usage (manual, from IRON-windows root):
-    set PYTHONPATH=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python;%PYTHONPATH%
-    C:\Python313\python.exe iron\operators\dma_echo\compile_echo.py --version 1
-"""
+# Compile DMA echo test using IRON's compilation framework.
+#
+# Must be run with C:\Python313\python.exe + PYTHONPATH including XRT SDK.
+# Use run_echo.bat which sets up the environment correctly.
+#
+# Usage (manual, from IRON-windows root):
+#   set PYTHONPATH=C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python;%PYTHONPATH%
+#   C:\Python313\python.exe iron\operators\dma_echo\compile_echo.py --version 1
 import os
 import sys
 from pathlib import Path
