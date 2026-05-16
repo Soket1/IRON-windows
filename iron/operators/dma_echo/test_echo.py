@@ -19,7 +19,7 @@ import pyxrt
 
 
 def run_echo_test(version: int, n: int = 256):
-    build_dir = Path(__file__).parent / f"build_echo_v{version}"
+    build_dir = Path(__file__).resolve().parent.parent.parent.parent / f"build_echo_v{version}"
     xclbin_path = build_dir / f"echo_v{version}.xclbin"
     insts_path = build_dir / f"echo_v{version}.bin"
 
