@@ -13,6 +13,16 @@ import statistics
 from iron.common import AIEContext
 import aie.utils as aie_utils
 
+# Workaround: pyxrt.bo.cacheable crashes on XDNA NPU driver.
+# CachedXRTRuntime (DefaultNPURuntime) uses cacheable for insts buffers.
+# Patch it to host_only which works on XDNA.
+try:
+    import pyxrt
+    if hasattr(pyxrt, 'bo') and hasattr(pyxrt.bo, 'cacheable'):
+        pyxrt.bo.cacheable = pyxrt.bo.host_only
+except Exception:
+    pass
+
 
 @pytest.fixture
 def aie_context(request):
