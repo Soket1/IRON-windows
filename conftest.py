@@ -26,7 +26,7 @@ try:
         print("[CONFTEST] pyxrt.bo.cacheable patched to host_only", flush=True)
 
     from aie.utils.hostruntime.xrtruntime import hostruntime as _hostrt
-    _orig_xrt_run = _hostrt.XRTRuntime.run
+    _orig_xrt_run = _hostrt.XRTHostRuntime.run
 
     def _xrt_run_with_sync(self, kernel_handle, args, trace_config=None,
                            fail_on_error=True, **kwargs):
@@ -70,7 +70,7 @@ try:
         npu_time = stop - start
         return _hostrt.XRTKernelResult(r, npu_time)
 
-    _hostrt.XRTRuntime.run = _xrt_run_with_sync
+    _hostrt.XRTHostRuntime.run = _xrt_run_with_sync
     print("[CONFTEST] XRTRuntime.run patched with insts_bo sync", flush=True)
 
 except Exception as _e:
