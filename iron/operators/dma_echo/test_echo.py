@@ -45,14 +45,17 @@ def run_echo_test(version: int, n: int = 256):
     print(f"ELF: {elf_path}")
     print()
 
-    # ===== Open device + load ELF =====
+    # ===== Open device + load xclbin =====
     device = pyxrt.device(0)
-    xrt_elf = load_elf_to_pyxrt(elf_path)
+    xclbin_path = build_dir / f"echo_v{version}.xclbin"
+    if not xclbin_path.exists():
+        print(f"ERROR: xclbin not found: {xclbin_path}")
+        sys.exit(1)
 
-    # ===== Create hw_context + kernel =====
-    hw_ctx = pyxrt.hw_context(device, xrt_elf)
-    kernel = pyxrt.ext.kernel(hw_ctx, "main:sequence")
-    print(f"Kernel loaded: main:sequence")
+    xclbin_obj = pyxrt.xclbin(str(xclbin_path))
+    hw_ctx = pyxrt.hw_context(device, xclbin_obj)
+    kernel = pyxrt.ext.kernel(hw_ctx, "MLIR_AIE:echo_v1")
+    print(f"Kernel loaded")
 
     # ===== Allocate BOs =====
     elem_bytes = 2  # bf16
