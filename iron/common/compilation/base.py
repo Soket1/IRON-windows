@@ -565,7 +565,6 @@ class ShellCompilationCommand(CompilationCommand):
         try:
             result = subprocess.run(
                 self.command,
-                capture_output=True,
                 text=True,
                 cwd=self.cwd,
                 env={**self.env, "PYTHONUNBUFFERED": "1"},
