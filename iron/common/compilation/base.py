@@ -809,26 +809,45 @@ class AieccCompilationRule(CompilationRule):
     def _resolve_aiecc(mlir_aie_dir: Path) -> Path:
         """Locate aiecc on the current platform.
 
-        Search order (all platforms):
+        On Windows, prefer the native aiecc.exe binary.  aiecc.py is a
+        Python wrapper that spawns aiecc.exe via ``subprocess.run()``
+        **without** ``stdin=DEVNULL``, which causes a PyInstaller stdin
+        deadlock on Windows (hundreds of zombie aiecc.exe processes).
+        By calling aiecc.exe directly we avoid the nested subprocess
+        and the ``stdin=DEVNULL`` in ShellCompilationCommand is applied
+        to the actual compiler binary.
+
+        Search order on Windows:
+          1. <mlir_aie_dir>/bin/aiecc.exe  (native binary, preferred)
+          2. <mlir_aie_dir>/bin/aiecc      (shell wrapper / native)
+          3. <mlir_aie_dir>/bin/aiecc.py   (Python wrapper — spawns exe)
+          4. System PATH (aiecc.exe, aiecc, aiecc.py)
+
+        Search order on Linux/macOS:
           1. <mlir_aie_dir>/bin/aiecc.py   (Python wrapper, preferred)
           2. <mlir_aie_dir>/bin/aiecc      (shell wrapper / native)
-          3. <mlir_aie_dir>/bin/aiecc.exe  (Windows native)
-          4. System PATH (aiecc.py, aiecc, aiecc.exe)
+          3. System PATH
         """
-        candidates: list[Path] = [
-            mlir_aie_dir / "bin" / "aiecc.py",
-            mlir_aie_dir / "bin" / "aiecc",
-        ]
         if sys.platform == "win32":
-            candidates.append(mlir_aie_dir / "bin" / "aiecc.exe")
+            candidates: list[Path] = [
+                mlir_aie_dir / "bin" / "aiecc.exe",
+                mlir_aie_dir / "bin" / "aiecc",
+                mlir_aie_dir / "bin" / "aiecc.py",
+            ]
+        else:
+            candidates = [
+                mlir_aie_dir / "bin" / "aiecc.py",
+                mlir_aie_dir / "bin" / "aiecc",
+            ]
         for c in candidates:
             if c.is_file():
                 print(f"[AIECC-RESOLVE] Using: {c} (size={c.stat().st_size})", file=sys.stderr)
                 return c
         # Fallback: check system PATH
-        path_names = ["aiecc.py", "aiecc"]
         if sys.platform == "win32":
-            path_names.append("aiecc.exe")
+            path_names = ["aiecc.exe", "aiecc", "aiecc.py"]
+        else:
+            path_names = ["aiecc.py", "aiecc"]
         for name in path_names:
             found = shutil.which(name)
             if found:
