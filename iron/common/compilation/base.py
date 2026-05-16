@@ -563,6 +563,7 @@ class ShellCompilationCommand(CompilationCommand):
             exe = self.command[0]
 
         try:
+            print(f"[AIECC-RUN] command={self.command}", file=sys.stderr)
             result = subprocess.run(
                 self.command,
                 text=True,
@@ -822,6 +823,7 @@ class AieccCompilationRule(CompilationRule):
             candidates.append(mlir_aie_dir / "bin" / "aiecc.exe")
         for c in candidates:
             if c.is_file():
+                print(f"[AIECC-RESOLVE] Using: {c} (size={c.stat().st_size})", file=sys.stderr)
                 return c
         # Fallback: check system PATH
         path_names = ["aiecc.py", "aiecc"]
