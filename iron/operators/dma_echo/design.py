@@ -1,10 +1,12 @@
 # Minimal DMA echo test for XDNA debugging.
-# Two versions:
+# Three versions:
 #   v1: single ObjectFifo (bo_in → tile → bo_out)
 #   v2: dual ObjectFifo (bo_a + bo_b → tile concat → bo_out)
+#   v3: FlowKV-like split path (bo_k → tile0 → inter FIFO → tile1, bo_v → tile1 → bo_out)
 #
 # Usage: python design.py --dev npu2 --version 1 -o echo_v1.mlir
 #        python design.py --dev npu2 --version 2 -o echo_v2.mlir
+#        python design.py --dev npu2 --version 3 -o echo_v3.mlir
 
 import numpy as np
 from pathlib import Path
@@ -107,18 +109,83 @@ def echo_v2(dev, N=128):
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
+def echo_v3(dev, N=128):
+    """Version 3: FlowKV-like two-worker path.
+    bo_k -> k_fifo -> score tile -> inter_fifo -> value tile
+    bo_v -> v_fifo ---------------------------> value tile -> out_fifo -> bo_out
+    """
+    dtype_in = np.dtype[bfloat16]
+    dev_ty = NPU1() if dev == "npu" else NPU2()
+
+    L1_ty = np.ndarray[(N,), dtype_in]
+    L1_full = np.ndarray[(2 * N,), dtype_in]
+    L3_half = np.ndarray[(N,), dtype_in]
+    L3_full = np.ndarray[(2 * N,), dtype_in]
+
+    score_fn = Kernel("echo_score_bf16", "echo.o", [L1_ty, L1_ty, np.int32])
+    value_fn = Kernel("echo_value_bf16", "echo.o", [L1_ty, L1_ty, L1_full, np.int32])
+
+    k_fifo = ObjectFifo(L1_ty, name="k_fifo", depth=2)
+    v_fifo = ObjectFifo(L1_ty, name="v_fifo", depth=2)
+    inter_fifo = ObjectFifo(L1_ty, name="inter_fifo", depth=2)
+    out_fifo = ObjectFifo(L1_full, name="out_fifo", depth=2)
+
+    def score_body(kf, inter, fn):
+        for _ in range_(0xFFFFFFFF):
+            k = kf.acquire(1)
+            i = inter.acquire(1)
+            fn(k, i, N)
+            kf.release(1)
+            inter.release(1)
+
+    def value_body(inter, vf, ofo, fn):
+        for _ in range_(0xFFFFFFFF):
+            i = inter.acquire(1)
+            v = vf.acquire(1)
+            out = ofo.acquire(1)
+            fn(i, v, out, N)
+            inter.release(1)
+            vf.release(1)
+            ofo.release(1)
+
+    score_worker = Worker(score_body, [k_fifo.cons(), inter_fifo.prod(), score_fn])
+    value_worker = Worker(value_body, [inter_fifo.cons(), v_fifo.cons(), out_fifo.prod(), value_fn])
+
+    rt = Runtime()
+    with rt.sequence(L3_half, L3_half, L3_full) as (bo_k, bo_v, bo_out):
+        rt.start(score_worker)
+        rt.start(value_worker)
+        tg = rt.task_group()
+        rt.fill(k_fifo.prod(), bo_k,
+                TensorAccessPattern((N,), 0, [1, 1, 1, N], [0, 0, 0, 1]),
+                task_group=tg)
+        rt.fill(v_fifo.prod(), bo_v,
+                TensorAccessPattern((N,), 0, [1, 1, 1, N], [0, 0, 0, 1]),
+                task_group=tg)
+        tg_out = rt.task_group()
+        rt.drain(out_fifo.cons(), bo_out,
+                 TensorAccessPattern((2 * N,), 0, [1, 1, 1, 2 * N], [0, 0, 0, 1]),
+                 task_group=tg_out, wait=True)
+        rt.finish_task_group(tg)
+        rt.finish_task_group(tg_out)
+
+    return Program(dev_ty, rt).resolve_program(SequentialPlacer())
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", default="npu2", choices=["npu", "npu2"])
-    ap.add_argument("--version", type=int, choices=[1, 2], required=True)
+    ap.add_argument("--version", type=int, choices=[1, 2, 3], required=True)
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("-o", "--output-file-path", required=True)
     args = ap.parse_args()
 
     if args.version == 1:
         module = echo_v1(args.dev, args.n)
-    else:
+    elif args.version == 2:
         module = echo_v2(args.dev, args.n)
+    else:
+        module = echo_v3(args.dev, args.n)
 
     Path(args.output_file_path).write_text(str(module))
     print(f"Wrote {args.output_file_path}")

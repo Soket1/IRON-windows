@@ -56,7 +56,7 @@ int main(int argc, char * argv[]) {
     if (argc < 3) {
         fprintf(stderr, "[echo_test] usage branch\n"); fflush(stderr);
         printf("Usage: %s <xclbin> <insts> [version]\n", argv[0]);
-        printf("  version: 1=copy (default), 2=concat\n");
+        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo\n");
         return 1;
     }
 
@@ -196,7 +196,7 @@ int main(int argc, char * argv[]) {
         }
         printf("PASS: echo v1\n");
 
-    } else {
+    } else if (version == 2) {
         fprintf(stderr, "[echo_test] enter v2 branch\n"); fflush(stderr);
         // --- Echo v2: dual concat ---
         int half_bytes = N * 2;
@@ -288,6 +288,99 @@ int main(int argc, char * argv[]) {
             return 1;
         }
         printf("PASS: echo v2\n");
+
+    } else if (version == 3) {
+        fprintf(stderr, "[echo_test] enter v3 branch\n"); fflush(stderr);
+        // --- Echo v3: K -> score tile -> inter FIFO -> value tile, V -> value tile, concat out ---
+        int half_bytes = N * 2;
+        int full_bytes = 2 * N * 2;
+
+        xrt::bo bo_k(dev, half_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        fprintf(stderr, "[echo_test] after bo_k create\n"); fflush(stderr);
+        xrt::bo bo_v(dev, half_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        fprintf(stderr, "[echo_test] after bo_v create\n"); fflush(stderr);
+        xrt::bo bo_out(dev, full_bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+        fprintf(stderr, "[echo_test] after v3 bo_out create\n"); fflush(stderr);
+
+        auto k_ptr = bo_k.map<uint16_t*>();
+        fprintf(stderr, "[echo_test] after bo_k map\n"); fflush(stderr);
+        auto v_ptr = bo_v.map<uint16_t*>();
+        fprintf(stderr, "[echo_test] after bo_v map\n"); fflush(stderr);
+        for (int i = 0; i < N; i++) {
+            k_ptr[i] = f32_to_bf16((float)(i + 1));
+            v_ptr[i] = f32_to_bf16((float)(i + 1) * 10);
+        }
+        bo_k.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "[echo_test] after bo_k sync\n"); fflush(stderr);
+        bo_v.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "[echo_test] after bo_v sync\n"); fflush(stderr);
+        printf("Inputs synced\n");
+        fflush(stdout);
+
+        auto out_ptr = bo_out.map<uint16_t*>();
+        fprintf(stderr, "[echo_test] after v3 bo_out map\n"); fflush(stderr);
+        memset(out_ptr, 0, full_bytes);
+        fprintf(stderr, "[echo_test] after v3 clear output\n"); fflush(stderr);
+
+        printf("Dispatching kernel...\n");
+        fflush(stdout);
+        fprintf(stderr, "[echo_test] before v3 run create\n"); fflush(stderr);
+        auto run = xrt::run(kernel);
+        fprintf(stderr, "[echo_test] after v3 run create\n"); fflush(stderr);
+        run.set_arg(0, 3u);
+        fprintf(stderr, "[echo_test] after v3 set_arg0\n"); fflush(stderr);
+        run.set_arg(1, insts_bo);
+        fprintf(stderr, "[echo_test] after v3 set_arg1\n"); fflush(stderr);
+        run.set_arg(2, (uint32_t)insts_data.size());
+        fprintf(stderr, "[echo_test] after v3 set_arg2\n"); fflush(stderr);
+        run.set_arg(3, bo_k);
+        fprintf(stderr, "[echo_test] after v3 set_arg3\n"); fflush(stderr);
+        run.set_arg(4, bo_v);
+        fprintf(stderr, "[echo_test] after v3 set_arg4\n"); fflush(stderr);
+        run.set_arg(5, bo_out);
+        fprintf(stderr, "[echo_test] after v3 set_arg5\n"); fflush(stderr);
+
+        fprintf(stderr, "[echo_test] before v3 start\n"); fflush(stderr);
+        run.start();
+        fprintf(stderr, "[echo_test] after v3 start\n"); fflush(stderr);
+        auto state = run.wait(10000);
+        fprintf(stderr, "[echo_test] after v3 wait state=%d\n", (int)state); fflush(stderr);
+
+        if (state != ERT_CMD_STATE_COMPLETED) {
+            printf("FAIL: kernel returned state=%d\n", (int)state);
+            return 1;
+        }
+        printf("Kernel completed\n");
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        int match_k = 0, match_v = 0;
+        for (int i = 0; i < N; i++) {
+            if (out_ptr[i] == k_ptr[i]) match_k++;
+            if (out_ptr[N + i] == v_ptr[i]) match_v++;
+        }
+        printf("Result: K=%d/%d V=%d/%d\n", match_k, N, match_v, N);
+
+        if (match_k != N || match_v != N) {
+            printf("FAIL: output mismatch\n");
+            if (match_k != N) {
+                printf("First 8 K diffs:\n");
+                for (int i = 0; i < 8; i++) {
+                    printf("  [%d] k=0x%04X out=0x%04X\n", i, k_ptr[i], out_ptr[i]);
+                }
+            }
+            if (match_v != N) {
+                printf("First 8 V diffs:\n");
+                for (int i = 0; i < 8; i++) {
+                    printf("  [%d] v=0x%04X out=0x%04X\n", i, v_ptr[i], out_ptr[N + i]);
+                }
+            }
+            return 1;
+        }
+        printf("PASS: echo v3\n");
+
+    } else {
+        printf("FAIL: unknown version %d\n", version);
+        return 1;
     }
 
     return 0;
