@@ -100,10 +100,12 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     # L3 (DDR) buffer types
     # -------------------------------------------------------------------------
-    # K and V caches in SEPARATE buffers (workaround for DMA offset corruption
-    # when K and V share same buffer with different offsets on XDNA2).
+    # K and V data are combined in a single buffer (arg1 = bo_v).
+    # IRON compiler bug: both K_fifos and V_fifos DMA read from arg1.
+    # Workaround: K data at offset 0, V data at offset kv_region_size.
+    # L3_V_ty must be 2x to hold both K and V regions.
     L3_K_ty = np.ndarray[(num_kv_heads * seq_len * head_dim,), dtype_in]
-    L3_V_ty = np.ndarray[(num_kv_heads * seq_len * head_dim,), dtype_in]
+    L3_V_ty = np.ndarray[(2 * num_kv_heads * seq_len * head_dim,), dtype_in]
     # Q DDR layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
     # Each group block = group_size * head_dim + head_dim + 2 (for actual_seq_len + alignment) contiguous bf16 values.
     q_group_stride = group_size * head_dim + head_dim + 2
