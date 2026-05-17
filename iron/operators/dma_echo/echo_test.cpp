@@ -65,7 +65,7 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "[echo_test] paths copied\n"); fflush(stderr);
     int version = (argc >= 4) ? atoi(argv[3]) : 1;
     fprintf(stderr, "[echo_test] version=%d\n", version); fflush(stderr);
-    int N = 256;
+    int N = (version == 1) ? 256 : 128;
 
     printf("echo_test v%d: xclbin=%s insts=%s N=%d\n",
            version, xclbin_path.c_str(), insts_path.c_str(), N);
@@ -197,40 +197,64 @@ int main(int argc, char * argv[]) {
         printf("PASS: echo v1\n");
 
     } else {
+        fprintf(stderr, "[echo_test] enter v2 branch\n"); fflush(stderr);
         // --- Echo v2: dual concat ---
         int half_bytes = N * 2;
         int full_bytes = 2 * N * 2;
 
         xrt::bo bo_a(dev, half_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        fprintf(stderr, "[echo_test] after bo_a create\n"); fflush(stderr);
         xrt::bo bo_b(dev, half_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        fprintf(stderr, "[echo_test] after bo_b create\n"); fflush(stderr);
         xrt::bo bo_out(dev, full_bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+        fprintf(stderr, "[echo_test] after v2 bo_out create\n"); fflush(stderr);
 
         // Fill A and B with different patterns
         auto a_ptr = bo_a.map<uint16_t*>();
+        fprintf(stderr, "[echo_test] after bo_a map\n"); fflush(stderr);
         auto b_ptr = bo_b.map<uint16_t*>();
+        fprintf(stderr, "[echo_test] after bo_b map\n"); fflush(stderr);
         for (int i = 0; i < N; i++) {
             a_ptr[i] = f32_to_bf16((float)(i + 1));       // 1.0, 2.0, 3.0, ...
             b_ptr[i] = f32_to_bf16((float)(i + 1) * 10);  // 10, 20, 30, ...
         }
         bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "[echo_test] after bo_a sync\n"); fflush(stderr);
         bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "[echo_test] after bo_b sync\n"); fflush(stderr);
         printf("Inputs synced\n");
+        fflush(stdout);
 
         // Clear output
         auto out_ptr = bo_out.map<uint16_t*>();
+        fprintf(stderr, "[echo_test] after v2 bo_out map\n"); fflush(stderr);
         memset(out_ptr, 0, full_bytes);
+        fprintf(stderr, "[echo_test] after v2 clear output\n"); fflush(stderr);
 
         // Dispatch
         printf("Dispatching kernel...\n");
+        fflush(stdout);
+        fprintf(stderr, "[echo_test] before v2 run create\n"); fflush(stderr);
         auto run = xrt::run(kernel);
+        fprintf(stderr, "[echo_test] after v2 run create\n"); fflush(stderr);
         run.set_arg(0, 3u);
+        fprintf(stderr, "[echo_test] after v2 set_arg0\n"); fflush(stderr);
         run.set_arg(1, insts_bo);
+        fprintf(stderr, "[echo_test] after v2 set_arg1\n"); fflush(stderr);
         run.set_arg(2, (uint32_t)insts_data.size());
+        fprintf(stderr, "[echo_test] after v2 set_arg2\n"); fflush(stderr);
         run.set_arg(3, bo_a);
+        fprintf(stderr, "[echo_test] after v2 set_arg3\n"); fflush(stderr);
         run.set_arg(4, bo_b);
+        fprintf(stderr, "[echo_test] after v2 set_arg4\n"); fflush(stderr);
         run.set_arg(5, bo_out);
+        fprintf(stderr, "[echo_test] after v2 set_arg5\n"); fflush(stderr);
 
+        fprintf(stderr, "[echo_test] before v2 start\n"); fflush(stderr);
+        run.start();
+        fprintf(stderr, "[echo_test] after v2 start\n"); fflush(stderr);
         auto state = run.wait(10000);
+        fprintf(stderr, "[echo_test] after v2 wait state=%d\n", (int)state); fflush(stderr);
 
         if (state != ERT_CMD_STATE_COMPLETED) {
             printf("FAIL: kernel returned state=%d\n", (int)state);

@@ -63,15 +63,16 @@ def echo_v2(dev, N=128):
     dev_ty = NPU1() if dev == "npu" else NPU2()
 
     L1_ty = np.ndarray[(N,), dtype_in]
+    L1_full = np.ndarray[(2 * N,), dtype_in]
     L3_half = np.ndarray[(N,), dtype_in]   # one input
     L3_full = np.ndarray[(2 * N,), dtype_in]  # combined output
 
     concat_fn = Kernel("echo_concat_bf16", "echo.o",
-                       [L1_ty, L1_ty, L1_ty, np.int32])
+                       [L1_ty, L1_ty, L1_full, np.int32])
 
     a_fifo = ObjectFifo(L1_ty, name="a_fifo", depth=2)
     b_fifo = ObjectFifo(L1_ty, name="b_fifo", depth=2)
-    out_fifo = ObjectFifo(L1_ty, name="out_fifo", depth=2)
+    out_fifo = ObjectFifo(L1_full, name="out_fifo", depth=2)
 
     def core_body(af, bf, ofo, fn):
         for _ in range_(0xFFFFFFFF):
