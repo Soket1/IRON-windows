@@ -16,9 +16,9 @@
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
-#include "xrt/xrt_xclbin.h"
+#include "xrt/experimental/xrt_xclbin.h"
 #include "xrt/xrt_hw_context.h"
-#include "experimental/xrt_ext.h"
+#include "xrt/experimental/xrt_ext.h"
 
 static std::vector<char> read_file(const std::string & path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -52,7 +52,9 @@ static float bf16_to_f32(uint16_t bf) {
 }
 
 int main(int argc, char * argv[]) {
+    fprintf(stderr, "[echo_test] argc=%d\n", argc); fflush(stderr);
     if (argc < 3) {
+        fprintf(stderr, "[echo_test] usage branch\n"); fflush(stderr);
         printf("Usage: %s <xclbin> <insts> [version]\n", argv[0]);
         printf("  version: 1=copy (default), 2=concat\n");
         return 1;
@@ -60,70 +62,109 @@ int main(int argc, char * argv[]) {
 
     std::string xclbin_path = argv[1];
     std::string insts_path = argv[2];
+    fprintf(stderr, "[echo_test] paths copied\n"); fflush(stderr);
     int version = (argc >= 4) ? atoi(argv[3]) : 1;
+    fprintf(stderr, "[echo_test] version=%d\n", version); fflush(stderr);
     int N = 256;
 
     printf("echo_test v%d: xclbin=%s insts=%s N=%d\n",
            version, xclbin_path.c_str(), insts_path.c_str(), N);
+    fflush(stdout);
+    fprintf(stderr, "[echo_test] before xrt::device\n"); fflush(stderr);
 
     // --- Init XRT ---
     xrt::device dev(0);
+    fprintf(stderr, "[echo_test] after xrt::device\n"); fflush(stderr);
     auto xclbin = xrt::xclbin(xclbin_path);
+    fprintf(stderr, "[echo_test] after xrt::xclbin\n"); fflush(stderr);
     dev.register_xclbin(xclbin);
+    fprintf(stderr, "[echo_test] after register_xclbin\n"); fflush(stderr);
     auto uuid = xclbin.get_uuid();
+    fprintf(stderr, "[echo_test] after get_uuid\n"); fflush(stderr);
     xrt::hw_context hw(dev, uuid);
+    fprintf(stderr, "[echo_test] after hw_context\n"); fflush(stderr);
     xrt::kernel kernel(hw, "MLIR_AIE");
+    fprintf(stderr, "[echo_test] after kernel\n"); fflush(stderr);
 
     // Print group_ids
     printf("Kernel group_ids:");
     for (int a = 0; a < 10; a++) {
-        try { printf(" [%d]=%zu", a, (size_t)kernel.group_id(a)); }
-        catch (...) { printf(" [%d]=ERR", a); break; }
+        try { printf(" [%d]=%zu", a, (size_t)kernel.group_id(a)); fflush(stdout); }
+        catch (...) { printf(" [%d]=ERR", a); fflush(stdout); break; }
     }
     printf("\n");
+    fflush(stdout);
+    fprintf(stderr, "[echo_test] after group_ids\n"); fflush(stderr);
 
     // --- Load insts ---
     auto insts_data = read_file(insts_path);
+    fprintf(stderr, "[echo_test] after read_file\n"); fflush(stderr);
     printf("insts: %zu bytes\n", insts_data.size());
+    fflush(stdout);
 
     xrt::bo insts_bo(dev, insts_data.size(),
                      xrt::bo::flags::cacheable, kernel.group_id(1));
+    fprintf(stderr, "[echo_test] after insts_bo create\n"); fflush(stderr);
     memcpy(insts_bo.map<void*>(), insts_data.data(), insts_data.size());
+    fprintf(stderr, "[echo_test] after insts_bo map/memcpy\n"); fflush(stderr);
     insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    fprintf(stderr, "[echo_test] after insts_bo sync\n"); fflush(stderr);
     printf("insts_bo synced to device\n");
+    fflush(stdout);
 
     if (version == 1) {
+        fprintf(stderr, "[echo_test] enter v1 branch\n"); fflush(stderr);
         // --- Echo v1: single copy ---
         int buf_bytes = N * 2;  // bf16 = 2 bytes
 
         xrt::bo bo_in(dev, buf_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        fprintf(stderr, "[echo_test] after bo_in create\n"); fflush(stderr);
         xrt::bo bo_out(dev, buf_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        fprintf(stderr, "[echo_test] after bo_out create\n"); fflush(stderr);
 
         // Fill input with known bf16 pattern
         auto in_ptr = bo_in.map<uint16_t*>();
+        fprintf(stderr, "[echo_test] after bo_in map\n"); fflush(stderr);
         for (int i = 0; i < N; i++) {
             float f = (float)(i + 1) * 0.5f;  // 0.5, 1.0, 1.5, ...
             in_ptr[i] = f32_to_bf16(f);
         }
+        fprintf(stderr, "[echo_test] after fill input\n"); fflush(stderr);
         bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "[echo_test] after bo_in sync\n"); fflush(stderr);
         printf("Input synced: ");
         for (int i = 0; i < 8; i++) printf("0x%04X ", in_ptr[i]);
         printf("...\n");
+        fflush(stdout);
 
         // Clear output
         auto out_ptr = bo_out.map<uint16_t*>();
+        fprintf(stderr, "[echo_test] after bo_out map\n"); fflush(stderr);
         memset(out_ptr, 0, buf_bytes);
+        fprintf(stderr, "[echo_test] after clear output\n"); fflush(stderr);
 
         // Dispatch
         printf("Dispatching kernel...\n");
+        fflush(stdout);
+        fprintf(stderr, "[echo_test] before run create\n"); fflush(stderr);
         auto run = xrt::run(kernel);
+        fprintf(stderr, "[echo_test] after run create\n"); fflush(stderr);
         run.set_arg(0, 3u);  // opcode
+        fprintf(stderr, "[echo_test] after set_arg0\n"); fflush(stderr);
         run.set_arg(1, insts_bo);
+        fprintf(stderr, "[echo_test] after set_arg1\n"); fflush(stderr);
         run.set_arg(2, (uint32_t)insts_data.size());
+        fprintf(stderr, "[echo_test] after set_arg2\n"); fflush(stderr);
         run.set_arg(3, bo_in);
+        fprintf(stderr, "[echo_test] after set_arg3\n"); fflush(stderr);
         run.set_arg(4, bo_out);
+        fprintf(stderr, "[echo_test] after set_arg4\n"); fflush(stderr);
 
+        fprintf(stderr, "[echo_test] before start\n"); fflush(stderr);
+        run.start();
+        fprintf(stderr, "[echo_test] after start\n"); fflush(stderr);
         auto state = run.wait(10000);  // 10s timeout
+        fprintf(stderr, "[echo_test] after wait state=%d\n", (int)state); fflush(stderr);
 
         if (state != ERT_CMD_STATE_COMPLETED) {
             printf("FAIL: kernel returned state=%d\n", (int)state);
