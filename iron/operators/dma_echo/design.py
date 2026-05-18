@@ -522,10 +522,81 @@ def echo_v7(dev, chunk_size=16, group_size=4, num_chunks=2, head_dim=64):
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
+def echo_v8(dev, chunk_size=16, group_size=4, num_chunks=2, head_dim=64):
+    """Version 8: FlowKV value math diagnostic.
+    Runs value accumulation and normalization from host-provided packed inter + V chunks.
+    """
+    dtype_in = np.dtype[bfloat16]
+    dev_ty = NPU1() if dev == "npu" else NPU2()
+
+    packed_inter_size = chunk_size * group_size + 2 * group_size
+    kv_size = chunk_size * head_dim
+    out_size = group_size * head_dim
+
+    L1_inter_ty = np.ndarray[(packed_inter_size,), dtype_in]
+    L1_v_ty = np.ndarray[(kv_size,), dtype_in]
+    L1_out_ty = np.ndarray[(out_size,), dtype_in]
+    L3_P_ty = np.ndarray[(num_chunks * packed_inter_size,), dtype_in]
+    L3_V_ty = np.ndarray[(2 * num_chunks * kv_size,), dtype_in]
+    L3_O_ty = np.ndarray[(out_size,), dtype_in]
+
+    value_init = Kernel("echo_v8_value_init_bf16", "echo.o", [np.int32, np.int32])
+    value_accum = Kernel("echo_v8_value_accum_bf16", "echo.o", [L1_inter_ty, L1_v_ty, np.int32, np.int32, np.int32])
+    value_norm = Kernel("echo_v8_value_normalize_bf16", "echo.o", [L1_out_ty, np.int32, np.int32])
+
+    packed_fifo = ObjectFifo(L1_inter_ty, name="packed_fifo", depth=2)
+    v_fifo = ObjectFifo(L1_v_ty, name="v_fifo", depth=2)
+    out_fifo = ObjectFifo(L1_out_ty, name="out_fifo", depth=1)
+
+    def value_body(pf, vf, ofo, init_fn, accum_fn, norm_fn):
+        for _ in range_(0xFFFFFFFF):
+            out = ofo.acquire(1)
+            init_fn(group_size, head_dim)
+
+            p0 = pf.acquire(1)
+            v0 = vf.acquire(1)
+            accum_fn(p0, v0, group_size, head_dim, chunk_size)
+            pf.release(1)
+            vf.release(1)
+
+            p1 = pf.acquire(1)
+            v1 = vf.acquire(1)
+            accum_fn(p1, v1, group_size, head_dim, chunk_size)
+            pf.release(1)
+            vf.release(1)
+
+            norm_fn(out, group_size, head_dim)
+            ofo.release(1)
+
+    value_worker = Worker(value_body, [packed_fifo.cons(), v_fifo.cons(), out_fifo.prod(), value_init, value_accum, value_norm])
+
+    rt = Runtime()
+    with rt.sequence(L3_P_ty, L3_V_ty, L3_O_ty) as (P, V, O):
+        rt.start(value_worker)
+        tg_in = rt.task_group()
+
+        for chunk in range(num_chunks):
+            rt.fill(packed_fifo.prod(), P,
+                    TensorAccessPattern((num_chunks * packed_inter_size,), chunk * packed_inter_size, [1, 1, 1, packed_inter_size], [0, 0, 0, 1]),
+                    task_group=tg_in)
+            rt.fill(v_fifo.prod(), V,
+                    TensorAccessPattern((2 * num_chunks * kv_size,), (num_chunks + chunk) * kv_size, [1, 1, 1, kv_size], [0, 0, 0, 1]),
+                    task_group=tg_in)
+        rt.finish_task_group(tg_in)
+
+        tg_out = rt.task_group()
+        rt.drain(out_fifo.cons(), O,
+                 TensorAccessPattern((out_size,), 0, [1, 1, 1, out_size], [0, 0, 0, 1]),
+                 task_group=tg_out, wait=True)
+        rt.finish_task_group(tg_out)
+
+    return Program(dev_ty, rt).resolve_program(SequentialPlacer())
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", default="npu2", choices=["npu", "npu2"])
-    ap.add_argument("--version", type=int, choices=[1, 2, 3, 4, 5, 6, 7], required=True)
+    ap.add_argument("--version", type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8], required=True)
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("-o", "--output-file-path", required=True)
     args = ap.parse_args()
@@ -542,8 +613,11 @@ if __name__ == "__main__":
         module = echo_v5(args.dev)
     elif args.version == 6:
         module = echo_v6(args.dev)
-    else:
+    elif args.version == 7:
         module = echo_v7(args.dev)
+    else:
+        module = echo_v8(args.dev)
+
 
     Path(args.output_file_path).write_text(str(module))
     print(f"Wrote {args.output_file_path}")

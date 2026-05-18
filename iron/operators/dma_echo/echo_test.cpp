@@ -9,6 +9,7 @@
 //            5 = FlowKV-like multi-chunk path
 //            6 = FlowKV packed inter layout path
 //            7 = FlowKV score math packed inter path
+//            8 = FlowKV value math path
 
 #include <cstdio>
 #include <cstdlib>
@@ -66,7 +67,7 @@ int main(int argc, char * argv[]) {
     if (argc < 3) {
         fprintf(stderr, "[echo_test] usage branch\n"); fflush(stderr);
         printf("Usage: %s <xclbin> <insts> [version]\n", argv[0]);
-        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk, 6=packed-inter, 7=score-math\n");
+        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk, 6=packed-inter, 7=score-math, 8=value-math\n");
         return 1;
     }
 
@@ -75,7 +76,7 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "[echo_test] paths copied\n"); fflush(stderr);
     int version = (argc >= 4) ? atoi(argv[3]) : 1;
     fprintf(stderr, "[echo_test] version=%d\n", version); fflush(stderr);
-    int N = (version == 1) ? 256 : ((version == 4) ? 64 : (((version == 5) || (version == 6) || (version == 7)) ? 32 : 128));
+    int N = (version == 1) ? 256 : ((version == 4) ? 64 : (((version >= 5) && (version <= 8)) ? 32 : 128));
 
     printf("echo_test v%d: xclbin=%s insts=%s N=%d\n",
            version, xclbin_path.c_str(), insts_path.c_str(), N);
@@ -792,6 +793,92 @@ int main(int argc, char * argv[]) {
             return 1;
         }
         printf("PASS: echo v7\n");
+
+    } else if (version == 8) {
+        fprintf(stderr, "[echo_test] enter v8 branch\n"); fflush(stderr);
+        const int chunk_size = 16;
+        const int group_size = 4;
+        const int num_chunks = 2;
+        const int head_dim = 64;
+        const int scores_size = chunk_size * group_size;
+        const int packed_size = scores_size + 2 * group_size;
+        const int kv_size = chunk_size * head_dim;
+        const int out_elems = group_size * head_dim;
+        int p_bytes = num_chunks * packed_size * 2;
+        int v_bytes = 2 * num_chunks * kv_size * 2;
+        int out_bytes = out_elems * 2;
+
+        xrt::bo bo_p(dev, p_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        xrt::bo bo_v(dev, v_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        xrt::bo bo_out(dev, out_bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+
+        auto p_ptr = bo_p.map<uint16_t*>();
+        auto v_ptr = bo_v.map<uint16_t*>();
+        for (int i = 0; i < num_chunks * packed_size; i++) p_ptr[i] = f32_to_bf16(0.0f);
+        for (int i = 0; i < 2 * num_chunks * kv_size; i++) v_ptr[i] = f32_to_bf16(0.0f);
+
+        uint16_t one = f32_to_bf16(1.0f);
+        uint16_t zero = f32_to_bf16(0.0f);
+        uint16_t l16 = f32_to_bf16(16.0f);
+        uint16_t l32 = f32_to_bf16(32.0f);
+        for (int chunk = 0; chunk < num_chunks; chunk++) {
+            uint16_t corr = (chunk == 0) ? zero : one;
+            uint16_t denom = (chunk == 0) ? l16 : l32;
+            uint16_t vval = f32_to_bf16((chunk == 0) ? 2.0f : 4.0f);
+            uint16_t *packed = p_ptr + chunk * packed_size;
+            for (int i = 0; i < scores_size; i++) packed[i] = one;
+            for (int h = 0; h < group_size; h++) {
+                packed[scores_size + h] = corr;
+                packed[scores_size + group_size + h] = denom;
+            }
+            uint16_t *v_chunk = v_ptr + (num_chunks + chunk) * kv_size;
+            for (int i = 0; i < kv_size; i++) v_chunk[i] = vval;
+        }
+
+        bo_p.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_v.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        printf("Inputs synced\n");
+        fflush(stdout);
+
+        auto out_ptr = bo_out.map<uint16_t*>();
+        memset(out_ptr, 0, out_bytes);
+
+        printf("Dispatching kernel...\n");
+        fflush(stdout);
+        auto run = xrt::run(kernel);
+        run.set_arg(0, 3u);
+        run.set_arg(1, insts_bo);
+        run.set_arg(2, (uint32_t)insts_data.size());
+        run.set_arg(3, bo_p);
+        run.set_arg(4, bo_v);
+        run.set_arg(5, bo_out);
+
+        run.start();
+        auto state = run.wait(10000);
+        fprintf(stderr, "[echo_test] after v8 wait state=%d\n", (int)state); fflush(stderr);
+        if (state != ERT_CMD_STATE_COMPLETED) {
+            printf("FAIL: kernel returned state=%d\n", (int)state);
+            return 1;
+        }
+        printf("Kernel completed\n");
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        int match_o = 0;
+        const float expected = 3.0f;
+        for (int i = 0; i < out_elems; i++) {
+            float got = bf16_to_f32(out_ptr[i]);
+            if (near_f32(got, expected, 0.05f)) match_o++;
+        }
+        printf("Result: O=%d/%d expected=%.6f\n", match_o, out_elems, expected);
+        printf("Samples: O0=%.6f O63=%.6f O64=%.6f O255=%.6f\n",
+               bf16_to_f32(out_ptr[0]), bf16_to_f32(out_ptr[63]),
+               bf16_to_f32(out_ptr[64]), bf16_to_f32(out_ptr[255]));
+
+        if (match_o != out_elems) {
+            printf("FAIL: output mismatch\n");
+            return 1;
+        }
+        printf("PASS: echo v8\n");
 
     } else {
         printf("FAIL: unknown version %d\n", version);

@@ -6,6 +6,7 @@
 // echo_value_chunk_bf16: multi-chunk FlowKV-like marker path
 // echo_pack_inter_v6_bf16/echo_value_v6_bf16: FlowKV packed inter layout path
 // echo_v7_score_*: FlowKV score math packed inter diagnostic
+// echo_v8_value_*: FlowKV value math diagnostic
 
 #define NOCPP
 #include <aie_api/aie.hpp>
@@ -16,6 +17,8 @@ static float echo_v7_score_running_sum[4] __attribute__((aligned(64)));
 static bfloat16 echo_v7_rotated_q[4 * 64] __attribute__((aligned(64)));
 static int32_t echo_v7_actual_seq_len = 0;
 static int32_t echo_v7_chunk_counter = 0;
+static float echo_v8_value_accum[4 * 64] __attribute__((aligned(64)));
+static float echo_v8_saved_denom[4] __attribute__((aligned(64)));
 
 static inline int32_t echo_v7_bf16_to_int(const bfloat16 *buf, int idx) {
     uint16_t bits = *(const uint16_t *)&buf[idx];
@@ -349,6 +352,79 @@ void echo_v7_copy_pack_chunk1_bf16(const bfloat16 *__restrict packed_in,
                                     int32_t packed_size)
 {
     echo_v7_copy_pack_bf16(packed_in, out, 1, packed_size);
+}
+
+void echo_v8_value_init_bf16(int32_t num_q_heads, int32_t head_dim)
+{
+    int total = num_q_heads * head_dim;
+    for (int i = 0; i < total; i++) {
+        echo_v8_value_accum[i] = 0.0f;
+    }
+    for (int h = 0; h < num_q_heads; h++) {
+        echo_v8_saved_denom[h] = 0.0f;
+    }
+}
+
+void echo_v8_value_accum_bf16(const bfloat16 *__restrict packed_in,
+                              const bfloat16 *__restrict v_chunk,
+                              int32_t num_q_heads,
+                              int32_t head_dim,
+                              int32_t chunk_size)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    const int32_t scores_size = chunk_size * num_q_heads;
+    const bfloat16 *scores_in = packed_in;
+    const bfloat16 *correction_in = packed_in + scores_size;
+    const bfloat16 *denom_in = packed_in + scores_size + num_q_heads;
+
+    for (int h = 0; h < num_q_heads; h++) {
+        float correction = static_cast<float>(correction_in[h]);
+        float *y_head = echo_v8_value_accum + h * head_dim;
+        echo_v8_saved_denom[h] = static_cast<float>(denom_in[h]);
+
+        aie::vector<float, 16> corr_vec = aie::broadcast<float, 16>(correction);
+        for (int d = 0; d < head_dim; d += 16) {
+            aie::vector<float, 16> y_vec = aie::load_v<16>(y_head + d);
+            y_vec = aie::mul(y_vec, corr_vec);
+            aie::store_v(y_head + d, y_vec);
+        }
+
+        for (int pos = 0; pos < chunk_size; pos++) {
+            float f = static_cast<float>(scores_in[pos * num_q_heads + h]);
+            const bfloat16 *v_pos = v_chunk + pos * head_dim;
+            aie::vector<float, 16> f_vec = aie::broadcast<float, 16>(f);
+            for (int d = 0; d < head_dim; d += 16) {
+                aie::vector<float, 16> y_vec = aie::load_v<16>(y_head + d);
+                aie::vector<bfloat16, 16> v_vec = aie::load_v<16>(v_pos + d);
+                aie::accum<accfloat, 16> v_acc(v_vec);
+                aie::vector<float, 16> v_f32 = v_acc.to_vector<float>();
+                aie::vector<float, 16> fv = aie::mul(f_vec, v_f32);
+                y_vec = aie::add(y_vec, fv);
+                aie::store_v(y_head + d, y_vec);
+            }
+        }
+    }
+}
+
+void echo_v8_value_normalize_bf16(bfloat16 *__restrict output, int32_t num_q_heads, int32_t head_dim)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    for (int h = 0; h < num_q_heads; h++) {
+        float inv_l = aie::inv(echo_v8_saved_denom[h]);
+        aie::vector<float, 16> inv_l_vec = aie::broadcast<float, 16>(inv_l);
+        float *y_head = echo_v8_value_accum + h * head_dim;
+        bfloat16 *o_head = output + h * head_dim;
+
+        for (int d = 0; d < head_dim; d += 16) {
+            aie::vector<float, 16> y_vec = aie::load_v<16>(y_head + d);
+            aie::vector<float, 16> scaled = aie::mul(y_vec, inv_l_vec);
+            aie::accum<accfloat, 16> y_acc(scaled);
+            aie::vector<bfloat16, 16> out_vec = y_acc.to_vector<bfloat16>();
+            aie::store_v(o_head + d, out_vec);
+        }
+    }
 }
 
 } // extern "C"
