@@ -6,6 +6,7 @@
 //            2 = dual ObjectFifo concat
 //            3 = inter-tile K/V path
 //            4 = FlowKV-like Q/K/V arg and TAP path
+//            5 = FlowKV-like multi-chunk path
 
 #include <cstdio>
 #include <cstdlib>
@@ -58,7 +59,7 @@ int main(int argc, char * argv[]) {
     if (argc < 3) {
         fprintf(stderr, "[echo_test] usage branch\n"); fflush(stderr);
         printf("Usage: %s <xclbin> <insts> [version]\n", argv[0]);
-        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv\n");
+        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk\n");
         return 1;
     }
 
@@ -67,7 +68,7 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "[echo_test] paths copied\n"); fflush(stderr);
     int version = (argc >= 4) ? atoi(argv[3]) : 1;
     fprintf(stderr, "[echo_test] version=%d\n", version); fflush(stderr);
-    int N = (version == 1) ? 256 : ((version == 4) ? 64 : 128);
+    int N = (version == 1) ? 256 : ((version == 4) ? 64 : ((version == 5) ? 32 : 128));
 
     printf("echo_test v%d: xclbin=%s insts=%s N=%d\n",
            version, xclbin_path.c_str(), insts_path.c_str(), N);
@@ -472,6 +473,107 @@ int main(int argc, char * argv[]) {
             return 1;
         }
         printf("PASS: echo v4\n");
+
+    } else if (version == 5) {
+        fprintf(stderr, "[echo_test] enter v5 branch\n"); fflush(stderr);
+        // --- Echo v5: FlowKV-like multi-chunk Q-held, K/inter/V per-chunk path ---
+        const int num_chunks = 2;
+        const int q_stride = 66;
+        const int out_elems = (3 + num_chunks) * N;
+        int k_bytes = num_chunks * N * 2;
+        int v_bytes = 2 * num_chunks * N * 2;
+        int q_bytes = q_stride * 2;
+        int out_bytes = out_elems * 2;
+
+        xrt::bo bo_k(dev, k_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        fprintf(stderr, "[echo_test] after v5 bo_k create\n"); fflush(stderr);
+        xrt::bo bo_v(dev, v_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        fprintf(stderr, "[echo_test] after v5 bo_v create\n"); fflush(stderr);
+        xrt::bo bo_q(dev, q_bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+        fprintf(stderr, "[echo_test] after v5 bo_q create\n"); fflush(stderr);
+        xrt::bo bo_out(dev, out_bytes, xrt::bo::flags::host_only, kernel.group_id(6));
+        fprintf(stderr, "[echo_test] after v5 bo_out create\n"); fflush(stderr);
+
+        auto k_ptr = bo_k.map<uint16_t*>();
+        auto v_ptr = bo_v.map<uint16_t*>();
+        auto q_ptr = bo_q.map<uint16_t*>();
+        for (int i = 0; i < num_chunks * N; i++) {
+            k_ptr[i] = f32_to_bf16(100.0f + (float)(i + 1));
+        }
+        for (int i = 0; i < 2 * num_chunks * N; i++) {
+            v_ptr[i] = f32_to_bf16(-1000.0f - (float)i);
+        }
+        for (int i = 0; i < num_chunks * N; i++) {
+            v_ptr[num_chunks * N + i] = f32_to_bf16(1000.0f + (float)(i + 1));
+        }
+        for (int i = 0; i < q_stride; i++) {
+            q_ptr[i] = f32_to_bf16(-2000.0f - (float)i);
+        }
+        for (int i = 0; i < N; i++) {
+            q_ptr[i] = f32_to_bf16(2000.0f + (float)(i + 1));
+        }
+        bo_k.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_v.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_q.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "[echo_test] after v5 input sync\n"); fflush(stderr);
+        printf("Inputs synced\n");
+        fflush(stdout);
+
+        auto out_ptr = bo_out.map<uint16_t*>();
+        memset(out_ptr, 0, out_bytes);
+        fprintf(stderr, "[echo_test] after v5 clear output\n"); fflush(stderr);
+
+        printf("Dispatching kernel...\n");
+        fflush(stdout);
+        auto run = xrt::run(kernel);
+        fprintf(stderr, "[echo_test] after v5 run create\n"); fflush(stderr);
+        run.set_arg(0, 3u);
+        run.set_arg(1, insts_bo);
+        run.set_arg(2, (uint32_t)insts_data.size());
+        run.set_arg(3, bo_k);
+        run.set_arg(4, bo_v);
+        run.set_arg(5, bo_q);
+        run.set_arg(6, bo_out);
+        fprintf(stderr, "[echo_test] after v5 set_args\n"); fflush(stderr);
+
+        run.start();
+        fprintf(stderr, "[echo_test] after v5 start\n"); fflush(stderr);
+        auto state = run.wait(10000);
+        fprintf(stderr, "[echo_test] after v5 wait state=%d\n", (int)state); fflush(stderr);
+
+        if (state != ERT_CMD_STATE_COMPLETED) {
+            printf("FAIL: kernel returned state=%d\n", (int)state);
+            return 1;
+        }
+        printf("Kernel completed\n");
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        int match_k0 = 0, match_k1 = 0, match_q = 0, match_v0 = 0, match_v1 = 0;
+        for (int i = 0; i < N; i++) {
+            if (out_ptr[i] == k_ptr[i]) match_k0++;
+            if (out_ptr[N + i] == k_ptr[N + i]) match_k1++;
+            if (out_ptr[2 * N + i] == q_ptr[i]) match_q++;
+            if (out_ptr[3 * N + i] == v_ptr[num_chunks * N + i]) match_v0++;
+            if (out_ptr[4 * N + i] == v_ptr[(num_chunks + 1) * N + i]) match_v1++;
+        }
+        printf("Result: K0=%d/%d K1=%d/%d Q=%d/%d V0=%d/%d V1=%d/%d\n",
+               match_k0, N, match_k1, N, match_q, N, match_v0, N, match_v1, N);
+
+        if (match_k0 != N || match_k1 != N || match_q != N || match_v0 != N || match_v1 != N) {
+            printf("FAIL: output mismatch\n");
+            printf("First 8 tuples:\n");
+            for (int i = 0; i < 8; i++) {
+                printf("  [%d] k0=0x%04X outK0=0x%04X k1=0x%04X outK1=0x%04X q=0x%04X outQ=0x%04X v0=0x%04X outV0=0x%04X v1=0x%04X outV1=0x%04X\n",
+                       i,
+                       k_ptr[i], out_ptr[i],
+                       k_ptr[N + i], out_ptr[N + i],
+                       q_ptr[i], out_ptr[2 * N + i],
+                       v_ptr[num_chunks * N + i], out_ptr[3 * N + i],
+                       v_ptr[(num_chunks + 1) * N + i], out_ptr[4 * N + i]);
+            }
+            return 1;
+        }
+        printf("PASS: echo v5\n");
 
     } else {
         printf("FAIL: unknown version %d\n", version);

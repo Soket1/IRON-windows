@@ -3,6 +3,7 @@
 // echo_concat_bf16: concat a+b → out (out[0..N-1]=a, out[N..2N-1]=b)
 // echo_score_bf16/echo_value_bf16: split two-tile K/inter/V path
 // echo_score_qk_bf16/echo_value_qkv_bf16: FlowKV-like Q/K/V marker path
+// echo_value_chunk_bf16: multi-chunk FlowKV-like marker path
 
 #define NOCPP
 #include <aie_api/aie.hpp>
@@ -90,6 +91,44 @@ void echo_value_qkv_bf16(const bfloat16 *__restrict inter,
         aie::vector<bfloat16, 16> y = aie::load_v<16>(v + i);
         aie::store_v(out + 2 * N + i, y);
     }
+}
+
+void echo_value_chunk_bf16(const bfloat16 *__restrict inter,
+                           const bfloat16 *__restrict v,
+                           bfloat16 *__restrict out,
+                           int32_t chunk_idx,
+                           int32_t N)
+{
+    for (int i = 0; i < N; i += 16) {
+        aie::vector<bfloat16, 16> k = aie::load_v<16>(inter + i);
+        aie::store_v(out + chunk_idx * N + i, k);
+    }
+    if (chunk_idx == 0) {
+        for (int i = 0; i < N; i += 16) {
+            aie::vector<bfloat16, 16> q = aie::load_v<16>(inter + N + i);
+            aie::store_v(out + 2 * N + i, q);
+        }
+    }
+    for (int i = 0; i < N; i += 16) {
+        aie::vector<bfloat16, 16> y = aie::load_v<16>(v + i);
+        aie::store_v(out + (3 + chunk_idx) * N + i, y);
+    }
+}
+
+void echo_value_chunk0_bf16(const bfloat16 *__restrict inter,
+                            const bfloat16 *__restrict v,
+                            bfloat16 *__restrict out,
+                            int32_t N)
+{
+    echo_value_chunk_bf16(inter, v, out, 0, N);
+}
+
+void echo_value_chunk1_bf16(const bfloat16 *__restrict inter,
+                            const bfloat16 *__restrict v,
+                            bfloat16 *__restrict out,
+                            int32_t N)
+{
+    echo_value_chunk_bf16(inter, v, out, 1, N);
 }
 
 } // extern "C"

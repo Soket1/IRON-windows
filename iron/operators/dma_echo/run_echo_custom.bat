@@ -4,11 +4,12 @@ REM ============================================================
 REM Build + Run Echo Test via Custom XRT Dispatch
 REM Bypasses IRON framework — tests raw DMA path.
 REM
-REM Usage: run_echo_custom.bat [1|2|3|4|all]
+REM Usage: run_echo_custom.bat [1|2|3|4|5|all]
 REM   1   = single ObjectFifo copy (default)
 REM   2   = dual ObjectFifo concat
 REM   3   = FlowKV-like two-tile inter FIFO path
 REM   4   = FlowKV-like Q/K/V arg order and TAP offsets
+REM   5   = FlowKV-like multi-chunk sequencing
 REM ============================================================
 
 set "MODE=%~1"
@@ -19,6 +20,7 @@ if /I "%MODE%"=="all" (
     call "%~f0" 2 || exit /b 1
     call "%~f0" 3 || exit /b 1
     call "%~f0" 4 || exit /b 1
+    call "%~f0" 5 || exit /b 1
     echo.
     echo === DONE ===
     exit /b 0
@@ -47,7 +49,7 @@ if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
 REM === Step 1: Generate MLIR ===
 echo === Step 1: Generate echo v%VERSION% MLIR ===
-%PYTHON% -c "import sys; sys.path.insert(0, r'%IRON_DIR%'); from iron.operators.dma_echo.design import echo_v1, echo_v2, echo_v3, echo_v4; v=%VERSION%; m = echo_v1('npu2', 256) if v==1 else (echo_v2('npu2', 128) if v==2 else (echo_v3('npu2', 128) if v==3 else echo_v4('npu2'))); open(r'%BUILD_DIR%\echo_v%VERSION%.mlir','w').write(str(m)); print('MLIR written')"
+%PYTHON% -c "import sys; sys.path.insert(0, r'%IRON_DIR%'); from iron.operators.dma_echo.design import echo_v1, echo_v2, echo_v3, echo_v4, echo_v5; v=%VERSION%; m = echo_v1('npu2', 256) if v==1 else (echo_v2('npu2', 128) if v==2 else (echo_v3('npu2', 128) if v==3 else (echo_v4('npu2') if v==4 else echo_v5('npu2')))); open(r'%BUILD_DIR%\echo_v%VERSION%.mlir','w').write(str(m)); print('MLIR written')"
 if errorlevel 1 (
     echo FAIL: MLIR generation
     exit /b 1
