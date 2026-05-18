@@ -8,6 +8,7 @@
 //            4 = FlowKV-like Q/K/V arg and TAP path
 //            5 = FlowKV-like multi-chunk path
 //            6 = FlowKV packed inter layout path
+//            7 = FlowKV score math packed inter path
 
 #include <cstdio>
 #include <cstdlib>
@@ -55,12 +56,17 @@ static float bf16_to_f32(uint16_t bf) {
     return f;
 }
 
+static bool near_f32(float a, float b, float tol) {
+    float d = fabsf(a - b);
+    return d <= tol;
+}
+
 int main(int argc, char * argv[]) {
     fprintf(stderr, "[echo_test] argc=%d\n", argc); fflush(stderr);
     if (argc < 3) {
         fprintf(stderr, "[echo_test] usage branch\n"); fflush(stderr);
         printf("Usage: %s <xclbin> <insts> [version]\n", argv[0]);
-        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk, 6=packed-inter\n");
+        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk, 6=packed-inter, 7=score-math\n");
         return 1;
     }
 
@@ -69,7 +75,7 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "[echo_test] paths copied\n"); fflush(stderr);
     int version = (argc >= 4) ? atoi(argv[3]) : 1;
     fprintf(stderr, "[echo_test] version=%d\n", version); fflush(stderr);
-    int N = (version == 1) ? 256 : ((version == 4) ? 64 : (((version == 5) || (version == 6)) ? 32 : 128));
+    int N = (version == 1) ? 256 : ((version == 4) ? 64 : (((version == 5) || (version == 6) || (version == 7)) ? 32 : 128));
 
     printf("echo_test v%d: xclbin=%s insts=%s N=%d\n",
            version, xclbin_path.c_str(), insts_path.c_str(), N);
@@ -695,6 +701,97 @@ int main(int argc, char * argv[]) {
             return 1;
         }
         printf("PASS: echo v6\n");
+
+    } else if (version == 7) {
+        fprintf(stderr, "[echo_test] enter v7 branch\n"); fflush(stderr);
+        const int chunk_size = 16;
+        const int group_size = 4;
+        const int num_chunks = 2;
+        const int head_dim = 64;
+        const int scores_size = chunk_size * group_size;
+        const int packed_size = scores_size + 2 * group_size;
+        const int kv_size = chunk_size * head_dim;
+        const int q_stride = group_size * head_dim + head_dim + 2;
+        const int out_elems = num_chunks * packed_size;
+        int k_bytes = num_chunks * kv_size * 2;
+        int q_bytes = q_stride * 2;
+        int out_bytes = out_elems * 2;
+
+        xrt::bo bo_k(dev, k_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        xrt::bo bo_q(dev, q_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        xrt::bo bo_out(dev, out_bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+
+        auto k_ptr = bo_k.map<uint16_t*>();
+        auto q_ptr = bo_q.map<uint16_t*>();
+        for (int i = 0; i < num_chunks * kv_size; i++) k_ptr[i] = f32_to_bf16(0.0f);
+        for (int pos = 0; pos < num_chunks * chunk_size; pos++) {
+            k_ptr[pos * head_dim] = f32_to_bf16(1.0f);
+        }
+        for (int i = 0; i < q_stride; i++) q_ptr[i] = f32_to_bf16(0.0f);
+        for (int h = 0; h < group_size; h++) q_ptr[h * head_dim] = f32_to_bf16(1.0f);
+        q_ptr[group_size * head_dim + head_dim] = f32_to_bf16((float)(num_chunks * chunk_size));
+        bo_k.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_q.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        printf("Inputs synced\n");
+        fflush(stdout);
+
+        auto out_ptr = bo_out.map<uint16_t*>();
+        memset(out_ptr, 0, out_bytes);
+
+        printf("Dispatching kernel...\n");
+        fflush(stdout);
+        auto run = xrt::run(kernel);
+        run.set_arg(0, 3u);
+        run.set_arg(1, insts_bo);
+        run.set_arg(2, (uint32_t)insts_data.size());
+        run.set_arg(3, bo_k);
+        run.set_arg(4, bo_q);
+        run.set_arg(5, bo_out);
+
+        run.start();
+        auto state = run.wait(10000);
+        fprintf(stderr, "[echo_test] after v7 wait state=%d\n", (int)state); fflush(stderr);
+        if (state != ERT_CMD_STATE_COMPLETED) {
+            printf("FAIL: kernel returned state=%d\n", (int)state);
+            return 1;
+        }
+        printf("Kernel completed\n");
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        int match_f0 = 0, match_c0 = 0, match_l0 = 0;
+        int match_f1 = 0, match_c1 = 0, match_l1 = 0;
+        float f0_ref = bf16_to_f32(out_ptr[0]);
+        float f1_ref = bf16_to_f32(out_ptr[packed_size]);
+        for (int i = 0; i < scores_size; i++) {
+            float f0 = bf16_to_f32(out_ptr[i]);
+            float f1 = bf16_to_f32(out_ptr[packed_size + i]);
+            if (f0 > 0.0f && near_f32(f0, f0_ref, 0.05f)) match_f0++;
+            if (f1 > 0.0f && near_f32(f1, f1_ref, 0.05f)) match_f1++;
+        }
+        for (int h = 0; h < group_size; h++) {
+            float c0 = bf16_to_f32(out_ptr[scores_size + h]);
+            float l0 = bf16_to_f32(out_ptr[scores_size + group_size + h]);
+            float c1 = bf16_to_f32(out_ptr[packed_size + scores_size + h]);
+            float l1 = bf16_to_f32(out_ptr[packed_size + scores_size + group_size + h]);
+            if (c0 >= 0.0f && c0 < 0.05f) match_c0++;
+            if (near_f32(l0, (float)chunk_size, 0.25f)) match_l0++;
+            if (near_f32(c1, 1.0f, 0.05f)) match_c1++;
+            if (near_f32(l1, (float)(2 * chunk_size), 0.25f)) match_l1++;
+        }
+        printf("Result: F0=%d/%d C0=%d/%d L0=%d/%d F1=%d/%d C1=%d/%d L1=%d/%d\n",
+               match_f0, scores_size, match_c0, group_size, match_l0, group_size,
+               match_f1, scores_size, match_c1, group_size, match_l1, group_size);
+        printf("Samples: F0=%.6f C0=%.6f L0=%.6f F1=%.6f C1=%.6f L1=%.6f\n",
+               bf16_to_f32(out_ptr[0]), bf16_to_f32(out_ptr[scores_size]), bf16_to_f32(out_ptr[scores_size + group_size]),
+               bf16_to_f32(out_ptr[packed_size]), bf16_to_f32(out_ptr[packed_size + scores_size]),
+               bf16_to_f32(out_ptr[packed_size + scores_size + group_size]));
+
+        if (match_f0 != scores_size || match_c0 != group_size || match_l0 != group_size ||
+            match_f1 != scores_size || match_c1 != group_size || match_l1 != group_size) {
+            printf("FAIL: output mismatch\n");
+            return 1;
+        }
+        printf("PASS: echo v7\n");
 
     } else {
         printf("FAIL: unknown version %d\n", version);
