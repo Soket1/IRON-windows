@@ -7,6 +7,7 @@
 //            3 = inter-tile K/V path
 //            4 = FlowKV-like Q/K/V arg and TAP path
 //            5 = FlowKV-like multi-chunk path
+//            6 = FlowKV packed inter layout path
 
 #include <cstdio>
 #include <cstdlib>
@@ -59,7 +60,7 @@ int main(int argc, char * argv[]) {
     if (argc < 3) {
         fprintf(stderr, "[echo_test] usage branch\n"); fflush(stderr);
         printf("Usage: %s <xclbin> <insts> [version]\n", argv[0]);
-        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk\n");
+        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk, 6=packed-inter\n");
         return 1;
     }
 
@@ -68,7 +69,7 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "[echo_test] paths copied\n"); fflush(stderr);
     int version = (argc >= 4) ? atoi(argv[3]) : 1;
     fprintf(stderr, "[echo_test] version=%d\n", version); fflush(stderr);
-    int N = (version == 1) ? 256 : ((version == 4) ? 64 : ((version == 5) ? 32 : 128));
+    int N = (version == 1) ? 256 : ((version == 4) ? 64 : (((version == 5) || (version == 6)) ? 32 : 128));
 
     printf("echo_test v%d: xclbin=%s insts=%s N=%d\n",
            version, xclbin_path.c_str(), insts_path.c_str(), N);
@@ -574,6 +575,126 @@ int main(int argc, char * argv[]) {
             return 1;
         }
         printf("PASS: echo v5\n");
+
+    } else if (version == 6) {
+        fprintf(stderr, "[echo_test] enter v6 branch\n"); fflush(stderr);
+        // --- Echo v6: FlowKV packed inter [F_c | C_c | l] layout path ---
+        const int chunk_size = 16;
+        const int group_size = 4;
+        const int num_chunks = 2;
+        const int head_dim = 64;
+        const int scores_size = chunk_size * group_size;
+        const int packed_inter_size = scores_size + 2 * group_size;
+        const int v_chunk_size = chunk_size * head_dim;
+        const int q_stride = group_size * head_dim + head_dim + 2;
+        const int out_block_size = packed_inter_size + v_chunk_size;
+        const int out_elems = num_chunks * out_block_size;
+        int k_bytes = num_chunks * v_chunk_size * 2;
+        int v_bytes = 2 * num_chunks * v_chunk_size * 2;
+        int q_bytes = q_stride * 2;
+        int out_bytes = out_elems * 2;
+        const uint16_t one_bf16 = f32_to_bf16(1.0f);
+
+        xrt::bo bo_k(dev, k_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        fprintf(stderr, "[echo_test] after v6 bo_k create\n"); fflush(stderr);
+        xrt::bo bo_v(dev, v_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        fprintf(stderr, "[echo_test] after v6 bo_v create\n"); fflush(stderr);
+        xrt::bo bo_q(dev, q_bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+        fprintf(stderr, "[echo_test] after v6 bo_q create\n"); fflush(stderr);
+        xrt::bo bo_out(dev, out_bytes, xrt::bo::flags::host_only, kernel.group_id(6));
+        fprintf(stderr, "[echo_test] after v6 bo_out create\n"); fflush(stderr);
+
+        auto k_ptr = bo_k.map<uint16_t*>();
+        auto v_ptr = bo_v.map<uint16_t*>();
+        auto q_ptr = bo_q.map<uint16_t*>();
+        for (int i = 0; i < num_chunks * v_chunk_size; i++) {
+            k_ptr[i] = f32_to_bf16(300.0f + (float)(i + 1));
+        }
+        for (int i = 0; i < 2 * num_chunks * v_chunk_size; i++) {
+            v_ptr[i] = f32_to_bf16(-3000.0f - (float)i);
+        }
+        for (int i = 0; i < num_chunks * v_chunk_size; i++) {
+            v_ptr[num_chunks * v_chunk_size + i] = f32_to_bf16(4000.0f + (float)(i + 1));
+        }
+        for (int i = 0; i < q_stride; i++) {
+            q_ptr[i] = f32_to_bf16(5000.0f + (float)(i + 1));
+        }
+        bo_k.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_v.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_q.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "[echo_test] after v6 input sync\n"); fflush(stderr);
+        printf("Inputs synced\n");
+        fflush(stdout);
+
+        auto out_ptr = bo_out.map<uint16_t*>();
+        memset(out_ptr, 0, out_bytes);
+        fprintf(stderr, "[echo_test] after v6 clear output\n"); fflush(stderr);
+
+        printf("Dispatching kernel...\n");
+        fflush(stdout);
+        auto run = xrt::run(kernel);
+        fprintf(stderr, "[echo_test] after v6 run create\n"); fflush(stderr);
+        run.set_arg(0, 3u);
+        run.set_arg(1, insts_bo);
+        run.set_arg(2, (uint32_t)insts_data.size());
+        run.set_arg(3, bo_k);
+        run.set_arg(4, bo_v);
+        run.set_arg(5, bo_q);
+        run.set_arg(6, bo_out);
+        fprintf(stderr, "[echo_test] after v6 set_args\n"); fflush(stderr);
+
+        run.start();
+        fprintf(stderr, "[echo_test] after v6 start\n"); fflush(stderr);
+        auto state = run.wait(10000);
+        fprintf(stderr, "[echo_test] after v6 wait state=%d\n", (int)state); fflush(stderr);
+
+        if (state != ERT_CMD_STATE_COMPLETED) {
+            printf("FAIL: kernel returned state=%d\n", (int)state);
+            return 1;
+        }
+        printf("Kernel completed\n");
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        int match_f0 = 0, match_c0 = 0, match_l0 = 0, match_v0 = 0;
+        int match_f1 = 0, match_c1 = 0, match_l1 = 0, match_v1 = 0;
+        for (int chunk = 0; chunk < num_chunks; chunk++) {
+            uint16_t *chunk_out = out_ptr + chunk * out_block_size;
+            uint16_t *chunk_k = k_ptr + chunk * v_chunk_size;
+            uint16_t *chunk_v = v_ptr + (num_chunks + chunk) * v_chunk_size;
+            int *match_f = (chunk == 0) ? &match_f0 : &match_f1;
+            int *match_c = (chunk == 0) ? &match_c0 : &match_c1;
+            int *match_l = (chunk == 0) ? &match_l0 : &match_l1;
+            int *match_v = (chunk == 0) ? &match_v0 : &match_v1;
+            for (int i = 0; i < scores_size; i++) {
+                if (chunk_out[i] == chunk_k[i]) (*match_f)++;
+            }
+            for (int i = 0; i < group_size; i++) {
+                if (chunk_out[scores_size + i] == one_bf16) (*match_c)++;
+                if (chunk_out[scores_size + group_size + i] == one_bf16) (*match_l)++;
+            }
+            for (int i = 0; i < v_chunk_size; i++) {
+                if (chunk_out[packed_inter_size + i] == chunk_v[i]) (*match_v)++;
+            }
+        }
+        printf("Result: F0=%d/%d C0=%d/%d L0=%d/%d V0=%d/%d F1=%d/%d C1=%d/%d L1=%d/%d V1=%d/%d\n",
+               match_f0, scores_size, match_c0, group_size, match_l0, group_size, match_v0, v_chunk_size,
+               match_f1, scores_size, match_c1, group_size, match_l1, group_size, match_v1, v_chunk_size);
+
+        if (match_f0 != scores_size || match_c0 != group_size || match_l0 != group_size || match_v0 != v_chunk_size ||
+            match_f1 != scores_size || match_c1 != group_size || match_l1 != group_size || match_v1 != v_chunk_size) {
+            printf("FAIL: output mismatch\n");
+            printf("First 8 packed entries:\n");
+            for (int i = 0; i < 8; i++) {
+                printf("  [%d] k0=0x%04X outF0=0x%04X k1=0x%04X outF1=0x%04X v0=0x%04X outV0=0x%04X v1=0x%04X outV1=0x%04X\n",
+                       i,
+                       k_ptr[i], out_ptr[i],
+                       k_ptr[v_chunk_size + i], out_ptr[out_block_size + i],
+                       v_ptr[num_chunks * v_chunk_size + i], out_ptr[packed_inter_size + i],
+                       v_ptr[(num_chunks + 1) * v_chunk_size + i], out_ptr[out_block_size + packed_inter_size + i]);
+            }
+            return 1;
+        }
+        printf("PASS: echo v6\n");
 
     } else {
         printf("FAIL: unknown version %d\n", version);

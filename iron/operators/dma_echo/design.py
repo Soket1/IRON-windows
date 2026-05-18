@@ -344,10 +344,104 @@ def echo_v5(dev, N=32, num_chunks=2, q_stride=66):
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
+def echo_v6(dev, chunk_size=16, group_size=4, num_chunks=2, head_dim=64):
+    """Version 6: FlowKV packed inter layout diagnostic.
+    Mirrors the real [F_c | C_c | l] packed inter contract without attention math.
+    """
+    dtype_in = np.dtype[bfloat16]
+    dev_ty = NPU1() if dev == "npu" else NPU2()
+
+    scores_size = chunk_size * group_size
+    packed_inter_size = scores_size + 2 * group_size
+    v_size = chunk_size * head_dim
+    out_block_size = packed_inter_size + v_size
+
+    L1_kv_ty = np.ndarray[(v_size,), dtype_in]
+    L1_q_ty = np.ndarray[(group_size * head_dim + head_dim + 2,), dtype_in]
+    L1_inter_ty = np.ndarray[(packed_inter_size,), dtype_in]
+    L1_out_ty = np.ndarray[(num_chunks * out_block_size,), dtype_in]
+    L3_K_ty = np.ndarray[(num_chunks * v_size,), dtype_in]
+    L3_V_ty = np.ndarray[(2 * num_chunks * v_size,), dtype_in]
+    L3_Q_ty = np.ndarray[(group_size * head_dim + head_dim + 2,), dtype_in]
+    L3_O_ty = np.ndarray[(num_chunks * out_block_size,), dtype_in]
+
+    pack_fn = Kernel("echo_pack_inter_v6_bf16", "echo.o", [L1_kv_ty, L1_inter_ty, np.int32, np.int32, np.int32])
+    value0_fn = Kernel("echo_value_v6_chunk0_bf16", "echo.o", [L1_inter_ty, L1_kv_ty, L1_out_ty, np.int32, np.int32, np.int32])
+    value1_fn = Kernel("echo_value_v6_chunk1_bf16", "echo.o", [L1_inter_ty, L1_kv_ty, L1_out_ty, np.int32, np.int32, np.int32])
+
+    q_fifo = ObjectFifo(L1_q_ty, name="q_fifo", depth=1)
+    k_fifo = ObjectFifo(L1_kv_ty, name="k_fifo", depth=2)
+    v_fifo = ObjectFifo(L1_kv_ty, name="v_fifo", depth=2)
+    inter_fifo = ObjectFifo(L1_inter_ty, name="inter_fifo", depth=2)
+    out_fifo = ObjectFifo(L1_out_ty, name="out_fifo", depth=1)
+
+    def score_body(qf, kf, inter, fn):
+        for _ in range_(0xFFFFFFFF):
+            q = qf.acquire(1)
+            for _ in range_(num_chunks):
+                k = kf.acquire(1)
+                p = inter.acquire(1)
+                fn(k, p, chunk_size, group_size, head_dim)
+                kf.release(1)
+                inter.release(1)
+            qf.release(1)
+
+    def value_body(inter, vf, ofo, fn0, fn1):
+        for _ in range_(0xFFFFFFFF):
+            out = ofo.acquire(1)
+
+            p0 = inter.acquire(1)
+            v0 = vf.acquire(1)
+            fn0(p0, v0, out, chunk_size, group_size, head_dim)
+            inter.release(1)
+            vf.release(1)
+
+            p1 = inter.acquire(1)
+            v1 = vf.acquire(1)
+            fn1(p1, v1, out, chunk_size, group_size, head_dim)
+            inter.release(1)
+            vf.release(1)
+
+            ofo.release(1)
+
+    score_worker = Worker(score_body, [q_fifo.cons(), k_fifo.cons(), inter_fifo.prod(), pack_fn])
+    value_worker = Worker(value_body, [inter_fifo.cons(), v_fifo.cons(), out_fifo.prod(), value0_fn, value1_fn])
+
+    rt = Runtime()
+    with rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty) as (K, V, Q, O):
+        rt.start(score_worker)
+        rt.start(value_worker)
+        tg_k = rt.task_group()
+        tg_v = rt.task_group()
+
+        rt.fill(q_fifo.prod(), Q,
+                TensorAccessPattern((group_size * head_dim + head_dim + 2,), 0, [1, 1, 1, group_size * head_dim + head_dim + 2], [0, 0, 0, 1]),
+                task_group=tg_k)
+        for chunk in range(num_chunks):
+            rt.fill(k_fifo.prod(), K,
+                    TensorAccessPattern((num_chunks * v_size,), chunk * v_size, [1, 1, 1, v_size], [0, 0, 0, 1]),
+                    task_group=tg_k)
+        rt.finish_task_group(tg_k)
+
+        for chunk in range(num_chunks):
+            rt.fill(v_fifo.prod(), V,
+                    TensorAccessPattern((2 * num_chunks * v_size,), (num_chunks + chunk) * v_size, [1, 1, 1, v_size], [0, 0, 0, 1]),
+                    task_group=tg_v)
+
+        tg_out = rt.task_group()
+        rt.drain(out_fifo.cons(), O,
+                 TensorAccessPattern((num_chunks * out_block_size,), 0, [1, 1, 1, num_chunks * out_block_size], [0, 0, 0, 1]),
+                 task_group=tg_out, wait=True)
+        rt.finish_task_group(tg_v)
+        rt.finish_task_group(tg_out)
+
+    return Program(dev_ty, rt).resolve_program(SequentialPlacer())
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", default="npu2", choices=["npu", "npu2"])
-    ap.add_argument("--version", type=int, choices=[1, 2, 3, 4, 5], required=True)
+    ap.add_argument("--version", type=int, choices=[1, 2, 3, 4, 5, 6], required=True)
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("-o", "--output-file-path", required=True)
     args = ap.parse_args()
@@ -360,8 +454,10 @@ if __name__ == "__main__":
         module = echo_v3(args.dev, args.n)
     elif args.version == 4:
         module = echo_v4(args.dev)
-    else:
+    elif args.version == 5:
         module = echo_v5(args.dev)
+    else:
+        module = echo_v6(args.dev)
 
     Path(args.output_file_path).write_text(str(module))
     print(f"Wrote {args.output_file_path}")
