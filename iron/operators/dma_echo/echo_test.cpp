@@ -4,6 +4,8 @@
 // Usage: echo_test.exe <xclbin_path> <insts_path> [version]
 //   version: 1 = single ObjectFifo copy (default)
 //            2 = dual ObjectFifo concat
+//            3 = inter-tile K/V path
+//            4 = FlowKV-like Q/K/V arg and TAP path
 
 #include <cstdio>
 #include <cstdlib>
@@ -56,7 +58,7 @@ int main(int argc, char * argv[]) {
     if (argc < 3) {
         fprintf(stderr, "[echo_test] usage branch\n"); fflush(stderr);
         printf("Usage: %s <xclbin> <insts> [version]\n", argv[0]);
-        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo\n");
+        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv\n");
         return 1;
     }
 
@@ -65,7 +67,7 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "[echo_test] paths copied\n"); fflush(stderr);
     int version = (argc >= 4) ? atoi(argv[3]) : 1;
     fprintf(stderr, "[echo_test] version=%d\n", version); fflush(stderr);
-    int N = (version == 1) ? 256 : 128;
+    int N = (version == 1) ? 256 : ((version == 4) ? 64 : 128);
 
     printf("echo_test v%d: xclbin=%s insts=%s N=%d\n",
            version, xclbin_path.c_str(), insts_path.c_str(), N);
@@ -377,6 +379,99 @@ int main(int argc, char * argv[]) {
             return 1;
         }
         printf("PASS: echo v3\n");
+
+    } else if (version == 4) {
+        fprintf(stderr, "[echo_test] enter v4 branch\n"); fflush(stderr);
+        // --- Echo v4: FlowKV-like args K,V,Q,O and TAP-style V offset ---
+        const int seq_len = 2;
+        const int q_stride = 130;
+        int half_bytes = N * 2;
+        int k_bytes = seq_len * N * 2;
+        int v_bytes = 2 * seq_len * N * 2;
+        int q_bytes = q_stride * 2;
+        int out_bytes = 3 * N * 2;
+
+        xrt::bo bo_k(dev, k_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        fprintf(stderr, "[echo_test] after bo_k create\n"); fflush(stderr);
+        xrt::bo bo_v(dev, v_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        fprintf(stderr, "[echo_test] after bo_v create\n"); fflush(stderr);
+        xrt::bo bo_q(dev, q_bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+        fprintf(stderr, "[echo_test] after bo_q create\n"); fflush(stderr);
+        xrt::bo bo_out(dev, out_bytes, xrt::bo::flags::host_only, kernel.group_id(6));
+        fprintf(stderr, "[echo_test] after v4 bo_out create\n"); fflush(stderr);
+
+        auto k_ptr = bo_k.map<uint16_t*>();
+        auto v_ptr = bo_v.map<uint16_t*>();
+        auto q_ptr = bo_q.map<uint16_t*>();
+        for (int i = 0; i < seq_len * N; i++) {
+            k_ptr[i] = f32_to_bf16((float)(i + 1));
+        }
+        for (int i = 0; i < 2 * seq_len * N; i++) {
+            v_ptr[i] = f32_to_bf16(-1000.0f - (float)i);
+        }
+        for (int i = 0; i < N; i++) {
+            v_ptr[N + i] = f32_to_bf16((float)(i + 1) * 10);
+        }
+        for (int i = 0; i < q_stride; i++) {
+            q_ptr[i] = f32_to_bf16(-2000.0f - (float)i);
+        }
+        for (int i = 0; i < N; i++) {
+            q_ptr[i] = f32_to_bf16((float)(i + 1) * 100);
+        }
+        bo_k.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_v.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_q.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "[echo_test] after v4 input sync\n"); fflush(stderr);
+        printf("Inputs synced\n");
+        fflush(stdout);
+
+        auto out_ptr = bo_out.map<uint16_t*>();
+        memset(out_ptr, 0, out_bytes);
+        fprintf(stderr, "[echo_test] after v4 clear output\n"); fflush(stderr);
+
+        printf("Dispatching kernel...\n");
+        fflush(stdout);
+        auto run = xrt::run(kernel);
+        fprintf(stderr, "[echo_test] after v4 run create\n"); fflush(stderr);
+        run.set_arg(0, 3u);
+        run.set_arg(1, insts_bo);
+        run.set_arg(2, (uint32_t)insts_data.size());
+        run.set_arg(3, bo_k);
+        run.set_arg(4, bo_v);
+        run.set_arg(5, bo_q);
+        run.set_arg(6, bo_out);
+        fprintf(stderr, "[echo_test] after v4 set_args\n"); fflush(stderr);
+
+        run.start();
+        fprintf(stderr, "[echo_test] after v4 start\n"); fflush(stderr);
+        auto state = run.wait(10000);
+        fprintf(stderr, "[echo_test] after v4 wait state=%d\n", (int)state); fflush(stderr);
+
+        if (state != ERT_CMD_STATE_COMPLETED) {
+            printf("FAIL: kernel returned state=%d\n", (int)state);
+            return 1;
+        }
+        printf("Kernel completed\n");
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        int match_k = 0, match_q = 0, match_v = 0;
+        for (int i = 0; i < N; i++) {
+            if (out_ptr[i] == k_ptr[i]) match_k++;
+            if (out_ptr[N + i] == q_ptr[i]) match_q++;
+            if (out_ptr[2 * N + i] == v_ptr[N + i]) match_v++;
+        }
+        printf("Result: K=%d/%d Q=%d/%d V=%d/%d\n", match_k, N, match_q, N, match_v, N);
+
+        if (match_k != N || match_q != N || match_v != N) {
+            printf("FAIL: output mismatch\n");
+            printf("First 8 triplets:\n");
+            for (int i = 0; i < 8; i++) {
+                printf("  [%d] k=0x%04X outK=0x%04X q=0x%04X outQ=0x%04X v=0x%04X outV=0x%04X\n",
+                       i, k_ptr[i], out_ptr[i], q_ptr[i], out_ptr[N + i], v_ptr[N + i], out_ptr[2 * N + i]);
+            }
+            return 1;
+        }
+        printf("PASS: echo v4\n");
 
     } else {
         printf("FAIL: unknown version %d\n", version);

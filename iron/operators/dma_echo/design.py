@@ -1,12 +1,14 @@
 # Minimal DMA echo test for XDNA debugging.
-# Three versions:
+# Four versions:
 #   v1: single ObjectFifo (bo_in → tile → bo_out)
 #   v2: dual ObjectFifo (bo_a + bo_b → tile concat → bo_out)
 #   v3: FlowKV-like split path (bo_k → tile0 → inter FIFO → tile1, bo_v → tile1 → bo_out)
+#   v4: FlowKV-like Q/K/V arg order and TAP offsets
 #
 # Usage: python design.py --dev npu2 --version 1 -o echo_v1.mlir
 #        python design.py --dev npu2 --version 2 -o echo_v2.mlir
 #        python design.py --dev npu2 --version 3 -o echo_v3.mlir
+#        python design.py --dev npu2 --version 4 -o echo_v4.mlir
 
 import numpy as np
 from pathlib import Path
@@ -172,10 +174,88 @@ def echo_v3(dev, N=128):
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
+def echo_v4(dev, N=64, seq_len=2, q_stride=130):
+    """Version 4: FlowKV-like Q/K/V arg order and TAP layout.
+    rt.sequence args are K, V, Q, O like FlowKV. The score tile consumes Q and K,
+    writes [K, Q] through inter_fifo, then the value tile consumes inter + V and
+    writes [K, Q, V] to O. V TAP reads from offset N to mimic FlowKV's V region.
+    """
+    dtype_in = np.dtype[bfloat16]
+    dev_ty = NPU1() if dev == "npu" else NPU2()
+
+    L1_ty = np.ndarray[(N,), dtype_in]
+    L1_inter = np.ndarray[(2 * N,), dtype_in]
+    L1_out = np.ndarray[(3 * N,), dtype_in]
+    L3_K_ty = np.ndarray[(seq_len * N,), dtype_in]
+    L3_V_ty = np.ndarray[(2 * seq_len * N,), dtype_in]
+    L3_Q_ty = np.ndarray[(q_stride,), dtype_in]
+    L3_O_ty = np.ndarray[(3 * N,), dtype_in]
+
+    score_fn = Kernel("echo_score_qk_bf16", "echo.o", [L1_ty, L1_ty, L1_inter, np.int32])
+    value_fn = Kernel("echo_value_qkv_bf16", "echo.o", [L1_inter, L1_ty, L1_out, np.int32])
+
+    q_fifo = ObjectFifo(L1_ty, name="q_fifo", depth=1)
+    k_fifo = ObjectFifo(L1_ty, name="k_fifo", depth=2)
+    v_fifo = ObjectFifo(L1_ty, name="v_fifo", depth=2)
+    inter_fifo = ObjectFifo(L1_inter, name="inter_fifo", depth=2)
+    out_fifo = ObjectFifo(L1_out, name="out_fifo", depth=2)
+
+    def score_body(qf, kf, inter, fn):
+        for _ in range_(0xFFFFFFFF):
+            q = qf.acquire(1)
+            k = kf.acquire(1)
+            i = inter.acquire(1)
+            fn(q, k, i, N)
+            qf.release(1)
+            kf.release(1)
+            inter.release(1)
+
+    def value_body(inter, vf, ofo, fn):
+        for _ in range_(0xFFFFFFFF):
+            i = inter.acquire(1)
+            v = vf.acquire(1)
+            out = ofo.acquire(1)
+            fn(i, v, out, N)
+            inter.release(1)
+            vf.release(1)
+            ofo.release(1)
+
+    score_worker = Worker(score_body, [q_fifo.cons(), k_fifo.cons(), inter_fifo.prod(), score_fn])
+    value_worker = Worker(value_body, [inter_fifo.cons(), v_fifo.cons(), out_fifo.prod(), value_fn])
+
+    rt = Runtime()
+    with rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty) as (K, V, Q, O):
+        rt.start(score_worker)
+        rt.start(value_worker)
+        tg_k = rt.task_group()
+        tg_v = rt.task_group()
+
+        rt.fill(q_fifo.prod(), Q,
+                TensorAccessPattern((q_stride,), 0, [1, 1, 1, N], [0, 0, 0, 1]),
+                task_group=tg_k)
+        rt.fill(k_fifo.prod(), K,
+                TensorAccessPattern((seq_len * N,), 0, [1, 1, 1, N], [0, 0, 0, 1]),
+                task_group=tg_k)
+        rt.finish_task_group(tg_k)
+
+        rt.fill(v_fifo.prod(), V,
+                TensorAccessPattern((2 * seq_len * N,), N, [1, 1, 1, N], [0, 0, 0, 1]),
+                task_group=tg_v)
+
+        tg_out = rt.task_group()
+        rt.drain(out_fifo.cons(), O,
+                 TensorAccessPattern((3 * N,), 0, [1, 1, 1, 3 * N], [0, 0, 0, 1]),
+                 task_group=tg_out, wait=True)
+        rt.finish_task_group(tg_v)
+        rt.finish_task_group(tg_out)
+
+    return Program(dev_ty, rt).resolve_program(SequentialPlacer())
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", default="npu2", choices=["npu", "npu2"])
-    ap.add_argument("--version", type=int, choices=[1, 2, 3], required=True)
+    ap.add_argument("--version", type=int, choices=[1, 2, 3, 4], required=True)
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("-o", "--output-file-path", required=True)
     args = ap.parse_args()
@@ -184,8 +264,10 @@ if __name__ == "__main__":
         module = echo_v1(args.dev, args.n)
     elif args.version == 2:
         module = echo_v2(args.dev, args.n)
-    else:
+    elif args.version == 3:
         module = echo_v3(args.dev, args.n)
+    else:
+        module = echo_v4(args.dev)
 
     Path(args.output_file_path).write_text(str(module))
     print(f"Wrote {args.output_file_path}")
