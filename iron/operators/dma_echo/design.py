@@ -593,10 +593,92 @@ def echo_v8(dev, chunk_size=16, group_size=4, num_chunks=2, head_dim=64):
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
+def echo_v9(dev, chunk_size=16, group_size=4, num_chunks=2, head_dim=64):
+    """Version 9: FlowKV production-layout probe.
+    Copies back what the score/value tiles see for K, V, Q, and Q metadata.
+    """
+    dtype_in = np.dtype[bfloat16]
+    dev_ty = NPU1() if dev == "npu" else NPU2()
+
+    kv_chunk_size = chunk_size * head_dim
+    q_stride = group_size * head_dim + head_dim + 2
+    actual_seq_len_slot = group_size * head_dim + head_dim
+    inter_size = 3 * head_dim
+    out_size = 4 * head_dim
+
+    L1_q_ty = np.ndarray[(q_stride,), dtype_in]
+    L1_kv_ty = np.ndarray[(head_dim,), dtype_in]
+    L1_inter_ty = np.ndarray[(inter_size,), dtype_in]
+    L1_out_ty = np.ndarray[(out_size,), dtype_in]
+    L3_K_ty = np.ndarray[(num_chunks * kv_chunk_size,), dtype_in]
+    L3_V_ty = np.ndarray[(2 * num_chunks * kv_chunk_size,), dtype_in]
+    L3_Q_ty = np.ndarray[(q_stride,), dtype_in]
+    L3_O_ty = np.ndarray[(out_size,), dtype_in]
+
+    pack_fn = Kernel("echo_v9_pack_qk_meta_bf16", "echo.o", [L1_q_ty, L1_kv_ty, L1_inter_ty, np.int32, np.int32])
+    value_fn = Kernel("echo_v9_probe_value_bf16", "echo.o", [L1_inter_ty, L1_kv_ty, L1_out_ty, np.int32])
+
+    q_fifo = ObjectFifo(L1_q_ty, name="q_fifo", depth=1)
+    k_fifo = ObjectFifo(L1_kv_ty, name="k_fifo", depth=1)
+    v_fifo = ObjectFifo(L1_kv_ty, name="v_fifo", depth=1)
+    inter_fifo = ObjectFifo(L1_inter_ty, name="inter_fifo", depth=1)
+    out_fifo = ObjectFifo(L1_out_ty, name="out_fifo", depth=1)
+
+    def score_body(qf, kf, inter, fn):
+        for _ in range_(0xFFFFFFFF):
+            q = qf.acquire(1)
+            k = kf.acquire(1)
+            i = inter.acquire(1)
+            fn(q, k, i, head_dim, actual_seq_len_slot)
+            qf.release(1)
+            kf.release(1)
+            inter.release(1)
+
+    def value_body(inter, vf, ofo, fn):
+        for _ in range_(0xFFFFFFFF):
+            i = inter.acquire(1)
+            v = vf.acquire(1)
+            out = ofo.acquire(1)
+            fn(i, v, out, head_dim)
+            inter.release(1)
+            vf.release(1)
+            ofo.release(1)
+
+    score_worker = Worker(score_body, [q_fifo.cons(), k_fifo.cons(), inter_fifo.prod(), pack_fn])
+    value_worker = Worker(value_body, [inter_fifo.cons(), v_fifo.cons(), out_fifo.prod(), value_fn])
+
+    rt = Runtime()
+    with rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty) as (K, V, Q, O):
+        rt.start(score_worker)
+        rt.start(value_worker)
+        tg_score = rt.task_group()
+        rt.fill(q_fifo.prod(), Q,
+                TensorAccessPattern((q_stride,), 0, [1, 1, 1, q_stride], [0, 0, 0, 1]),
+                task_group=tg_score)
+        rt.fill(k_fifo.prod(), K,
+                TensorAccessPattern((num_chunks * kv_chunk_size,), 0, [1, 1, 1, head_dim], [0, 0, 0, 1]),
+                task_group=tg_score)
+        rt.finish_task_group(tg_score)
+
+        tg_v = rt.task_group()
+        rt.fill(v_fifo.prod(), V,
+                TensorAccessPattern((2 * num_chunks * kv_chunk_size,), num_chunks * kv_chunk_size, [1, 1, 1, head_dim], [0, 0, 0, 1]),
+                task_group=tg_v)
+
+        tg_out = rt.task_group()
+        rt.drain(out_fifo.cons(), O,
+                 TensorAccessPattern((out_size,), 0, [1, 1, 1, out_size], [0, 0, 0, 1]),
+                 task_group=tg_out, wait=True)
+        rt.finish_task_group(tg_v)
+        rt.finish_task_group(tg_out)
+
+    return Program(dev_ty, rt).resolve_program(SequentialPlacer())
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", default="npu2", choices=["npu", "npu2"])
-    ap.add_argument("--version", type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8], required=True)
+    ap.add_argument("--version", type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9], required=True)
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("-o", "--output-file-path", required=True)
     args = ap.parse_args()
@@ -615,9 +697,10 @@ if __name__ == "__main__":
         module = echo_v6(args.dev)
     elif args.version == 7:
         module = echo_v7(args.dev)
-    else:
+    elif args.version == 8:
         module = echo_v8(args.dev)
-
+    else:
+        module = echo_v9(args.dev)
 
     Path(args.output_file_path).write_text(str(module))
     print(f"Wrote {args.output_file_path}")

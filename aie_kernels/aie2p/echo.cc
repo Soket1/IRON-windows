@@ -427,4 +427,65 @@ void echo_v8_value_normalize_bf16(bfloat16 *__restrict output, int32_t num_q_hea
     }
 }
 
+void echo_v9_pack_qk_meta_bf16(const bfloat16 *__restrict q,
+                                const bfloat16 *__restrict k,
+                                bfloat16 *__restrict inter,
+                                int32_t head_dim,
+                                int32_t actual_seq_len_slot)
+{
+    const int32_t inter_elems = 3 * head_dim;
+    for (int i = 0; i < head_dim; i += 16) {
+        aie::vector<bfloat16, 16> q_vec = aie::load_v<16>(q + i);
+        aie::vector<bfloat16, 16> k_vec = aie::load_v<16>(k + i);
+        aie::store_v(inter + i, q_vec);
+        aie::store_v(inter + head_dim + i, k_vec);
+    }
+    inter[2 * head_dim] = q[actual_seq_len_slot];
+    for (int i = 2 * head_dim + 1; i < inter_elems; i++) {
+        inter[i] = static_cast<bfloat16>(0.0f);
+    }
+}
+
+void echo_v9_probe_value_bf16(const bfloat16 *__restrict inter,
+                              const bfloat16 *__restrict v,
+                              bfloat16 *__restrict out,
+                              int32_t head_dim)
+{
+    const int32_t out_elems = 4 * head_dim;
+    for (int i = 0; i < head_dim; i += 16) {
+        aie::vector<bfloat16, 16> q_vec = aie::load_v<16>(inter + i);
+        aie::vector<bfloat16, 16> k_vec = aie::load_v<16>(inter + head_dim + i);
+        aie::vector<bfloat16, 16> v_vec = aie::load_v<16>(v + i);
+        aie::store_v(out + i, q_vec);
+        aie::store_v(out + head_dim + i, k_vec);
+        aie::store_v(out + 2 * head_dim + i, v_vec);
+    }
+    out[3 * head_dim] = inter[2 * head_dim];
+    for (int i = 3 * head_dim + 1; i < out_elems; i++) {
+        out[i] = static_cast<bfloat16>(0.0f);
+    }
+}
+
+void echo_v9_probe_layout_bf16(const bfloat16 *__restrict q,
+                               const bfloat16 *__restrict k,
+                               const bfloat16 *__restrict v,
+                               bfloat16 *__restrict out,
+                               int32_t head_dim,
+                               int32_t actual_seq_len_slot)
+{
+    const int32_t out_elems = 4 * head_dim;
+    for (int i = 0; i < head_dim; i += 16) {
+        aie::vector<bfloat16, 16> q_vec = aie::load_v<16>(q + i);
+        aie::vector<bfloat16, 16> k_vec = aie::load_v<16>(k + i);
+        aie::vector<bfloat16, 16> v_vec = aie::load_v<16>(v + i);
+        aie::store_v(out + i, q_vec);
+        aie::store_v(out + head_dim + i, k_vec);
+        aie::store_v(out + 2 * head_dim + i, v_vec);
+    }
+    out[3 * head_dim] = q[actual_seq_len_slot];
+    for (int i = 3 * head_dim + 1; i < out_elems; i++) {
+        out[i] = static_cast<bfloat16>(0.0f);
+    }
+}
+
 } // extern "C"

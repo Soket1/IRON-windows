@@ -9,7 +9,8 @@
 //            5 = FlowKV-like multi-chunk path
 //            6 = FlowKV packed inter layout path
 //            7 = FlowKV score math packed inter path
-//            8 = FlowKV value math path
+//            8 = FlowKV value math packed inter path
+//            9 = FlowKV production-layout ABI/TAP/Q metadata probe
 
 #include <cstdio>
 #include <cstdlib>
@@ -67,7 +68,7 @@ int main(int argc, char * argv[]) {
     if (argc < 3) {
         fprintf(stderr, "[echo_test] usage branch\n"); fflush(stderr);
         printf("Usage: %s <xclbin> <insts> [version]\n", argv[0]);
-        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk, 6=packed-inter, 7=score-math, 8=value-math\n");
+        printf("  version: 1=copy (default), 2=concat, 3=inter-fifo, 4=qkv-flowkv, 5=multi-chunk, 6=packed-inter, 7=score-math, 8=value-math, 9=prod-layout\n");
         return 1;
     }
 
@@ -76,7 +77,7 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "[echo_test] paths copied\n"); fflush(stderr);
     int version = (argc >= 4) ? atoi(argv[3]) : 1;
     fprintf(stderr, "[echo_test] version=%d\n", version); fflush(stderr);
-    int N = (version == 1) ? 256 : ((version == 4) ? 64 : (((version >= 5) && (version <= 8)) ? 32 : 128));
+    int N = (version == 1) ? 256 : ((version == 4 || version == 9) ? 64 : (((version >= 5) && (version <= 8)) ? 32 : 128));
 
     printf("echo_test v%d: xclbin=%s insts=%s N=%d\n",
            version, xclbin_path.c_str(), insts_path.c_str(), N);
@@ -879,6 +880,96 @@ int main(int argc, char * argv[]) {
             return 1;
         }
         printf("PASS: echo v8\n");
+
+    } else if (version == 9) {
+        fprintf(stderr, "[echo_test] enter v9 branch\n"); fflush(stderr);
+        const int chunk_size = 16;
+        const int group_size = 4;
+        const int num_chunks = 2;
+        const int head_dim = 64;
+        const int q_stride = group_size * head_dim + head_dim + 2;
+        const int actual_seq_len_slot = group_size * head_dim + head_dim;
+        const int kv_chunk_size = chunk_size * head_dim;
+        const int out_elems = 4 * head_dim;
+        int k_bytes = num_chunks * kv_chunk_size * 2;
+        int v_bytes = 2 * num_chunks * kv_chunk_size * 2;
+        int q_bytes = q_stride * 2;
+        int out_bytes = out_elems * 2;
+
+        xrt::bo bo_k(dev, k_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        xrt::bo bo_v(dev, v_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+        xrt::bo bo_q(dev, q_bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+        xrt::bo bo_out(dev, out_bytes, xrt::bo::flags::host_only, kernel.group_id(6));
+
+        auto k_ptr = bo_k.map<uint16_t*>();
+        auto v_ptr = bo_v.map<uint16_t*>();
+        auto q_ptr = bo_q.map<uint16_t*>();
+        for (int i = 0; i < num_chunks * kv_chunk_size; i++) {
+            k_ptr[i] = f32_to_bf16(1000.0f + (float)i);
+        }
+        for (int i = 0; i < 2 * num_chunks * kv_chunk_size; i++) {
+            v_ptr[i] = f32_to_bf16(-3000.0f - (float)i);
+        }
+        for (int i = 0; i < q_stride; i++) {
+            q_ptr[i] = f32_to_bf16(5000.0f + (float)i);
+        }
+        for (int i = 0; i < kv_chunk_size; i++) {
+            v_ptr[num_chunks * kv_chunk_size + i] = f32_to_bf16(4000.0f + (float)i);
+        }
+        q_ptr[actual_seq_len_slot] = f32_to_bf16(32.0f);
+
+        bo_k.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_v.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_q.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        printf("Inputs synced\n");
+        fflush(stdout);
+
+        auto out_ptr = bo_out.map<uint16_t*>();
+        memset(out_ptr, 0, out_bytes);
+
+        printf("Dispatching kernel...\n");
+        fflush(stdout);
+        auto run = xrt::run(kernel);
+        run.set_arg(0, 3u);
+        run.set_arg(1, insts_bo);
+        run.set_arg(2, (uint32_t)insts_data.size());
+        run.set_arg(3, bo_k);
+        run.set_arg(4, bo_v);
+        run.set_arg(5, bo_q);
+        run.set_arg(6, bo_out);
+
+        run.start();
+        auto state = run.wait(10000);
+        fprintf(stderr, "[echo_test] after v9 wait state=%d\n", (int)state); fflush(stderr);
+        if (state != ERT_CMD_STATE_COMPLETED) {
+            printf("FAIL: kernel returned state=%d\n", (int)state);
+            return 1;
+        }
+        printf("Kernel completed\n");
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        int match_q = 0, match_k = 0, match_v = 0, match_meta = 0, match_tail = 0;
+        for (int i = 0; i < head_dim; i++) {
+            if (out_ptr[i] == q_ptr[i]) match_q++;
+            if (out_ptr[head_dim + i] == k_ptr[i]) match_k++;
+            if (out_ptr[2 * head_dim + i] == v_ptr[num_chunks * kv_chunk_size + i]) match_v++;
+        }
+        if (out_ptr[3 * head_dim] == q_ptr[actual_seq_len_slot]) match_meta = 1;
+        for (int i = 3 * head_dim + 1; i < out_elems; i++) {
+            if (out_ptr[i] == f32_to_bf16(0.0f)) match_tail++;
+        }
+        printf("Result: Q=%d/%d K=%d/%d V=%d/%d META=%d/1 TAIL=%d/%d\n",
+               match_q, head_dim, match_k, head_dim, match_v, head_dim, match_meta, match_tail, out_elems - (3 * head_dim + 1));
+        printf("Samples: Q0=%.6f K0=%.6f V0=%.6f META=%.6f Qmeta=%.6f\n",
+               bf16_to_f32(out_ptr[0]), bf16_to_f32(out_ptr[head_dim]), bf16_to_f32(out_ptr[2 * head_dim]),
+               bf16_to_f32(out_ptr[3 * head_dim]), bf16_to_f32(q_ptr[actual_seq_len_slot]));
+
+        if (match_q != head_dim || match_k != head_dim || match_v != head_dim ||
+            match_meta != 1 || match_tail != out_elems - (3 * head_dim + 1)) {
+            printf("FAIL: output mismatch\n");
+            return 1;
+        }
+        printf("PASS: echo v9\n");
 
     } else {
         printf("FAIL: unknown version %d\n", version);
