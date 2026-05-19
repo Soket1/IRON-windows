@@ -8,12 +8,12 @@ FlowKV decode attention is integrated and produces correct output on STX NPU2.
 Debug flowkv.bat: Step 2 (no FlowKV) = "The capital of France is Paris." ✅
                     Step 3 (with FlowKV) = "The capital of France is Paris." ✅
 
-Benchmark (test_short3.bat, 32 tokens):
+Benchmark (run_flowkv_bench.bat, 32 tokens):
 
 | Config | Prompt | Generation |
 |--------|--------|------------|
 | Baseline (no FlowKV) | 123.7 t/s | **6.0 t/s** |
-| With FlowKV | 112.4 t/s | **4.4 t/s** (-27%) |
+| With FlowKV | 127.6 t/s | **4.8 t/s** (-20%) |
 
 FlowKV is slower due to 8 separate dispatches per layer (96 per token).
 Dispatch overhead (xrt::run setup + wait) dominates. Priority 4: batch KV heads.
@@ -112,11 +112,31 @@ Only when:
 - Reduction infra built for softmax (reusable for RMSNorm)
 - All other ops on NPU
 
-### Priority 4: Benchmark and optimize FlowKV
+### Priority 4: Batch KV heads per dispatch (4.4 → ~5.5-6.0 t/s)
 
-- Run proper benchmark with more tokens (current: only 16 tokens)
-- Profile per-KV-head dispatch overhead (8 separate dispatches)
-- Consider multi-KV-head dispatch (batch 2-4 KV heads per dispatch)
+**Problem:** FlowKV dispatches 8 times per layer (1 per KV head) = 96 dispatches per token.
+Dispatch overhead (xrt::run setup + wait) dominates, making FlowKV SLOWER than baseline.
+
+**Solution:** Batch 4 KV heads into a single xrt::run call.
+- Dispatch count: 8 → 2 per layer (24 per token instead of 96)
+- Kernel stays the same, called 4 times inside one dispatch
+- Expected gain: 4.4 → ~5.5-6.0 t/s
+
+**Implementation:**
+1. Host: write K/V/Q data for 4 KV heads into combined buffers
+2. IRON design: runtime sequence with 4× K/V/Q/O buffers
+3. Kernel: loop over 4 KV heads within single dispatch
+4. Scatter: write 4× output back to correct head positions
+
+### Priority 5: Multi-column parallelism (→ ~8-10 t/s)
+
+Distribute 8 KV heads across 8 NPU columns (STX NPU2 has 8 columns).
+Each KV head on its own column, all in parallel.
+
+### Priority 6: Fuse FlowKV + output projection (→ +1-2 t/s)
+
+Combine FlowKV output → attn_output.weight MUL_MAT in single dispatch.
+Remove CONT + MUL_MAT from CPU path.
 
 ## Testing
 
