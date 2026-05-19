@@ -8,6 +8,16 @@ FlowKV decode attention is integrated and produces correct output on STX NPU2.
 Debug flowkv.bat: Step 2 (no FlowKV) = "The capital of France is Paris." ✅
                     Step 3 (with FlowKV) = "The capital of France is Paris." ✅
 
+Benchmark (test_short3.bat, 32 tokens):
+
+| Config | Prompt | Generation |
+|--------|--------|------------|
+| Baseline (no FlowKV) | 123.7 t/s | **6.0 t/s** |
+| With FlowKV | 112.4 t/s | **4.4 t/s** (-27%) |
+
+FlowKV is slower due to 8 separate dispatches per layer (96 per token).
+Dispatch overhead (xrt::run setup + wait) dominates. Priority 4: batch KV heads.
+
 ## Two bugs found and fixed (2026-05-19)
 
 ### Bug 1 (v10): K DMA routing
