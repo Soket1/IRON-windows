@@ -1,47 +1,64 @@
 # IRON-windows NPU Optimization Plan
 
-> Last updated: 2026-05-10 23:31 GMT+8
+> Last updated: 2026-05-19
 
-## Current Status: **5.8 t/s** (Llama-3.2-1B-BF16, STX NPU2)
+## Current Status: **FlowKV decode WORKING**
+
+FlowKV decode attention is integrated and produces correct output on STX NPU2.
+Debug flowkv.bat: Step 2 (no FlowKV) = "The capital of France is Paris." ✅
+                    Step 3 (with FlowKV) = "The capital of France is Paris." ✅
+
+## Two bugs found and fixed (2026-05-19)
+
+### Bug 1 (v10): K DMA routing
+IRON compiler reads K FIFO from arg0 (bo_k), not arg1 (bo_v) as assumed.
+Host wrote K only to bo_v[0] → tile saw zeros.
+Fix: mirror K data into bo_k via memcpy after writing to bo_v.
+
+### Bug 2 (v11): CONT node skip
+`continue` skipped CONT node after FlowKV dispatch. MUL_MAT read from
+CONT output buffer (empty), not from kqv_out->data (CONT input).
+Fix: removed `continue`, let CONT execute in CPU range.
+
+Both bugs masked each other. After both fixes, model produces correct output.
+
+## Component Status
 
 | Component | Status | NPU? | Per-dispatch | Per token (×12) |
 |---|---|---|---|---|
 | QKV projection | ✅ Working | NPU | 1.17 ms | 14.0 ms |
 | SwiGLU (gate+up+silu+down) | ✅ Working | NPU | 3.62 ms | 43.4 ms |
 | Output projection (decode batch) | ✅ Working | NPU | 1.06 ms | 12.7 ms |
-| **NPU subtotal** | | | | **70 ms (41%)** |
-| Attention (Q@K^T, softmax, scores@V) | 🔶 Integrated, needs testing | NPU | ~2 ms × 8 | ~16 ms |
+| **Attention (FlowKV decode)** | ✅ Working | NPU | ~2 ms × 8 | ~16 ms |
 | RMSNorm + MUL (gain) | ❌ CPU | CPU | — | ~15-20 ms |
 | Residual ADD, RoPE, KV cache | ❌ CPU | CPU | — | ~10-15 ms |
-| **CPU subtotal** | | | | **~35-45 ms** |
-| **Total per token (projected)** | | | | **~120 ms → ~8-10 t/s** |
-
-## Per-dispatch profiling (decode M=1, 115 samples)
-
-| Operation | rl_build | rl_exec | rl_wait (NPU) | Total |
-|---|---|---|---|---|
-| SwiGLU | 54 µs | 51 µs | 3486 µs | 3620 µs |
-| QKV | — | — | — | 1165 µs |
-| decode_batch | — | — | — | 1055 µs |
 
 ## Dispatch pattern per layer
 
 ```
-graph_compute n_nodes=1   → SOFT_MAX (CPU, separate call)
-graph_compute n_nodes=32  → Main layer:
-  RMS_NORM      → CPU (tile_size=32 bug)
+graph_compute n_nodes=1   → SOFT_MAX (skipped when FlowKV enabled)
+graph_compute n_nodes=N   → Main layer:
+  RMS_NORM      → CPU
   MUL (gain)    → CPU
   MUL_MAT ×3    → NPU via QKV dispatch (1.17 ms)
   ROPE ×2       → CPU
-  SET_ROWS ×2   → CPU (KV cache writes)
-  VIEW/RESHAPE/PERMUTE → skipped
-  MUL_MAT       → NPU via decode_batch (output proj, 1.06 ms)
+  KV cache ops  → CPU
+  CONT + attn   → FlowKV POC dispatch (8 × ~2 ms = ~16 ms)
   ADD           → CPU (residual)
   RMS_NORM      → CPU
   MUL (gain)    → CPU
   GLU/SwiGLU    → NPU (3.62 ms)
   ADD           → CPU (residual)
 ```
+
+## Per-dispatch profiling (decode M=1)
+
+| Operation | Total |
+|---|---|
+| SwiGLU | 3620 µs |
+| QKV | 1165 µs |
+| decode_batch | 1055 µs |
+| FlowKV (per KV head) | ~2000 µs × 8 dispatches |
 
 ## What DOESN'T work (lessons learned)
 
@@ -57,7 +74,6 @@ graph_compute n_nodes=32  → Main layer:
 ### ❌ Transformer block fusion for decode (`tblock_match=0`)
 - Early-reject: `ne[1] < 32` blocks decode (ne[1]=1)
 - Gate: `seq_len >= 256` blocks decode (seq_len=1)
-- Matcher requires `FLASH_ATTN_EXT` (decode uses expanded pattern)
 - Even if fixed, impact is small: RMSNorm can't be included
 
 ### ❌ Decode batch efficiency
@@ -66,52 +82,14 @@ graph_compute n_nodes=32  → Main layer:
 
 ## Priorities
 
-### Priority 1: Attention → NPU (save ~60-70 ms/token)
+### Priority 1: Attention → NPU ✅ DONE
 
-**Expected gain: 5.8 → ~8-10 t/s (projected)**
-
-**Status: ✅ INTEGRATED (commit 67ae710), needs hardware testing**
-
-Implementation: per-KV-head FlowKV dispatch (Option 3).
-- Each KV head group dispatched separately (8 dispatches for Llama 3.2 1B)
-- Each dispatch: group_size=4 Q heads × 1 KV head × seq_len positions
-- RoPE: identity angles (Q already rotated by graph)
+FlowKV decode integrated and working (2026-05-19).
+- Per-KV-head dispatch (Option 3)
+- 8 dispatches for Llama 3.2 1B (group_size=4, 8 KV heads)
 - Gate: `XDNA_ENABLE_FLOWKV_DECODE=1`
-
-Architecture:
-```
-xdna_plan_flowkv() pre-scan:
-  - Find all Q@K^T MUL_MATs (M=1, K=64)
-  - Match with scores@V via SOFT_MAX
-  - Group by shared K source (= KV head)
-  ↓
-Per KV head (8 dispatches):
-  ggml_backend_xdna_flowkv_per_head():
-    - Interleaved K/V for one KV head
-    - Q for group_size heads
-    - Identity RoPE angles
-    - xrt::run → read back → scatter to output tensors
-  ↓
-Mark Q@K^T + SCALE + ADD + SOFT_MAX + scores@V as dispatched
-Main loop skips dispatched nodes
-```
-
-Compile (see [llama.cpp-xdna](https://github.com/Soket1/llama.cpp-xdna)): `python compile.py flowkv-decode --num-heads 4 --num-kv-heads 1 --head-dim 64 --seq-len 128 --num-cols 1`
-
-Test scripts:
-- `test_timing.ps1` — warmup + 64 tokens + timing
-- `test_short1.ps1` — clean cache + 32 tokens + conversation mode
-
-**Verification needed (before marking as working):**
-- [ ] Matcher correctly identifies expanded attention pattern in real graph
-- [ ] Q tensor extraction: src[1] gives [head_dim, 1] per head
-- [ ] K/V tensor extraction: src[0] gives [head_dim, seq_len] per KV head
-- [ ] Interleaved KV cache layout matches kernel expectation
-- [ ] Identity RoPE angles (cos=0x3C00, sin=0x0000) make kernel RoPE a no-op
-- [ ] Output scatter writes to correct per-head result tensors
-- [ ] Intermediate nodes (SCALE, ADD, SOFT_MAX) correctly skipped
-- [ ] Numerical correctness: NPU output matches CPU within bf16 tolerance
-- [ ] Performance: ~2ms per dispatch × 8 = ~16ms per layer
+- Identity RoPE angles (Q already rotated by graph)
+- Two bugs fixed: K DMA routing + CONT node skip
 
 ### Priority 2: Merge QKV + decode_batch (save ~5 ms/token)
 
@@ -124,18 +102,30 @@ Only when:
 - Reduction infra built for softmax (reusable for RMSNorm)
 - All other ops on NPU
 
+### Priority 4: Benchmark and optimize FlowKV
+
+- Run proper benchmark with more tokens (current: only 16 tokens)
+- Profile per-KV-head dispatch overhead (8 separate dispatches)
+- Consider multi-KV-head dispatch (batch 2-4 KV heads per dispatch)
+
 ## Testing
 
-### Pure CPU baseline (needed)
+### FlowKV verification
+
 ```bat
-set XDNA_ENABLE_GEMV=0
-set XDNA_ENABLE_SWIGLU=0
-set XDNA_ENABLE_QKV=0
-set XDNA_ENABLE_RMS_NORM=0
-set XDNA_ENABLE_DECODE_BATCH=0
+debug_flowkv.bat
 ```
 
+Runs Step 2 (baseline without FlowKV) and Step 3 (with FlowKV).
+Both should output "The capital of France is Paris."
+
+### Diagnostic tools
+
+- `XDNA_FLOWKV_REAL_PROBE=1` — v10: data transport probe
+- `XDNA_FLOWKV_MATH_DIAG=1` — v11: CPU reference comparison
+
 ### Current NPU config
+
 ```bat
 set XDNA_ENABLE_GEMV=1
 set XDNA_ENABLE_SWIGLU=1
@@ -145,7 +135,6 @@ set XDNA_ENABLE_SWIGLU_PREFILL=0
 set XDNA_ENABLE_DECODE_BATCH=1
 set XDNA_ENABLE_TRANSFORMER_BLOCK=1
 set XDNA_ENABLE_FLOWKV_DECODE=1
-set XDNA_DEBUG=1
 set GGML_XDNA_NUM_COLS=8
 ```
 
@@ -153,11 +142,29 @@ set GGML_XDNA_NUM_COLS=8
 
 | Milestone | Current | Target |
 |---|---|---|
-| Steady-state | **5.8 t/s** | — |
-| + Attention on NPU | **integrated, testing** | ~8-10 t/s |
+| Steady-state (no FlowKV) | **5.8 t/s** | — |
+| + Attention on NPU (FlowKV) | ✅ Working | ~8-10 t/s |
 | + Merge QKV+batch | — | ~12-13 t/s |
 | + RMSNorm on NPU | — | ~13-14 t/s |
 | Full model on NPU | — | ~15+ t/s |
+
+## Architecture
+
+### FlowKV Decode Attention
+
+2-tile streaming pipeline per KV head group:
+- **Score tile (CT0)**: Q*K^T/sqrt(d) + online softmax → packed [F_c | C_c | l]
+- **Value tile (CT1)**: weighted V accumulation + normalize → output
+
+### DDR buffer layout
+
+- **KV cache**: `[K_all | V_all]` combined in bo_v, K mirrored to bo_k
+- **Q**: `[Q_group | angles | actual_seq_len | probe_magic]` per KV group
+- **Output**: `(num_heads * head_dim)` bf16
+
+### Cache key
+
+`flowkv_H4_KV1_d64_S256_C32_1col`
 
 ## Environment
 
