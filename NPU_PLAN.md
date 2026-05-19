@@ -90,6 +90,16 @@ graph_compute n_nodes=N   → Main layer:
 - Plans 4 batchable GEMVs but only captures 1 per flush
 - CPU ops between GEMVs force flush after each one
 
+### ❌ FlowKV batch num_cols=1→4 (3 attempts)
+- Attempt 1: Wrong V layout (interleaved). Garbage.
+- Attempt 2: Correct contiguous V layout. Still garbage.
+- Attempt 3: Persistent xrt::run. Worse (3.9 vs 4.8 t/s).
+- All reverted. IRON TAP mapping needs deeper investigation.
+
+### ❌ FlowKV host-side optimizations
+- Remove memset of bo_v: no effect (4.8 t/s). Kernel only reads actual_seq_len.
+- Persistent xrt::run: worse (3.9 t/s). XRT doesn't optimize run reuse.
+
 ## Priorities
 
 ### Priority 1: Attention → NPU ✅ DONE
@@ -112,21 +122,27 @@ Only when:
 - Reduction infra built for softmax (reusable for RMSNorm)
 - All other ops on NPU
 
-### Priority 4: Batch KV heads per dispatch (4.4 → ~5.5-6.0 t/s)
+### Priority 4: Batch KV heads per dispatch (4.8 → ~5.5-6.0 t/s)
 
 **Problem:** FlowKV dispatches 8 times per layer (1 per KV head) = 96 dispatches per token.
-Dispatch overhead (xrt::run setup + wait) dominates, making FlowKV SLOWER than baseline.
+Dispatch overhead (xrt::run.wait hardware time) dominates.
 
 **Solution:** Batch 4 KV heads into a single xrt::run call.
 - Dispatch count: 8 → 2 per layer (24 per token instead of 96)
 - Kernel stays the same, called 4 times inside one dispatch
-- Expected gain: 4.4 → ~5.5-6.0 t/s
+- Expected gain: 4.8 → ~5.5-6.0 t/s
 
-**Implementation:**
-1. Host: write K/V/Q data for 4 KV heads into combined buffers
-2. IRON design: runtime sequence with 4× K/V/Q/O buffers
-3. Kernel: loop over 4 KV heads within single dispatch
-4. Scatter: write 4× output back to correct head positions
+**V buffer layout (contiguous, confirmed from design.py lines 332-343):**
+```
+K region: [col0_K | col1_K | col2_K | col3_K]
+V region: [col0_V | col1_V | col2_V | col3_V]
+```
+V TAP offset = `num_kv_heads * seq_len * head_dim + col * seq_len * head_dim`
+
+**Previous attempts failed because:**
+1. Used interleaved layout (wrong)
+2. Stale binary after git revert (caused garbage)
+3. Host-side optimizations (persistent xrt::run, skip memset) had no effect
 
 ### Priority 5: Multi-column parallelism (→ ~8-10 t/s)
 
