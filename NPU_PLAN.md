@@ -136,10 +136,11 @@ FlowKV decode integrated and working (2026-05-19).
 - Identity RoPE angles (Q already rotated by graph)
 - Two bugs fixed: K DMA routing + CONT node skip
 
-### Priority 2: Merge QKV + decode_batch (save ~5 ms/token)
+### Priority 2: Merge QKV + decode_batch (BLOCKED)
 
-Currently: QKV (1.17 ms) + decode_batch (1.06 ms) = 2 dispatches per layer.
-Target: single dispatch = ~1.5 ms → saves 0.7 ms/layer × 12 = ~8 ms/token.
+QKV and O_proj use different xclbins → different hw_context → XRT runlist API throws on add().
+Would need "super-fused" xclbin (like SwiGLU) containing both QKV and O_proj kernels.
+Alternative: QKV per-row loop already 1 submission for decode (M=1). No savings there.
 
 ### ✅ Priority 3: RMSNorm → NPU (DONE)
 
