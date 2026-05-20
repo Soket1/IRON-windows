@@ -159,7 +159,35 @@ Dispatch overhead (xrt::run.wait hardware time) dominates.
 **Aligned stride (PDF fix):**
 For S256, `raw_head_bytes = 256*64*2 = 32768` — already 64-byte aligned. The PDF fix only matters when `raw_head_bytes % 64 != 0`. Still applied for correctness with arbitrary seq_len.
 
-### Priority 5: Multi-column parallelism (BLOCKED)
+### Priority 5: Fuse FlowKV + Output Projection (future, high complexity)
+
+**Idea:** Fuse FlowKV attention + O_proj GEMV into a single xrt::run dispatch per layer.
+
+**Current flow:**
+```
+FlowKV dispatch (0.56ms) → bo_out → host DMA → CONT → O_proj dispatch (0.56ms)
+```
+
+**Fused flow:**
+```
+FlowKV+O_proj dispatch (est. 0.7ms) → bo_final → host
+```
+
+**Savings analysis:**
+- Eliminate 12 O_proj dispatches: 12 × 0.56ms = 6.7 ms/token
+- Fused dispatch slightly slower: ~0.7ms × 12 = 8.4ms (vs 6.7ms FlowKV-only)
+- Net savings: ~5 ms/token
+- Result: ~5.6 t/s (from 5.4 t/s)
+
+**Challenges:**
+- O_proj weight = 2048×2048 bf16 = 8MB. Tile memory = 32KB. Needs tiling/streaming.
+- Cross-column dependency: each column computes 4 Q heads, but O_proj needs all 8 KV heads' outputs.
+- Would need new IRON design with fused attention + GEMV workers.
+- IRON fusion framework (`FusedMLIROperator`) exists but is designed for simple chains, not complex attention patterns.
+
+**Verdict:** ROI is low (large complexity for ~0.2 t/s gain). Main bottleneck is NPU compute time (13.4 ms/token = 83% of overhead), which fused kernel doesn't reduce.
+
+### Priority 6: Multi-column parallelism (BLOCKED)
 
 XDNA 2 physically has 8 compute columns, but XRT runtime allocates only 4 per user context.
 Remaining 4 are reserved for OS background AI tasks (Windows Studio Effects, noise cancellation).
