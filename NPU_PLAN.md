@@ -260,6 +260,13 @@ Persistent KV cache would save ~1.7 ms/token (the memcpy+sync overhead).
 3. **Remove mutex on hot path** — `weights_mutex` lock on every dispatch.
    Decode is single-threaded — no contention. Use atomics or thread-local state.
 
+### Future work
+
+- **Multi-layer packing** — pack N consecutive transformer blocks into one ELF.
+  Reduces host dispatch by Nx. Requires major IRON compiler changes.
+- **Compile-time tile profiling** — benchmark tile_m/tile_k/tile_n combinations,
+  build lookup table for optimal tiles per shape. Useful for new xclbin shapes.
+
 ## Testing
 
 ### FlowKV verification
