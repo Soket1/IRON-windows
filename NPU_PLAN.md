@@ -273,17 +273,17 @@ Kernel uses identity RoPE angles (cos=1.0, sin=0.0). Q and K are already
 post-RoPE from ggml, so the angles buffer is unused by the kernel. This
 is not a bug — the kernel correctly computes attention over pre-rotated Q/K.
 
-### Known bug: FlowKV garbage on multi-query sessions (FIXED)
+### Known bug: FlowKV garbage on multi-query sessions (OPEN)
 
-Fixed by using RoPE position tensor for actual_seq_len instead of binary
-search on K data zeros. Binary search was unreliable when KV cache contained
-stale data from previous queries.
+FlowKV works correctly for single queries (short and long prompts, 5.4-5.8 t/s).
+In interactive chat sessions (multiple queries in one process), later queries
+may produce garbage. Root cause: `actual_seq_len` detection via binary search
+on K data zeros is unreliable when KV cache has stale data from previous queries.
 
-RoPE node at graph index i+2 (Q MUL_MAT → Q RESHAPE → Q ROPE). Position
-tensor src[1] contains exact position for each token. actual_seq_len = max_pos + 1.
+Attempted fixes (staleness check, RoPE position, seq_len change detection) were
+inconsistent — sometimes work, sometimes don't. Reverted to stable baseline.
 
-Multi-question test works: "What is the capital of France? And 2+2? And 3+3?"
-→ "The capital of France is Paris. Two plus two is four." ✅
+**Workaround:** use separate llama-cli processes per query.
 
 ## Testing
 
