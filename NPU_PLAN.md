@@ -2,7 +2,7 @@
 
 > Last updated: 2026-05-20
 
-## Current Status: **FlowKV decode WORKING, batch mode operational**
+## Current Status: **FlowKV + RMSNorm on NPU, 5.9 t/s (near baseline 6.0 t/s)**
 
 FlowKV decode attention is integrated and produces correct output on STX NPU2.
 Debug flowkv.bat: Step 2 (no FlowKV) = "The capital of France is Paris." ✅
@@ -14,7 +14,8 @@ Benchmark (run_flowkv_bench.bat, 32 tokens):
 |--------|--------|------------|
 | Baseline (no FlowKV) | 123.7 t/s | **6.0 t/s** |
 | FlowKV num_cols=1 | 127.6 t/s | **4.8 t/s** (-20%) |
-| FlowKV num_cols=4 (batch) | 126.8 t/s | **5.4 t/s** (-10%) |
+| FlowKV num_cols=4 (batch) | 126.8 t/s | **5.5 t/s** (-8%) |
+| FlowKV batch + RMSNorm NPU | 96.7 t/s | **5.9 t/s** (-2%) |
 
 Batch mode (num_cols=4) reduces dispatch count from 96 to 24 per token.
 Root cause of batch failures: `num_heads` parameter was `q_heads_per_kv` (4) instead of `q_heads_per_kv * num_cols` (16), causing `group_size=1` in compiled xclbin.
@@ -140,11 +141,14 @@ FlowKV decode integrated and working (2026-05-19).
 Currently: QKV (1.17 ms) + decode_batch (1.06 ms) = 2 dispatches per layer.
 Target: single dispatch = ~1.5 ms → saves 0.7 ms/layer × 12 = ~8 ms/token.
 
-### Priority 3: RMSNorm → NPU (save ~10-15 ms/token)
+### ✅ Priority 3: RMSNorm → NPU (DONE)
 
-Only when:
-- Reduction infra built for softmax (reusable for RMSNorm)
-- All other ops on NPU
+RMSNorm runs on NPU with full-row tile_size (2048). Single AIE core processes
+entire row — avoids per-tile independent normalization bug (tile_size=32).
+
+Fix: `xdna_select_rms_norm_params()` now uses `tile_size = size` (not hardcoded 32).
+Result: **5.9 t/s** (from 5.5 t/s). FlowKV overhead reduced to 2%.
+Note: weighted variant (gain) still applied via separate CPU MUL.
 
 ### Priority 4: Batch KV heads per dispatch ✅ DONE (2026-05-20)
 
@@ -224,7 +228,7 @@ Both should output "The capital of France is Paris."
 set XDNA_ENABLE_GEMV=1
 set XDNA_ENABLE_SWIGLU=1
 set XDNA_ENABLE_QKV=1
-set XDNA_ENABLE_RMS_NORM=0
+set XDNA_ENABLE_RMS_NORM=1
 set XDNA_ENABLE_SWIGLU_PREFILL=0
 set XDNA_ENABLE_DECODE_BATCH=1
 set XDNA_ENABLE_TRANSFORMER_BLOCK=1
@@ -238,10 +242,10 @@ set GGML_XDNA_NUM_COLS=8
 |---|---|---|
 | Steady-state (no FlowKV) | **5.8 t/s** | — |
 | + Attention on NPU (FlowKV num_cols=1) | **4.8 t/s** | — |
-| + Batch 4 KV heads (num_cols=4) | **5.3 t/s** | — |
+| + Batch 4 KV heads (num_cols=4) | **5.5 t/s** | — |
+| + RMSNorm on NPU | **5.9 t/s** | — |
 | + Multi-column parallelism (8 cols) | BLOCKED (XRT 4 col limit) | ~8-10 t/s |
 | + Merge QKV+batch | — | ~12-13 t/s |
-| + RMSNorm on NPU | — | ~13-14 t/s |
 | Full model on NPU | — | ~15+ t/s |
 
 ## Architecture
