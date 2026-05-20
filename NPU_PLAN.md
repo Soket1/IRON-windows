@@ -102,7 +102,9 @@ graph_compute n_nodes=N   → Main layer:
 
 ### ❌ FlowKV host-side optimizations
 - Remove memset of bo_v: no effect (4.8 t/s). Kernel only reads actual_seq_len.
-- Persistent xrt::run: worse (3.9 t/s). XRT doesn't optimize run reuse.
+- Persistent xrt::run (num_cols=1): worse (3.9 t/s). XRT doesn't optimize run reuse.
+- Persistent xrt::run (num_cols=4): no improvement (5.0 vs 5.3 t/s). Overhead is elsewhere.
+- num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
 
 ## Priorities
 
@@ -142,11 +144,12 @@ Dispatch overhead (xrt::run.wait hardware time) dominates.
 **Aligned stride (PDF fix):**
 For S256, `raw_head_bytes = 256*64*2 = 32768` — already 64-byte aligned. The PDF fix only matters when `raw_head_bytes % 64 != 0`. Still applied for correctness with arbitrary seq_len.
 
-### Priority 5: Multi-column parallelism (→ ~8-10 t/s)
+### Priority 5: Multi-column parallelism (BLOCKED)
 
-
-Distribute 8 KV heads across 8 NPU columns (STX NPU2 has 8 columns).
-Each KV head on its own column, all in parallel.
+XDNA 2 physically has 8 compute columns, but XRT runtime allocates only 4 per user context.
+Remaining 4 are reserved for OS background AI tasks (Windows Studio Effects, noise cancellation).
+SequentialPlacer fails with "Failed to find a tile matching column 2: tried until column 8".
+**num_cols=4 is the hard limit** for user XRT contexts on client Ryzen AI processors.
 
 ### Priority 6: Fuse FlowKV + output projection (→ +1-2 t/s)
 
@@ -190,7 +193,7 @@ set GGML_XDNA_NUM_COLS=8
 | Steady-state (no FlowKV) | **5.8 t/s** | — |
 | + Attention on NPU (FlowKV num_cols=1) | **4.8 t/s** | — |
 | + Batch 4 KV heads (num_cols=4) | **5.3 t/s** | — |
-| + Multi-column parallelism (8 cols) | — | ~8-10 t/s |
+| + Multi-column parallelism (8 cols) | BLOCKED (XRT 4 col limit) | ~8-10 t/s |
 | + Merge QKV+batch | — | ~12-13 t/s |
 | + RMSNorm on NPU | — | ~13-14 t/s |
 | Full model on NPU | — | ~15+ t/s |
