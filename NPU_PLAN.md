@@ -267,6 +267,22 @@ Persistent KV cache would save ~1.7 ms/token (the memcpy+sync overhead).
 - **Compile-time tile profiling** — benchmark tile_m/tile_k/tile_n combinations,
   build lookup table for optimal tiles per shape. Useful for new xclbin shapes.
 
+### Known bug: FlowKV garbage on long prompts
+
+FlowKV uses identity RoPE (cos=1.0, sin=0.0) — no rotation applied to Q/K.
+Short prompts (≤20 tokens) work because positions are close together.
+Long prompts (40+ tokens) produce repetitive garbage because attention
+becomes uniform without positional encoding.
+
+Fix needed: compute real RoPE angles from ggml's rope node parameters
+(base_freq, n_dims, mode) and pass to kernel via angles buffer.
+
+### Known bug: flowkv_poc_valid stale pointers
+
+flowkv_poc_q/k/v_perm are static pointers set once during first decode.
+Between graph evaluations, ggml may reuse tensors. Attempted invalidation
+at end of graph_compute broke short prompts — needs deeper investigation.
+
 ## Testing
 
 ### FlowKV verification
