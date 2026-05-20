@@ -42,28 +42,6 @@ static float score_running_sum[4] __attribute__((aligned(64)));
 // RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk)
 static bfloat16 rotated_q[4 * 64] __attribute__((aligned(64)));
 
-// === V10 PROBE: inline real-data diagnostic ===
-// Magic value written by host into Q metadata slot angles[head_dim + 1]
-// under XDNA_FLOWKV_REAL_PROBE=1. The kernel reads it and switches to
-// probe mode: forward tile-visible Q/K/V/meta through inter FIFO instead
-// of running attention math.
-static constexpr uint16_t FLOWKV_PROBE_MAGIC = 0x7A10;
-static int32_t g_probe_enabled = 0;
-
-// Score-tile probe capture: populated in flowkv_score_rope_q_bf16,
-// forwarded through packed_out in flowkv_score_chunk_bf16.
-// (These statics are per-tile; score tile writes them, value tile
-// reads them through the inter-tile FIFO, not directly.)
-
-// Value-tile probe capture: populated in flowkv_value_accum_bf16
-// from packed_in + v_chunk; written to output in flowkv_value_normalize_bf16.
-static bfloat16 diag_q_first[64] __attribute__((aligned(64)));
-static bfloat16 diag_k_first[64] __attribute__((aligned(64)));
-static bfloat16 diag_v_first[64] __attribute__((aligned(64)));
-static bfloat16 diag_actual_seq_bf16;
-static int32_t diag_probe_seen = 0;
-// === END V10 PROBE ===
-
 // Actual sequence length (number of filled KV positions).
 // Read from Q buffer element [num_q_heads*head_dim + head_dim] = angles[64].
 // The host encodes this as bf16 before dispatch.
@@ -115,12 +93,6 @@ void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_hea
     g_actual_seq_len = bf16_to_int(angles, head_dim);
     if (g_actual_seq_len <= 0) g_actual_seq_len = 32767;  // fallback: process all
 
-    // V10 PROBE: read magic from angles[head_dim + 1] to enable inline probe mode.
-    {
-        uint16_t probe_bits = *(const uint16_t *)&angles[head_dim + 1];
-        g_probe_enabled = (probe_bits == FLOWKV_PROBE_MAGIC) ? 1 : 0;
-    }
-
     // Reset chunk counter for this attention computation.
     *(volatile int32_t *)&g_actual_seq_len; // force re-read (compiler barrier)
     g_score_chunk_counter = 0;
@@ -171,27 +143,6 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
     int32_t pos_start = chunk_idx * chunk_size;
     int32_t actual_seq = g_actual_seq_len;
 
-    // === V10 PROBE: forward tile-visible Q/K/meta through inter FIFO ===
-    if (g_probe_enabled) {
-        if (chunk_idx == 0) {
-            for (int d = 0; d < head_dim; d += 16) {
-                aie::vector<bfloat16, 16> qv = aie::load_v<16>(rotated_q + d);
-                aie::vector<bfloat16, 16> kv = aie::load_v<16>(k_chunk + d);
-                aie::store_v(packed_out + d, qv);
-                aie::store_v(packed_out + head_dim + d, kv);
-            }
-            packed_out[head_dim * 2] = static_cast<bfloat16>((float)actual_seq);
-            *(uint16_t *)(packed_out + head_dim * 2 + 1) = FLOWKV_PROBE_MAGIC;
-            for (int i = head_dim * 2 + 2; i < scores_size + num_q_heads * 2; i++)
-                packed_out[i] = static_cast<bfloat16>(0.0f);
-        } else {
-            for (int i = 0; i < scores_size + num_q_heads * 2; i++)
-                packed_out[i] = static_cast<bfloat16>(0.0f);
-        }
-        return;
-    }
-    // === END V10 PROBE ===
-
     // If this entire chunk is beyond actual_seq_len, send zero scores
     // (identity for online softmax: scores=0 → exp(0-m)=~0 when m>>0,
     //  correction=1, denominator unchanged).
@@ -211,10 +162,6 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
     int32_t eff_chunk = chunk_size;
     if (pos_start + chunk_size > actual_seq)
         eff_chunk = actual_seq - pos_start;
-
-    // === V10 PROBE: no extra capture here — probe forwards through packed_out ===
-    // (Old diag_k_first save was cross-tile-unsafe and has been removed.)
-    // === END V10 PROBE ===
 
     for (int h = 0; h < num_q_heads; h++) {
         const bfloat16 *q_head = rotated_q + h * head_dim;
@@ -301,8 +248,6 @@ void flowkv_value_init_bf16(int32_t num_q_heads, int32_t head_dim)
     for (int h = 0; h < num_q_heads; h++) {
         saved_denom[h] = 0.0f;
     }
-    // V10 PROBE: reset value-tile probe state
-    diag_probe_seen = 0;
 }
 
 // Accumulate weighted values for one chunk.
@@ -327,26 +272,6 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
     const bfloat16 *scores_in = packed_in;
     const bfloat16 *correction_in = packed_in + scores_size;
     const bfloat16 *denom_in = packed_in + scores_size + num_q_heads;
-
-    // === V10 PROBE: capture tile-visible Q/K/V/meta from inter FIFO + v_chunk ===
-    if (!diag_probe_seen) {
-        uint16_t probe_magic = *(const uint16_t *)(packed_in + head_dim * 2 + 1);
-        if (probe_magic == FLOWKV_PROBE_MAGIC) {
-            diag_probe_seen = 1;
-            for (int d = 0; d < head_dim; d += 16) {
-                aie::vector<bfloat16, 16> qv = aie::load_v<16>(packed_in + d);
-                aie::vector<bfloat16, 16> kv = aie::load_v<16>(packed_in + head_dim + d);
-                aie::vector<bfloat16, 16> vv = aie::load_v<16>(v_chunk + d);
-                aie::store_v(diag_q_first + d, qv);
-                aie::store_v(diag_k_first + d, kv);
-                aie::store_v(diag_v_first + d, vv);
-            }
-            diag_actual_seq_bf16 = packed_in[head_dim * 2];
-            return;
-        }
-    }
-    if (diag_probe_seen) return;
-    // === END V10 PROBE ===
 
     for (int h = 0; h < num_q_heads; h++) {
         float correction = static_cast<float>(correction_in[h]);
@@ -407,24 +332,6 @@ void flowkv_value_normalize_bf16(bfloat16 *__restrict output, int32_t num_q_head
         }
     }
 
-    // === V10 PROBE: write captured Q/K/V/meta to output heads 0-3 ===
-    if (diag_probe_seen && num_q_heads >= 4 && head_dim >= 64) {
-        for (int d = 0; d < 64; d += 16) {
-            aie::vector<bfloat16, 16> qv = aie::load_v<16>(diag_q_first + d);
-            aie::vector<bfloat16, 16> kv = aie::load_v<16>(diag_k_first + d);
-            aie::vector<bfloat16, 16> vv = aie::load_v<16>(diag_v_first + d);
-            aie::store_v(output + d, qv);
-            aie::store_v(output + head_dim + d, kv);
-            aie::store_v(output + 2 * head_dim + d, vv);
-        }
-        output[3 * head_dim] = diag_actual_seq_bf16;
-        *(uint16_t *)(output + 3 * head_dim + 1) = FLOWKV_PROBE_MAGIC;
-        for (int d = 3 * head_dim + 2; d < 4 * head_dim; d++) {
-            output[d] = static_cast<bfloat16>(0.0f);
-        }
-        return;
-    }
-    // === END V10 PROBE ===
 }
 
 } // extern "C"
