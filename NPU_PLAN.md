@@ -14,10 +14,24 @@ Benchmark (run_flowkv_bench.bat, 32 tokens):
 |--------|--------|------------|
 | Baseline (no FlowKV) | 123.7 t/s | **6.0 t/s** |
 | FlowKV num_cols=1 | 127.6 t/s | **4.8 t/s** (-20%) |
-| FlowKV num_cols=4 (batch) | 122.7 t/s | **5.3 t/s** (-12%) |
+| FlowKV num_cols=4 (batch) | 126.8 t/s | **5.4 t/s** (-10%) |
 
 Batch mode (num_cols=4) reduces dispatch count from 96 to 24 per token.
 Root cause of batch failures: `num_heads` parameter was `q_heads_per_kv` (4) instead of `q_heads_per_kv * num_cols` (16), causing `group_size=1` in compiled xclbin.
+
+### FlowKV dispatch profiling breakdown (per token, 12 layers × 2 dispatches)
+
+| Phase | ms/dispatch | ms/token (×24) |
+|-------|-------------|----------------|
+| KV+Q memcpy+sync | 0.07 | 1.7 |
+| run_create | 0.00 | 0.0 |
+| **NPU exec** | **0.56 avg** | **13.4** |
+| output_sync+scatter | 0.00 | 0.0 |
+| **Total dispatch** | | **~15 ms** |
+
+**Conclusion: 83% of overhead is NPU execution time, not host-side.**
+memcpy optimization won't help. Bottleneck is NPU compute for 256-position attention.
+Baseline 6.0 t/s = 167 ms, FlowKV 5.4 t/s = 185 ms. Difference = 18 ms, dispatch = 15 ms.
 
 ## Two bugs found and fixed (2026-05-19)
 
@@ -105,6 +119,7 @@ graph_compute n_nodes=N   → Main layer:
 - Persistent xrt::run (num_cols=1): worse (3.9 t/s). XRT doesn't optimize run reuse.
 - Persistent xrt::run (num_cols=4): no improvement (5.0 vs 5.3 t/s). Overhead is elsewhere.
 - num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
+- Host memcpy optimization: **won't help** — profiling shows memcpy+sync = 1.7 ms/token vs NPU exec = 13.4 ms/token. 83% of overhead is NPU execution.
 
 ## Priorities
 
