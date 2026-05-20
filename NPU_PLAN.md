@@ -233,6 +233,33 @@ ic reports: "IRON contact with 64K alignment matching SMMU page got 41 t/s"
 Current implementation uses 64-byte alignment. 64K alignment may reduce
 SMMU page table overhead for DMA transfers. Worth benchmarking.
 
+### Priority 10: Async NPU dispatch (from XDNA_OPTIMIZATION_PLAN.md)
+
+Submit NPU run, immediately continue with CPU ops (residual add, RMSNorm).
+Wait for NPU only when result is needed. Overlap NPU compute with CPU-side ops.
+
+Currently we block on `rl.wait()` every time. If we overlap NPU compute with
+CPU residual add + RMSNorm — estimated 10-15% improvement from pipelining.
+
+### Priority 11: KV cache persistent on NPU (from XDNA_OPTIMIZATION_PLAN.md)
+
+Pre-allocate KV cache BO at model load for max seq_len. Only DMA the new K/V
+row each token, not the full cache. NPU reads cache directly from device memory.
+
+Currently FlowKV re-uploads full K/V cache (256 × 128 bytes) every dispatch.
+Persistent KV cache would save ~1.7 ms/token (the memcpy+sync overhead).
+
+### Priority 12: Quick wins (from XDNA_OPTIMIZATION_PLAN.md)
+
+1. **Weight BO lookup O(1)** — replace `unordered_map<void*, xrt::bo>` with
+   `std::vector<xrt::bo>` indexed by layer+slot. O(1) instead of hash lookup.
+
+2. **Prefetch next layer** — while NPU processes layer N, CPU prepares BO args
+   for layer N+1. Double-buffering: zero setup latency between layers.
+
+3. **Remove mutex on hot path** — `weights_mutex` lock on every dispatch.
+   Decode is single-threaded — no contention. Use atomics or thread-local state.
+
 ## Testing
 
 ### FlowKV verification
