@@ -101,9 +101,12 @@ graph_compute n_nodes=N   → Main layer:
 - Gate: `seq_len >= 256` blocks decode (seq_len=1)
 - Even if fixed, impact is small: RMSNorm can't be included
 
-### ❌ Decode batch efficiency
-- Plans 4 batchable GEMVs but only captures 1 per flush
-- CPU ops between GEMVs force flush after each one
+### ✅ Decode batch efficiency (not a bug)
+- `xdna_plan_decode_batch()` finds 4 GEMVs: O_proj, gate_proj, up_proj, down_proj
+- SwiGLU matcher (line 11025) consumes gate_proj+up_proj+GLU+down_proj as fused dispatch
+- Only O_proj reaches the batcher — this is correct behavior, not a bug
+- Result: 2 dispatches/layer (O_proj batch + SwiGLU fused) = 24 dispatches/token
+- Residual ADD between O_proj and SwiGLU forces O_proj flush — cannot batch further
 
 ### ✅ FlowKV batch num_cols=1→4 (resolved 2026-05-20)
 - Attempt 1: Wrong V layout (interleaved). Garbage.
