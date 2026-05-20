@@ -104,13 +104,29 @@ def my_flowkv_decode(
     # IRON compiler bug: both K_fifos and V_fifos DMA read from arg1.
     # Workaround: K data at offset 0, V data at offset kv_region_size.
     # L3_V_ty must be 2x to hold both K and V regions.
-    L3_K_ty = np.ndarray[(num_kv_heads * seq_len * head_dim,), dtype_in]
-    L3_V_ty = np.ndarray[(2 * num_kv_heads * seq_len * head_dim,), dtype_in]
+    # Aligned stride: Shim DMA requires 64-byte alignment for parallel channels.
+    DTYPE_SIZE = 2  # bfloat16 = 2 bytes
+    raw_head_bytes = seq_len * head_dim * DTYPE_SIZE
+    ALIGNED_HEAD_STRIDE_BYTES = int(np.ceil(raw_head_bytes / 64.0) * 64)
+    ALIGNED_HEAD_STRIDE_ELEMS = ALIGNED_HEAD_STRIDE_BYTES // DTYPE_SIZE
+
+    # K region: num_kv_heads * aligned stride
+    KV_REGION_ELEMS = num_kv_heads * ALIGNED_HEAD_STRIDE_ELEMS
+    # V region follows K region, also aligned
+    ALIGNED_V_REGION_OFFSET_ELEMS = int(np.ceil((num_kv_heads * ALIGNED_HEAD_STRIDE_BYTES) / 64.0) * 64) // DTYPE_SIZE
+
+    L3_K_ty = np.ndarray[(KV_REGION_ELEMS,), dtype_in]
+    L3_V_ty = np.ndarray[(ALIGNED_V_REGION_OFFSET_ELEMS + KV_REGION_ELEMS,), dtype_in]
     # Q DDR layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
-    # Each group block = group_size * head_dim + head_dim + 2 (for actual_seq_len + alignment) contiguous bf16 values.
     q_group_stride = group_size * head_dim + head_dim + 2
-    L3_Q_ty = np.ndarray[(num_kv_heads * q_group_stride,), dtype_in]
-    L3_O_ty = np.ndarray[(num_heads * head_dim,), dtype_in]
+    ALIGNED_Q_GROUP_STRIDE_BYTES = int(np.ceil((q_group_stride * DTYPE_SIZE) / 64.0) * 64)
+    ALIGNED_Q_GROUP_STRIDE_ELEMS = ALIGNED_Q_GROUP_STRIDE_BYTES // DTYPE_SIZE
+    L3_Q_ty = np.ndarray[(num_kv_heads * ALIGNED_Q_GROUP_STRIDE_ELEMS,), dtype_in]
+    # Output stride also aligned
+    raw_out_bytes = group_size * head_dim * DTYPE_SIZE
+    ALIGNED_OUT_STRIDE_BYTES = int(np.ceil(raw_out_bytes / 64.0) * 64)
+    ALIGNED_OUT_STRIDE_ELEMS = ALIGNED_OUT_STRIDE_BYTES // DTYPE_SIZE
+    L3_O_ty = np.ndarray[(num_kv_heads * ALIGNED_OUT_STRIDE_ELEMS,), dtype_in]
 
     # -------------------------------------------------------------------------
     # Kernel declarations (all from flowkv.o)
@@ -307,23 +323,21 @@ def my_flowkv_decode(
 
     def make_q_tap(kv_head_idx):
         """Q tap: select group_size query heads + RoPE angles for this KV group.
-
-        DDR layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 ...].
-        Each group block is q_group_stride contiguous bf16 values.
+        Uses aligned stride for 64-byte DMA alignment.
         """
-        q_offset = kv_head_idx * q_group_stride
+        q_offset = kv_head_idx * ALIGNED_Q_GROUP_STRIDE_ELEMS
         return TensorAccessPattern(
-            tensor_dims=(num_kv_heads * q_group_stride,),
+            tensor_dims=(num_kv_heads * ALIGNED_Q_GROUP_STRIDE_ELEMS,),
             offset=q_offset,
             sizes=[1, 1, 1, q_group_stride],
             strides=[0, 0, 0, 1],
         )
 
     def make_k_tap(kv_head_idx):
-        """K tap: stream K rows from K buffer."""
-        base = kv_head_idx * seq_len * head_dim
+        """K tap: stream K rows from K buffer. Uses aligned stride."""
+        base = kv_head_idx * ALIGNED_HEAD_STRIDE_ELEMS
         return TensorAccessPattern(
-            tensor_dims=(num_kv_heads * seq_len * head_dim,),
+            tensor_dims=(KV_REGION_ELEMS,),
             offset=base,
             sizes=[1, seq_len, 1, head_dim],
             strides=[0, head_dim, 0, 1],
@@ -331,22 +345,21 @@ def my_flowkv_decode(
 
     def make_v_tap(kv_head_idx):
         """V tap: stream V rows from combined K+V buffer (arg1).
-        V data starts after K region: offset = kv_region_size + kv_head_idx * seq * hd.
+        V data starts after aligned K region. Uses aligned stride.
         """
-        kv_region_size = num_kv_heads * seq_len * head_dim
-        base = kv_region_size + kv_head_idx * seq_len * head_dim
+        base = ALIGNED_V_REGION_OFFSET_ELEMS + kv_head_idx * ALIGNED_HEAD_STRIDE_ELEMS
         return TensorAccessPattern(
-            tensor_dims=(2 * num_kv_heads * seq_len * head_dim,),
+            tensor_dims=(ALIGNED_V_REGION_OFFSET_ELEMS + KV_REGION_ELEMS,),
             offset=base,
             sizes=[1, seq_len, 1, head_dim],
             strides=[0, head_dim, 0, 1],
         )
 
     def make_o_tap(kv_head_idx):
-        """Output tap: write group_size heads of attention output."""
-        o_offset = kv_head_idx * group_size * head_dim
+        """Output tap: write group_size heads of attention output. Uses aligned stride."""
+        o_offset = kv_head_idx * ALIGNED_OUT_STRIDE_ELEMS
         return TensorAccessPattern(
-            tensor_dims=(num_heads * head_dim,),
+            tensor_dims=(num_kv_heads * ALIGNED_OUT_STRIDE_ELEMS,),
             offset=o_offset,
             sizes=[1, 1, 1, group_size * head_dim],
             strides=[0, 0, 0, 1],

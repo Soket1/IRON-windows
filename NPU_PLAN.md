@@ -1,8 +1,8 @@
 # IRON-windows NPU Optimization Plan
 
-> Last updated: 2026-05-19
+> Last updated: 2026-05-20
 
-## Current Status: **FlowKV decode WORKING**
+## Current Status: **FlowKV decode WORKING, batch mode operational**
 
 FlowKV decode attention is integrated and produces correct output on STX NPU2.
 Debug flowkv.bat: Step 2 (no FlowKV) = "The capital of France is Paris." ✅
@@ -13,10 +13,11 @@ Benchmark (run_flowkv_bench.bat, 32 tokens):
 | Config | Prompt | Generation |
 |--------|--------|------------|
 | Baseline (no FlowKV) | 123.7 t/s | **6.0 t/s** |
-| With FlowKV | 127.6 t/s | **4.8 t/s** (-20%) |
+| FlowKV num_cols=1 | 127.6 t/s | **4.8 t/s** (-20%) |
+| FlowKV num_cols=4 (batch) | 122.7 t/s | **5.3 t/s** (-12%) |
 
-FlowKV is slower due to 8 separate dispatches per layer (96 per token).
-Dispatch overhead (xrt::run setup + wait) dominates. Priority 4: batch KV heads.
+Batch mode (num_cols=4) reduces dispatch count from 96 to 24 per token.
+Root cause of batch failures: `num_heads` parameter was `q_heads_per_kv` (4) instead of `q_heads_per_kv * num_cols` (16), causing `group_size=1` in compiled xclbin.
 
 ## Two bugs found and fixed (2026-05-19)
 
@@ -90,11 +91,14 @@ graph_compute n_nodes=N   → Main layer:
 - Plans 4 batchable GEMVs but only captures 1 per flush
 - CPU ops between GEMVs force flush after each one
 
-### ❌ FlowKV batch num_cols=1→4 (3 attempts)
+### ✅ FlowKV batch num_cols=1→4 (resolved 2026-05-20)
 - Attempt 1: Wrong V layout (interleaved). Garbage.
 - Attempt 2: Correct contiguous V layout. Still garbage.
 - Attempt 3: Persistent xrt::run. Worse (3.9 vs 4.8 t/s).
-- All reverted. IRON TAP mapping needs deeper investigation.
+- Attempt 4: Aligned stride (PDF fix). Garbage — didn't help for S256 (already 64-byte aligned).
+- **Root cause**: `num_heads` param to `get_or_load_flowkv_kernel()` was `q_heads_per_kv` (4) instead of `q_heads_per_kv * num_cols` (16). Kernel compiled with `group_size=1`, host prepared data for `group_size=4`.
+- **Fix**: Pass `q_heads_per_kv * num_cols` as `num_heads`. Cache key changes to `flowkv_H16_KV4_...`.
+- Result: **5.3 t/s** (from 4.8 t/s with num_cols=1).
 
 ### ❌ FlowKV host-side optimizations
 - Remove memset of bo_v: no effect (4.8 t/s). Kernel only reads actual_seq_len.
@@ -122,29 +126,24 @@ Only when:
 - Reduction infra built for softmax (reusable for RMSNorm)
 - All other ops on NPU
 
-### Priority 4: Batch KV heads per dispatch (4.8 → ~5.5-6.0 t/s)
+### Priority 4: Batch KV heads per dispatch ✅ DONE (2026-05-20)
 
 **Problem:** FlowKV dispatches 8 times per layer (1 per KV head) = 96 dispatches per token.
 Dispatch overhead (xrt::run.wait hardware time) dominates.
 
 **Solution:** Batch 4 KV heads into a single xrt::run call.
 - Dispatch count: 8 → 2 per layer (24 per token instead of 96)
-- Kernel stays the same, called 4 times inside one dispatch
-- Expected gain: 4.8 → ~5.5-6.0 t/s
+- IRON design uses 4 columns, runtime sequence fills 4 KV heads in parallel
+- Cache key: `flowkv_H16_KV4_d64_S256_C32_4col`
 
-**V buffer layout (contiguous, confirmed from design.py lines 332-343):**
-```
-K region: [col0_K | col1_K | col2_K | col3_K]
-V region: [col0_V | col1_V | col2_V | col3_V]
-```
-V TAP offset = `num_kv_heads * seq_len * head_dim + col * seq_len * head_dim`
+**Root cause of previous failures:**
+`num_heads` param passed to `get_or_load_flowkv_kernel()` was `q_heads_per_kv` (4) instead of `q_heads_per_kv * num_cols` (16). This compiled xclbin with `group_size=1` while host prepared data for `group_size=4`, causing DMA misalignment and garbage output.
 
-**Previous attempts failed because:**
-1. Used interleaved layout (wrong)
-2. Stale binary after git revert (caused garbage)
-3. Host-side optimizations (persistent xrt::run, skip memset) had no effect
+**Aligned stride (PDF fix):**
+For S256, `raw_head_bytes = 256*64*2 = 32768` — already 64-byte aligned. The PDF fix only matters when `raw_head_bytes % 64 != 0`. Still applied for correctness with arbitrary seq_len.
 
 ### Priority 5: Multi-column parallelism (→ ~8-10 t/s)
+
 
 Distribute 8 KV heads across 8 NPU columns (STX NPU2 has 8 columns).
 Each KV head on its own column, all in parallel.
@@ -189,7 +188,9 @@ set GGML_XDNA_NUM_COLS=8
 | Milestone | Current | Target |
 |---|---|---|
 | Steady-state (no FlowKV) | **5.8 t/s** | — |
-| + Attention on NPU (FlowKV) | ✅ Working | ~8-10 t/s |
+| + Attention on NPU (FlowKV num_cols=1) | **4.8 t/s** | — |
+| + Batch 4 KV heads (num_cols=4) | **5.3 t/s** | — |
+| + Multi-column parallelism (8 cols) | — | ~8-10 t/s |
 | + Merge QKV+batch | — | ~12-13 t/s |
 | + RMSNorm on NPU | — | ~13-14 t/s |
 | Full model on NPU | — | ~15+ t/s |
@@ -210,7 +211,7 @@ set GGML_XDNA_NUM_COLS=8
 
 ### Cache key
 
-`flowkv_H4_KV1_d64_S256_C32_1col`
+`flowkv_H16_KV4_d64_S256_C32_4col` (batch mode, num_heads=16, num_kv_heads=4, num_cols=4)
 
 ## Environment
 
