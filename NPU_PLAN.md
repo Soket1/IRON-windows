@@ -202,10 +202,36 @@ Remaining 4 are reserved for OS background AI tasks (Windows Studio Effects, noi
 SequentialPlacer fails with "Failed to find a tile matching column 2: tried until column 8".
 **num_cols=4 is the hard limit** for user XRT contexts on client Ryzen AI processors.
 
-### Priority 6: Fuse FlowKV + output projection (→ +1-2 t/s)
+### Priority 7: Speculative decoding (from albiol2004, ggml-org/llama.cpp#21725)
 
-Combine FlowKV output → attn_output.weight MUL_MAT in single dispatch.
-Remove CONT + MUL_MAT from CPU path.
+albiol2004 notes: "XDNA NPUs are not designed for LLMs — decode is memory-bound,
+NPU compute underutilized. Speculative decoding can still squeeze a lot of performance."
+
+Speculative decoding drafts 4-8 tokens in parallel, then verifies in one batch.
+This transforms decode from memory-bound (1 token) to compute-bound (N tokens),
+充分利用 NPU parallelism. NPU has 4 columns × 4 rows = 16 tiles — ideal for
+batch verification.
+
+Estimated gain: 3-5x throughput if speculative draft is fast (small model on CPU).
+
+### Priority 8: INT4 quantization (from albiol2004)
+
+albiol2004: "FLM appears to work only at INT4. Want to support both INT8 and INT4
+so that virtually every GGUF runs on it."
+
+INT4 reduces weight memory 4x vs bf16,大幅 reducing DMA transfer time.
+Current bottleneck is NPU execution (13.4 ms/token) which is dominated by
+weight streaming from DDR. INT4 would cut this proportionally.
+
+Challenge: need INT4 dequantization kernel on AIE tiles, or host-side dequant.
+
+### Priority 9: 64K SMMU alignment (from ic, ggml-org/llama.cpp#21725)
+
+ic reports: "IRON contact with 64K alignment matching SMMU page got 41 t/s"
+(vs 4 t/s without alignment, vs 61 t/s with FLM).
+
+Current implementation uses 64-byte alignment. 64K alignment may reduce
+SMMU page table overhead for DMA transfers. Worth benchmarking.
 
 ## Testing
 
