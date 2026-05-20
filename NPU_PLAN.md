@@ -136,11 +136,11 @@ FlowKV decode integrated and working (2026-05-19).
 - Identity RoPE angles (Q already rotated by graph)
 - Two bugs fixed: K DMA routing + CONT node skip
 
-### Priority 2: Merge QKV + decode_batch (BLOCKED)
+### Priority 2: Merge QKV + O_proj (NOT FEASIBLE)
 
-QKV and O_proj use different xclbins → different hw_context → XRT runlist API throws on add().
-Would need "super-fused" xclbin (like SwiGLU) containing both QKV and O_proj kernels.
-Alternative: QKV per-row loop already 1 submission for decode (M=1). No savings there.
+QKV accepts input activation as src[1]. O_proj accepts attention output as src[1].
+Different tensors — cannot concatenate into one GEMV. Different xclbins → different
+hw_context → XRT runlist throws on add(). QKV already 1 submission for decode (M=1).
 
 ### ✅ Priority 3: RMSNorm → NPU (DONE)
 
