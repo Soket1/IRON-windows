@@ -277,12 +277,20 @@ becomes uniform without positional encoding.
 Fix needed: compute real RoPE angles from ggml's rope node parameters
 (base_freq, n_dims, mode) and pass to kernel via angles buffer.
 
-### Known bug: flowkv_poc_valid stale pointers (FIXED)
+### Known bug: FlowKV garbage on multi-query sessions
 
-flowkv_poc_q/k/v_perm are static pointers set during QKV graph eval.
-Two graph evaluations per decode token: first sets pointers, second uses
-them. Invalidation between evals breaks FlowKV. Staleness across queries
-detected by comparing Q data pointer at CONT handler time.
+FlowKV works correctly for single queries (short and long). In multi-query
+chat sessions within one process, later queries produce garbage when KV cache
+accumulates positions from previous queries.
+
+Root cause: `actual_seq_len` detection (binary search on K data zeros) fails
+when KV cache contains stale data from previous queries. ggml reuses KV cache
+memory without zeroing between queries.
+
+Staleness check (Q data pointer comparison) prevents pointer reuse across
+queries but doesn't fix the KV cache contamination issue.
+
+Workaround: use separate llama-cli processes per query (no chat mode).
 
 ## Testing
 
