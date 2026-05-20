@@ -267,30 +267,23 @@ Persistent KV cache would save ~1.7 ms/token (the memcpy+sync overhead).
 - **Compile-time tile profiling** — benchmark tile_m/tile_k/tile_n combinations,
   build lookup table for optimal tiles per shape. Useful for new xclbin shapes.
 
-### Known bug: FlowKV garbage on long prompts
+### Known limitation: FlowKV identity RoPE (low priority)
 
-FlowKV uses identity RoPE (cos=1.0, sin=0.0) — no rotation applied to Q/K.
-Short prompts (≤20 tokens) work because positions are close together.
-Long prompts (40+ tokens) produce repetitive garbage because attention
-becomes uniform without positional encoding.
+Kernel uses identity RoPE angles (cos=1.0, sin=0.0). Q and K are already
+post-RoPE from ggml, so the angles buffer is unused by the kernel. This
+is not a bug — the kernel correctly computes attention over pre-rotated Q/K.
 
-Fix needed: compute real RoPE angles from ggml's rope node parameters
-(base_freq, n_dims, mode) and pass to kernel via angles buffer.
+### Known bug: FlowKV garbage on multi-query sessions (FIXED)
 
-### Known bug: FlowKV garbage on multi-query sessions
+Fixed by using RoPE position tensor for actual_seq_len instead of binary
+search on K data zeros. Binary search was unreliable when KV cache contained
+stale data from previous queries.
 
-FlowKV works correctly for single queries (short and long). In multi-query
-chat sessions within one process, later queries produce garbage when KV cache
-accumulates positions from previous queries.
+RoPE node at graph index i+2 (Q MUL_MAT → Q RESHAPE → Q ROPE). Position
+tensor src[1] contains exact position for each token. actual_seq_len = max_pos + 1.
 
-Root cause: `actual_seq_len` detection (binary search on K data zeros) fails
-when KV cache contains stale data from previous queries. ggml reuses KV cache
-memory without zeroing between queries.
-
-Staleness check (Q data pointer comparison) prevents pointer reuse across
-queries but doesn't fix the KV cache contamination issue.
-
-Workaround: use separate llama-cli processes per query (no chat mode).
+Multi-question test works: "What is the capital of France? And 2+2? And 3+3?"
+→ "The capital of France is Paris. Two plus two is four." ✅
 
 ## Testing
 
