@@ -277,11 +277,12 @@ becomes uniform without positional encoding.
 Fix needed: compute real RoPE angles from ggml's rope node parameters
 (base_freq, n_dims, mode) and pass to kernel via angles buffer.
 
-### Known bug: flowkv_poc_valid stale pointers
+### Known bug: flowkv_poc_valid stale pointers (FIXED)
 
-flowkv_poc_q/k/v_perm are static pointers set once during first decode.
-Between graph evaluations, ggml may reuse tensors. Attempted invalidation
-at end of graph_compute broke short prompts — needs deeper investigation.
+flowkv_poc_q/k/v_perm are static pointers set during QKV graph eval.
+Two graph evaluations per decode token: first sets pointers, second uses
+them. Invalidation between evals breaks FlowKV. Staleness across queries
+detected by comparing Q data pointer at CONT handler time.
 
 ## Testing
 
