@@ -277,13 +277,22 @@ is not a bug — the kernel correctly computes attention over pre-rotated Q/K.
 
 FlowKV works correctly for single queries (short and long prompts, 5.4-5.8 t/s).
 In interactive chat sessions (multiple queries in one process), later queries
-may produce garbage. Root cause: `actual_seq_len` detection via binary search
-on K data zeros is unreliable when KV cache has stale data from previous queries.
+produce garbage.
 
-Attempted fixes (staleness check, RoPE position, seq_len change detection) were
-inconsistent — sometimes work, sometimes don't. Reverted to stable baseline.
+Attempted fixes (all reverted — didn't solve the issue):
+- Binary search on K data zeros — unreliable with stale KV cache
+- RoPE position tensor — n_past is correct, but output still garbage
+- Staleness check (Q data pointer) — didn't help
+- Seq_len change detection — didn't help
+
+Root cause is deeper than actual_seq_len detection. Likely KV cache management
+or attention computation with contaminated cache from previous queries.
 
 **Workaround:** use separate llama-cli processes per query.
+
+**Potential fix:** pass actual_seq_len as kernel argument (requires IRON design
+changes + kernel signature modification). See user's suggestion about
+kernel-side position_offset mask.
 
 ## Testing
 
