@@ -132,13 +132,18 @@ search path than the conda Python interpreter loading pyxrt directly.
 | Output values vs CPU | ✅ byte-exact (3/3 tests) |
 
 **Throughput measurement (2026-05-22, llama-3.2-1B-Instruct, n_predict=64,
-`--bench` mode of `correctness_test.py`):**
+`--bench` mode of `correctness_test.py`, median of 2 runs):**
 
-| Config | Decode t/s | Prompt t/s |
+| Config | single-turn | chat (-cnv) |
 |---|---:|---:|
-| CPU Q4_0 (`cpu_baseline`) | **10.70** | 205.3 |
-| NPU bf16 (`npu_chat_safe`, BF16 model) | 5.30 | 127.2 |
-| NPU INT4 (`npu_int4`, Q4_0 model) | **3.40** | 127.4 |
+| CPU Q4_0 (`cpu_baseline`) | **10.70** | 10.30 |
+| NPU bf16 (`npu_chat_safe`, BF16 model) | 5.20 | 5.20 |
+| NPU INT4 (`npu_int4`, Q4_0 model) | **3.30** | **3.40** |
+
+(decode t/s; prompt-eval is roughly 1.3-1.6× of decode and tracks the same pattern.)
+
+Single-turn vs chat-mode results are within ±0.2 t/s noise — the
+fusion-bypass effect is mode-independent (per-token compute is the same).
 
 **Critical finding: Phase 8.1 alone is a net regression.** NPU INT4 is
 ~36 % slower than NPU bf16 and ~3 × slower than CPU Q4_0. The root cause
