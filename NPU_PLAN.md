@@ -284,6 +284,7 @@ Attempted fixes (all reverted — didn't solve the issue):
 - RoPE position tensor — n_past is correct, but output still garbage
 - Staleness check (Q data pointer) — didn't help
 - Seq_len change detection — didn't help
+- Three-invariant fix (a3ef22209 + 50f826233) — didn't solve garbage (see below)
 
 Root cause is deeper than actual_seq_len detection. Likely KV cache management
 or attention computation with contaminated cache from previous queries.
@@ -293,6 +294,94 @@ or attention computation with contaminated cache from previous queries.
 **Potential fix:** pass actual_seq_len as kernel argument (requires IRON design
 changes + kernel signature modification). See user's suggestion about
 kernel-side position_offset mask.
+
+### Diagnostic session (2026-05-21): reproduced multi-query garbage
+
+Build `b8953-50f826233` (head of `ggml-xdna`, three-invariant fix applied).
+
+**Setup:** Test driven from MSYS bash on Windows. Configuration matches
+`debug_flowkv.bat` (XDNA_ENABLE_FLOWKV_DECODE=1, num_cols=8 cache dir).
+
+**PowerShell stderr capture gotcha:** PS5.1 `2>` redirect silently dropped
+all native-process stderr from llama-cli.exe in our reproducer — stderr.log
+ended up 0 bytes despite the binary printing ~2.6 MB of diagnostics. Same
+binary under MSYS bash captured everything. **For FlowKV debugging on
+Windows, use `cmd /c` or `Start-Process -RedirectStandardError` — not PS `2>`.**
+
+**Tests:**
+| Mode | Result |
+|------|--------|
+| Single-query (`--single-turn`) | "The capital of France is Paris." ✅ 4.2 t/s, 224 POC dispatches |
+| Single-query + `GGML_SCHED_KV_OFFLOAD=1` | "The capital of France is Paris." ✅ 5.6 t/s |
+| Chat-mode (`-cnv`, stdin-piped 2 queries) | Q1 "Paris." ✅, Q2 "Hellofnfnf...fawfahav" ❌ |
+
+`GGML_SCHED_KV_OFFLOAD=1` did not break single-query — earlier suspicion ruled out.
+
+**stderr analysis (chat mode, 2.6 MB):**
+- 2 prefill rounds at lines 8 and 410 — **both happen before any M=1 decode**
+- 71 decode tokens (1136 layer-events / 16 layers), all M=1, all from line 746+
+- 2272 POC dispatches (32 per token = 16 layers × 2 num_cols=4 batches)
+- BO addresses constant across all dispatches (no DMA layout drift):
+  `bo_k=0x3F2D000  bo_v=0x3F4D000  bo_q=0x3F1C000  bo_out=0x3F1D000`
+- V-K delta = 131072 bytes (exactly `k_size`) — no driver metadata insertion
+- Both single-query and chat-mode use **identical** POC mechanics: same BO sizes,
+  group_ids, addresses. POC fires for every layer of every decode token in both.
+
+**Implication:** the transition from "correct" (~first 10 decodes = Q1 response)
+to "garbage" (~next 60 decodes = Q2 response) happens DURING one continuous
+M=1 decode stream. POC fires the same way for both halves — but data fed into
+the BOs (sourced via `flowkv_poc_*_perm->data` pointers) is correct for Q1's
+decodes and corrupted for Q2's.
+
+**Why the three-invariant fix doesn't help:**
+Inv #1 invalidates `flowkv_poc_valid` only when prefill (M>1) is detected in
+the first 30 nodes of a graph_compute. In chat-mode both prefills fire BEFORE
+any decode — so the chat-boundary between Q1's EOT and Q2's first decode token
+sees no prefill in any segment. POC pointers from Q1 leak across the boundary
+into Q2's decodes. Three-invariant Inv #2 (PERMUTE shape matching) is correct
+but irrelevant — POC stays valid through the boundary regardless.
+
+**Side finding:** Inv #2's V-PERMUTE matcher `nd->ne[0] > hd && nd->ne[1] == hd`
+silently fails when `seq_len ≤ 64` (early generation, short prompt) because
+V's `ne[0] = seq_len ≤ 64` doesn't satisfy `> hd`. POC silently disabled in
+that regime. Not the cause of current bug, but a hidden gating issue.
+
+**Next minimal fix tried — did NOT work:** Invalidate POC across cgraph
+segments where QKV is not refreshed. Tracked last cgraph pointer; invalidated
+when `cgraph_changed && !has_decode_qkv`. This dropped POC dispatch count
+to **zero** even on single-query test — confirming a3ef22209's reasoning
+that QKV and CONT really do live in different graph_compute calls. The
+CONT segment (no QKV in first 30 nodes) was being invalidated right before
+it could consume POC. Reverted.
+
+**actual_seq_len heuristic is NOT the bug.** With `XDNA_DEBUG=1`, the binary
+search returns expected values throughout chat (Q1: 43→49 token-by-token,
+jump to 61 at Q2 prefill boundary, Q2: 61→123). Monotonic increments confirm
+the K-zero scan is working correctly for this case (cache is contiguous,
+no gaps). `actual_seq_len` is correctly encoded into Q BO at angles[head_dim].
+
+**V11 MATH_DIAG (NPU vs CPU reference) is broken for num_cols>1.** The CPU
+reference at lines 11806-11807 hard-codes `k=bo_v[0]`, `v=bo_v[seq_len*row_bytes]`
+— that's the num_cols=1 layout. With num_cols=4, V actually lives at
+`aligned_v_region_offset_bytes` (~128 KB), not `seq_len*row_bytes` (32 KB).
+So MATH_DIAG produces FAIL for every dispatch regardless of correctness
+(including known-good Q1 dispatches that produce "Paris."). The diagnostic
+needs to be updated before it can isolate the bug. Until then, isolating
+"is the NPU computing right?" requires either:
+1. Fix V11 MATH_DIAG for num_cols=4 layout (read V from offset
+   `aligned_v_region_offset_bytes`, not `seq_len*row_bytes`).
+2. Force `num_cols=1` to use the MATH_DIAG's existing layout assumption.
+3. Probe kqv_out delta (NPU result minus CPU result-before-overwrite) and
+   compare across "correct" Q1 decodes and "garbage" Q2 decodes.
+
+**Other observations from this session:**
+- POC mechanics are byte-identical between known-good Q1 decodes and garbage
+  Q2 decodes: same BO addresses (`0x3F2D000` / `0x3F4D000` / `0x3F1C000` /
+  `0x3F1D000`), same sizes, same kernel group_ids, same V-K delta (131072).
+- Q2's first decoded token is often coherent ("Bonjour"/"Hello"/"It") before
+  text degenerates — suggesting attention is partially right then drifts.
+- Decode rate ~5.3-5.7 t/s during both correct (Q1) and garbage (Q2) phases
+  — no slowdown indicating the dispatch path is unchanged.
 
 ## Testing
 
