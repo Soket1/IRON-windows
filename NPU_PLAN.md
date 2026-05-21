@@ -514,6 +514,43 @@ operators at the same col count.
 If garbage still appears with 8-col RMS_NORM → root cause is elsewhere
 (maybe deeper in the kernel itself, IRON design, or XRT runtime).
 
+### Result of the 8-col compile attempt (2026-05-21): BLOCKED
+
+Tried changing `xdna_select_rms_norm_params()` to return
+`*out_cols = max_cols` (8) and triggering the auto-compile path. `compile.py`
+rejects the parameter set:
+
+```
+ValueError: size (2048) must be a multiple of
+  num_aie_columns * num_channels * tile_size (16384)
+```
+
+The RMS_NORM IRON design enforces `size = cols × channels × tile_size`.
+With `cols=8` and `size=2048`, the only legal tile_size is `2048 / 8 = 256`
+— which reintroduces the **per-tile mean bug** (each of the 8 cores
+computes mean over its own 256-element shard rather than the full 2048-
+element row; RMS_NORM by definition needs the full-row mean to normalize
+correctly).
+
+The existing kernel has no cross-core reduction step, so cannot operate
+correctly with tile_size < size. NPU_PLAN already noted this earlier
+under "❌ RMSNorm on NPU (tile_size=32 bug)" — fix would need a two-pass
+or shared-memory reduction design, which isn't a small change.
+
+**Conclusion on hypothesis #2 confirmation:** cannot validate by simply
+relabelling the existing kernel as 8-col. Confirming or refuting #2
+requires either:
+1. A new IRON design with multi-column reduction (substantial kernel work)
+2. Some runtime trick to force the XRT placer to put the 1-col
+   RMS_NORM kernel on a column that's not used by QKV (currently the
+   hw_context allocator's decision, not directly steerable from host)
+3. A 1-col kernel using `cols=1 channels=8 tile_size=256` — still 1-col
+   hw_context footprint, doesn't validate column-conflict hypothesis,
+   and would need cross-channel reduction anyway
+
+**Current status:** `XDNA_ENABLE_RMS_NORM=0` remains the only known
+workaround for chat-mode. Loss is ~0.4 t/s (5.9 → 5.5 single-query).
+
 Pre-fix verification (FlowKV OFF, RMS_NORM ON, QKV ON) gives garbage but
 ~6 t/s, vs full config 5.9 t/s — so the regression isn't from FlowKV
 overhead, it's the RMS_NORM⊕QKV pair.
