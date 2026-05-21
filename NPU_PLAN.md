@@ -649,19 +649,53 @@ differ, the bug is in the buffer routing between POC and O_proj.
 
 ## Testing
 
-### FlowKV verification
+### Correctness harness (recommended for every NPU change)
+
+```powershell
+python C:\llama.cpp-xdna\ggml\src\ggml-xdna\tools\correctness_test.py            # all tests (~3-5 min)
+python C:\llama.cpp-xdna\ggml\src\ggml-xdna\tools\correctness_test.py paris_short  # one test (~20 s)
+python C:\llama.cpp-xdna\ggml\src\ggml-xdna\tools\correctness_test.py --list       # show all tests
+```
+
+Python stdlib-only script (no deps). Runs each test against three operator
+presets — `cpu_baseline`, `npu_chat_safe` (production config), `npu_full`
+(everything incl. RMS_NORM) — with greedy sampling (`--temp 0 --seed 42`)
+for determinism, then compares the generated text token-for-token.
+
+Current test cases:
+| Test | What it probes |
+|---|---|
+| `paris_short` | Sanity. Short prompt, 16 tokens. |
+| `paris_drift_128` | bf16 numerical drift over 128 tokens. |
+| `multiquery_basic` | RMS_NORM+QKV regression (`npu_full` expected fail). |
+| `multiquery_chatsafe` | 3-query chat with the production workaround. |
+| `seq_len_short` | Tiny seq case (V-PERMUTE matcher gating). |
+| `seq_len_near_chunk32` | FlowKV chunk_size=32 boundary crossing. |
+
+Exit code 0 if all pass, 1 if any fail. `expected_fail` for known issues
+flips logic: an accidental fix surfaces as `?? UNEXPECTED PASS` (also a fail).
+Add new test cases by appending to `TESTS` in the script.
+
+### FlowKV verification (legacy quick check)
 
 ```bat
 debug_flowkv.bat
 ```
 
 Runs Step 2 (baseline without FlowKV) and Step 3 (with FlowKV).
-Both should output "The capital of France is Paris."
+Both should output "The capital of France is Paris." Subsumed by the
+correctness harness above; kept for quick smoke checks.
 
 ### Diagnostic tools
 
-- `XDNA_FLOWKV_REAL_PROBE=1` — v10: data transport probe
-- `XDNA_FLOWKV_MATH_DIAG=1` — v11: CPU reference comparison
+- `XDNA_DEBUG=1` — enables `FlowKV-DIAG` + `BO ADDRESS DIAGNOSTIC` + `poc_dbg`
+  blocks (very verbose, ~750 lines of stderr per token)
+- `XDNA_FLOWKV_BO_PROBE=1` — dumps source vs BO bytes (Q/K/V at pos 0, mid, last)
+- `XDNA_FLOWKV_MATH_DIAG=1` — NPU output vs CPU reference comparison (now fixed
+  for num_cols>1, see commit 250eed45b)
+- `XDNA_FLOWKV_REAL_PROBE=1` — v10 data transport probe
+- `XDNA_FLOWKV_PER_HEAD_LEGACY=1` — re-enable the legacy per-head FlowKV path
+  (default disabled, see commit ea435baa2)
 
 ### Current NPU config
 
