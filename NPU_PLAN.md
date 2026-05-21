@@ -412,6 +412,47 @@ POC mechanics, kernel computation, and `actual_seq_len` are now ruled out
 as direct causes. Focus shifts to **what `flowkv_poc_*_perm->data` actually
 points to** at the Q1→Q2 boundary.
 
+### BO probe (2026-05-21, XDNA_FLOWKV_BO_PROBE)
+
+Added a host-side probe that dumps 8 bf16 values from each of (Q_src, K_src,
+V_src, Q_bo, K_bo, V_bo) at positions 0, mid, and last_active, gated on
+`kv_h==0` so it fires once per layer per decode. Result for first decode
+of Q1 (actual_seq=43, layer 0) vs first decode of Q2 (actual_seq=61, layer 0):
+
+| Probe | Q1 first decode | Q2 first decode | Verdict |
+|-------|-----------------|-----------------|---------|
+| K_src@0 (BOS K, dim 0..7) | `31E2 2D0B 3146 ...` | `31E2 2D0B 3146 ...` | identical (correct — same BOS) |
+| V_src@0 (BOS V, seq 0..7) | `8A86 2E4E 2AE8 ...` | `8A86 2E4E 2AE8 ...` | identical (correct) |
+| K_bo@0 / V_bo@0 | identical to Q1 | identical to Q1 | host write preserved data |
+| K_src@last (pos 42 / pos 60) | legitimate non-zero | legitimate non-zero | new K written correctly by QKV |
+| V_src@last | nonzero then zeros (correct — only positions ≤actual_seq filled) | same pattern | layout consistent |
+
+Cache types: Q=F32, K=F16, V=F16. Strides: nb_K=[2,1024,128], nb_V=[2,1024,65536]
+(reflects cache_v underlying max_seq=512 from `-c 512`, viewed as 256-window).
+
+**Three host-data-prep hypotheses are now ruled out:**
+1. Stale Q pointer — Q_src looks fresh, Q_bo = bf16-truncate(Q_src) byte-exact
+2. Wrong K/V stride/offset — host write matches what's in the source tensor
+3. KV cache contamination — position 0 identical Q1/Q2 (correct BOS),
+   newly-appended positions are plausible non-zero values
+
+Combined with MATH_DIAG showing NPU output ≈ CPU reference within bf16
+precision: the kernel computes correct attention over correct inputs.
+**Yet the model produces garbage from Q2.**
+
+Possible remaining causes:
+- POC's `kqv_out->data` overwrite lands in the right address but downstream
+  CONT (CPU range) doesn't read from there at the chat boundary (state in
+  the segment delegation / cpu_run_start tracking)
+- Some other op in the cgraph between POC and the next layer reads from a
+  different buffer than POC wrote to
+- Sampling-stage state corruption (much less likely)
+
+Next probe: dump first 8 bf16 of `kqv_out->data` immediately AFTER POC
+finishes the scatter (line ~11797), AND inspect what downstream MUL_MAT
+(blk.N.attn_output) reads at its `src[1]` data pointer. If those two
+differ, the bug is in the buffer routing between POC and O_proj.
+
 ## Testing
 
 ### FlowKV verification
