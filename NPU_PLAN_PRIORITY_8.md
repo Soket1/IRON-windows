@@ -136,14 +136,38 @@ search path than the conda Python interpreter loading pyxrt directly.
 
 | Config | single-turn | chat (-cnv) |
 |---|---:|---:|
-| CPU Q4_0 (`cpu_baseline`) | **10.70** | 10.30 |
-| NPU bf16 (`npu_chat_safe`, BF16 model) | 5.20 | 5.20 |
-| NPU INT4 (`npu_int4`, Q4_0 model) | **3.30** | **3.40** |
+| CPU Q4_0 (`cpu_baseline`) | **11.10 / 10.70** | 11.00 / 10.30 |
+| NPU bf16 (`npu_chat_safe`, BF16 model) | 5.40 / 5.20 | 5.40 / 5.20 |
+| NPU INT4 8.1 only (`npu_int4` w/o SwiGLU_INT4) | 3.30 | 3.40 |
+| NPU INT4 8.1+8.2 (`npu_int4` w/ SwiGLU_INT4) | **2.80** | **2.80** |
 
-(decode t/s; prompt-eval is roughly 1.3-1.6× of decode and tracks the same pattern.)
+(decode t/s; values shown as 8.2 / 8.1 measurement-set pairs where comparable.
+Prompt-eval is roughly 1.3-1.6× of decode and tracks the same pattern.)
 
 Single-turn vs chat-mode results are within ±0.2 t/s noise — the
 fusion-bypass effect is mode-independent (per-token compute is the same).
+
+**Surprise: Phase 8.2 alone is a 17 % decode regression vs Phase 8.1.**
+Correctness is byte-exact across the three regression tests, but the
+chained SwiGLU INT4 dispatch is slower than three individual
+`mul_mat_gemv_int4` calls. Suspected culprits (need profiling):
+- `intermediate_bo->sync(FROM_DEVICE)` adds ~50 µs DMA per FFN layer
+  × 16 layers = 0.8 ms/token. We need it on the host for the down
+  bias compensation.
+- `M_OUTPUT_MAX = hidden_dim / fused_cols = 2048` (per-row bf16) eats
+  8 KB of L1 budget per AIE tile, possibly forcing `tile_in=1` where
+  Phase 8.1's plain GEMV could pick `tile_in=4`.
+- Chained xrt::runlist submission overhead may be > 3× individual
+  submissions for very short kernels.
+
+**Next investigation (not Phase 8.2 anymore):**
+1. Profile per-phase timing inside `mul_mat_swiglu_int4` (mirror the
+   bf16 dispatch's clk steady-state profile).
+2. Move the down bias `aie::sub(8)` into a new
+   `fused_dequant_gemv_signed.cc` kernel variant. Removes the
+   intermediate sync entirely.
+3. Investigate why tile_in selection of the new dispatch may be
+   conservative.
 
 **Critical finding: Phase 8.1 alone is a net regression.** NPU INT4 is
 ~36 % slower than NPU bf16 and ~3 × slower than CPU Q4_0. The root cause
@@ -445,7 +469,7 @@ compute-bound.
 | 8.0 Validation | 0.5 | 1 | INT4 kernel works on STX | 5.9 (baseline) | ⚪ partial (pyxrt blocked for pytest; compile.py via system() works) |
 | 8.1 Q4_0 GEMV scaffolding (enum + supports_op + repack + compile.py) | landed | landed | safe default-off scaffolding | 5.9 (unchanged) | ✅ commit 35ae3fee1 |
 | 8.1 Q4_0 GEMV dispatch path (BO + kernel + bias + tile_in selector) | landed | landed | NPU dispatch for bare Q4_0 mul_mat, byte-exact vs CPU on 3 regression tests | **decode 3.40 t/s** measured (regression vs NPU bf16 5.30 t/s -- fusion lost) | ✅ DONE (2026-05-21) |
-| 8.2 Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, restores fusion -- needed to net-positive on 8.1 | target ≥9–10 | **HIGH PRIORITY** -- 8.1 alone regresses |
+| 8.2 Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, restores fusion -- needed to net-positive on 8.1 | **measured 2.80 t/s (regression vs 8.1 -- needs profiling)** | ⚠️ Functionally DONE (byte-exact), perf regression -- 8.3 may help |
 | 8.3 QKV INT4 | 1–2 (or skip) | 3 | only if 8.2 profile shows QKV dominates | ~10–11 | measurement-gated |
 | 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
 | 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
