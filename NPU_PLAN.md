@@ -464,6 +464,56 @@ Possible mechanisms (untested):
    flush before QKV reads (DMA pipeline races), the first decode of Q2
    may see partially-updated activation.
 
+### Hypothesis verdicts (2026-05-21, code-reading only — no runtime test)
+
+**#1 Shared static state: RULED OUT.**
+- Each operator owns its own context-level cache (`rms_norm_cache`,
+  `qkv_cache`, `swiglu_cache`, …) keyed by distinct cache_key strings.
+  Per-weight BO caches inside each entry are keyed by `data` pointer —
+  no cross-operator collision possible.
+- No shared static state in the hot-path dispatch functions.
+
+**#3 DMA pipeline race: RULED OUT.**
+- `ggml_backend_xdna_rms_norm` does `out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE)`
+  + CPU memcpy/convert to `node->data` BEFORE returning. Subsequent ops
+  see fresh data.
+- Between RMS_NORM and QKV the cgraph has a CPU MUL (gain weight),
+  which reads RMS_NORM's output and writes its own output entirely on
+  the host side. QKV reads `src1_input->data` from host memory, not
+  from any device BO of RMS_NORM. No NPU-host pipeline straddles the
+  data path.
+
+**#2 XRT column-set conflict: leading candidate.**
+- Precompiled kernel cache shows three column counts in use:
+  `flowkv: 4col`, `qkv/swiglu: 8col`, `rms_norm: 1c1ch (= 1col)`.
+- FlowKV (4col) and QKV (8col) coexist without garbage. The bug only
+  appears when the **1-col** RMS_NORM is added — and RMS_NORM is the
+  only 1-col operator in the pipeline.
+- Each kernel creates its own `xrt::hw_context(device, uuid)`, and the
+  XRT runtime time-multiplexes these contexts as different operators
+  dispatch. A 1-col hw_ctx and an 8-col hw_ctx must overlap on physical
+  column 0; if XRT's context-switch doesn't fully reset tile memory
+  state, the 1-col path can leave residue that corrupts the 8-col
+  path's read on the next dispatch — visible only on the second query
+  because the first query's tile state is still "clean enough".
+
+### Concrete next experiment
+
+Recompile RMS_NORM xclbin for 8 columns (the kernel logically uses 1
+core but allocates all 8 columns to match QKV's footprint, eliminating
+the 1-vs-8 switch). Requires running the Python compile pipeline
+(MLIR-AIE + Peano) to produce
+`rms_norm_S2048_bf16_8c1ch_t2048/combined.xclbin`, then updating
+`xdna_select_rms_norm_params()` to return `*out_cols = ctx->num_cols`
+instead of hard-coded 1.
+
+If 8-col RMS_NORM coexists with QKV in chat-mode without garbage →
+hypothesis #2 confirmed and the right long-term fix is to keep all
+operators at the same col count.
+
+If garbage still appears with 8-col RMS_NORM → root cause is elsewhere
+(maybe deeper in the kernel itself, IRON design, or XRT runtime).
+
 Pre-fix verification (FlowKV OFF, RMS_NORM ON, QKV ON) gives garbage but
 ~6 t/s, vs full config 5.9 t/s — so the regression isn't from FlowKV
 overhead, it's the RMS_NORM⊕QKV pair.
