@@ -266,6 +266,17 @@ Persistent KV cache would save ~1.7 ms/token (the memcpy+sync overhead).
   Reduces host dispatch by Nx. Requires major IRON compiler changes.
 - **Compile-time tile profiling** — benchmark tile_m/tile_k/tile_n combinations,
   build lookup table for optimal tiles per shape. Useful for new xclbin shapes.
+- **Multi-column RMS_NORM with cross-core reduction** — unblocks
+  `XDNA_ENABLE_RMS_NORM=1` in chat-mode (currently breaks multi-query
+  via RMS_NORM⊕QKV interference; see hypothesis #2 below). Needs a new
+  IRON design with a two-pass or shared-memory reduction step so the
+  kernel can run on `num_cols × channels × tile_size = size` with
+  `cols > 1` without falling back to per-tile means. Existing 1-col
+  full-row design works correctly but its 1-col hw_context conflicts
+  with the 8-col QKV/SwiGLU contexts when both are alive. Expected
+  payoff: +0.4 t/s (5.5 → 5.9) in chat-mode, no other gains since
+  RMS_NORM is ~1% of token time. Low ROI unless chat-mode performance
+  is the explicit goal — single-query workflows aren't affected.
 
 ### Known limitation: FlowKV identity RoPE (low priority)
 
