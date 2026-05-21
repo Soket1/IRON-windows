@@ -273,7 +273,22 @@ Kernel uses identity RoPE angles (cos=1.0, sin=0.0). Q and K are already
 post-RoPE from ggml, so the angles buffer is unused by the kernel. This
 is not a bug — the kernel correctly computes attention over pre-rotated Q/K.
 
-### Known bug: FlowKV garbage on multi-query sessions (OPEN)
+### Known bug: multi-query garbage — RMS_NORM⊕QKV (RESOLVED ROOT CAUSE 2026-05-21)
+
+**Update 2026-05-21:** the multi-query garbage is **NOT a FlowKV bug**.
+Bisect via toggling `XDNA_ENABLE_*` shows it is interference between
+`XDNA_ENABLE_RMS_NORM=1` and `XDNA_ENABLE_QKV=1`. Either alone works in
+chat-mode. Both together: Q2 garbage. FlowKV ON or OFF makes no difference.
+See "Multi-query garbage — ROOT CAUSE" section below for the bisect matrix.
+
+**Workaround:** disable either `XDNA_ENABLE_RMS_NORM` (back to 5.5 t/s)
+or `XDNA_ENABLE_QKV` (slower QKV on CPU). Other NPU operators are safe.
+
+The historical FlowKV-related text below is preserved for context but
+is misleading — the bug was misattributed to FlowKV because FlowKV was
+the latest addition. RMS_NORM⊕QKV interference is the real fault.
+
+### Historical: FlowKV garbage on multi-query sessions (now reclassified)
 
 FlowKV works correctly for single queries (short and long prompts, 5.4-5.8 t/s).
 In interactive chat sessions (multiple queries in one process), later queries
@@ -412,7 +427,62 @@ POC mechanics, kernel computation, and `actual_seq_len` are now ruled out
 as direct causes. Focus shifts to **what `flowkv_poc_*_perm->data` actually
 points to** at the Q1→Q2 boundary.
 
-### BO probe (2026-05-21, XDNA_FLOWKV_BO_PROBE)
+## Multi-query garbage — ROOT CAUSE: RMS_NORM ⊕ QKV interference (2026-05-21)
+
+After exhausting FlowKV-side hypotheses (NPU computation, actual_seq_len,
+POC pointer staleness, host data prep), did a bisect by toggling
+`XDNA_ENABLE_*` env vars while keeping FlowKV OFF:
+
+| Config | Q2 output |
+|---|---|
+| All NPU OFF | ✅ "Hello. Is there something I can help you with..." |
+| GEMV only | ✅ "Hello again. It's nice to meet you..." |
+| GEMV + SWIGLU + QKV | ✅ "It's nice to meet you. Is there something..." |
+| GEMV + SWIGLU + QKV + DECODE_BATCH | ✅ "Hello. How can I assist you today?" |
+| + TRANSFORMER_BLOCK (no RMS_NORM) | ✅ "Bonjour! How can I assist you today?" |
+| + RMS_NORM (= full original config minus FlowKV) | ❌ "Hellodies Hajivalido..." |
+| RMS_NORM **only** (everything else OFF) | ✅ "Hello again. What would you like..." |
+| **RMS_NORM + QKV** (clean pair) | ❌ "Bonjourïnaïdalectinearadvi..." |
+| RMS_NORM + GEMV | ✅ |
+| RMS_NORM + GEMV + SWIGLU | ✅ |
+
+**Verdict: Multi-query garbage is NOT a FlowKV bug.** It is an interference
+between `XDNA_ENABLE_RMS_NORM=1` and `XDNA_ENABLE_QKV=1`. Either one alone
+works correctly in chat-mode. Both together: Q1 ok, Q2 garbage.
+
+Possible mechanisms (untested):
+1. **Shared static state.** Both RMS_NORM and QKV cache kernel entries
+   and BOs via `static` containers in graph_compute. If the cache key
+   collides or one path invalidates the other's BO, Q2's dispatch reads
+   stale data.
+2. **XRT context column-set conflict.** RMS_NORM is single-column;
+   QKV uses 8 columns (`GGML_XDNA_NUM_COLS=8`). Switching between
+   contexts mid-graph may leak state if the previous context's columns
+   aren't fully released.
+3. **In-place output overwrite.** RMS_NORM writes to its output tensor;
+   QKV consumes that as `src[1]`. If RMS_NORM's NPU path doesn't fully
+   flush before QKV reads (DMA pipeline races), the first decode of Q2
+   may see partially-updated activation.
+
+Pre-fix verification (FlowKV OFF, RMS_NORM ON, QKV ON) gives garbage but
+~6 t/s, vs full config 5.9 t/s — so the regression isn't from FlowKV
+overhead, it's the RMS_NORM⊕QKV pair.
+
+The prior "FlowKV multi-query bug" framing was misleading: garbage was
+present even when FlowKV was disabled. NPU_PLAN earlier sections that
+claim "FlowKV works correctly for single queries" remain technically
+true, but the multi-query problem is unrelated to FlowKV.
+
+Next steps to localize the actual fault:
+- Compare BO addresses and cache keys touched by RMS_NORM vs QKV
+  between Q1 first decode and Q2 first decode. If any address collision
+  or cache-key reuse appears across operators, that is the smoking gun.
+- Audit `static` containers in `xdna_select_rms_norm_params`,
+  `get_or_load_rms_norm_kernel`, and `ggml_backend_xdna_mul_mat_qkv`
+  for shared state that is not partitioned per-operator.
+- Test with `GGML_XDNA_NUM_COLS=4` to rule out the column-set hypothesis.
+- Force a `XCL_BO_SYNC_BO_FROM_DEVICE` on RMS_NORM output before any
+  subsequent NPU op reads it, to rule out DMA pipeline races.
 
 Added a host-side probe that dumps 8 bf16 values from each of (Q_src, K_src,
 V_src, Q_bo, K_bo, V_bo) at positions 0, mid, and last_active, gated on
