@@ -383,6 +383,35 @@ needs to be updated before it can isolate the bug. Until then, isolating
 - Decode rate ~5.3-5.7 t/s during both correct (Q1) and garbage (Q2) phases
   — no slowdown indicating the dispatch path is unchanged.
 
+### MATH_DIAG breakthrough (after num_cols>1 fix in commit 250eed45b)
+
+With the V offset fixed, V11 MATH_DIAG now produces meaningful numbers:
+- **max_abs stable at 0.0006-0.014 across ALL ~1120 dispatches** (Q1 correct
+  AND Q2 garbage). No jump at the chat boundary, no drift over time.
+- `FAIL` verdict only because rel_threshold=0.10 trips on near-zero values
+  (tiny abs error becomes large relative). Absolute error is well within
+  bf16 precision (~0.004).
+- **NPU output matches CPU reference computed over the same BO data.**
+
+**This sharply changes the diagnosis.** The NPU computes attention correctly
+in absolute terms. Both NPU and CPU agree on the result of the (Q, K, V)
+data sitting in the BOs. So either:
+
+1. **Host-side BO data is wrong** for Q2 — `flowkv_poc_*_perm->data` reads
+   stale/corrupt source data, both NPU and CPU agree because they read the
+   same (wrong) BO. This is consistent with the stale-Q-pointer or
+   memory-pool-reuse hypothesis. Next probe: dump first 32 bytes of Q/K/V
+   BO contents for first decode of Q1 vs first decode of Q2, compare with
+   a CPU pre-image scan of `cache_k`/`cache_v`/`Qcur` source tensors.
+
+2. **Downstream of POC is wrong** — POC correctly overwrites `kqv_out`,
+   but a later op reads from somewhere it shouldn't. Less likely since
+   single-query works with the same downstream sequence.
+
+POC mechanics, kernel computation, and `actual_seq_len` are now ruled out
+as direct causes. Focus shifts to **what `flowkv_poc_*_perm->data` actually
+points to** at the Q1→Q2 boundary.
+
 ## Testing
 
 ### FlowKV verification
