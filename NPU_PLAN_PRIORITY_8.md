@@ -150,24 +150,52 @@ fusion-bypass effect is mode-independent (per-token compute is the same).
 **Surprise: Phase 8.2 alone is a 17 % decode regression vs Phase 8.1.**
 Correctness is byte-exact across the three regression tests, but the
 chained SwiGLU INT4 dispatch is slower than three individual
-`mul_mat_gemv_int4` calls. Suspected culprits (need profiling):
-- `intermediate_bo->sync(FROM_DEVICE)` adds ~50 µs DMA per FFN layer
-  × 16 layers = 0.8 ms/token. We need it on the host for the down
-  bias compensation.
-- `M_OUTPUT_MAX = hidden_dim / fused_cols = 2048` (per-row bf16) eats
-  8 KB of L1 budget per AIE tile, possibly forcing `tile_in=1` where
-  Phase 8.1's plain GEMV could pick `tile_in=4`.
-- Chained xrt::runlist submission overhead may be > 3× individual
-  submissions for very short kernels.
+`mul_mat_gemv_int4` calls.
 
-**Next investigation (not Phase 8.2 anymore):**
-1. Profile per-phase timing inside `mul_mat_swiglu_int4` (mirror the
-   bf16 dispatch's clk steady-state profile).
-2. Move the down bias `aie::sub(8)` into a new
-   `fused_dequant_gemv_signed.cc` kernel variant. Removes the
-   intermediate sync entirely.
-3. Investigate why tile_in selection of the new dispatch may be
-   conservative.
+**Profile data (XDNA_DEBUG=1, per FFN layer dispatch, llama-3.2-1B,
+K=2048, N=8192, f_tsi=8, d_tsi=4):**
+
+| Phase | Time (µs) |
+|---|---:|
+| input write + sync TO_DEVICE | 1-4 |
+| runlist build (2 xrt::run) | 40-130 |
+| runlist execute (submit) | 23-130 |
+| **runlist wait (kernel execute)** | **13,085-13,939** |
+| sync intermediate FROM_DEVICE | 2-4 |
+| sync output FROM_DEVICE | 0 |
+| host bias compensation | 678-942 |
+| **total per FFN dispatch** | **~14,000** |
+
+The kernel-execute time alone is ~14 ms per FFN layer × 16 layers =
+224 ms/token. At ~357 ms/token actual decode time, FFN accounts for
+~63 %. Compared with bf16 SwiGLU (~5.7 ms/layer), the INT4 kernel is
+**2.3× slower than bf16** -- so the 4× DDR-bandwidth saving cannot
+compensate because the kernel is **compute-bound**, not
+bandwidth-bound.
+
+Earlier hypotheses (intermediate_bo sync, M_OUTPUT_MAX L1 pressure,
+runlist submission overhead) all turned out to be sub-millisecond
+overheads that don't move the needle.
+
+**Root cause: the inner dequant+mac loop has 5 vector ops per 32-element
+block (uint4→u8→u16→bf16 + sub(8) + scale_mul + load + mac) vs bf16's
+2 ops (load + mac). Even with perfect vectorization, the dequant work
+dominates the compute envelope.**
+
+**Implications and follow-up options:**
+
+1. **Optimize the AIE microkernel** — vectorize the unpack chain
+   further, fuse `sub(8) + mul(scale)` into a single fma, or
+   precompute `scale * 8` lookup. Requires AIE intrinsic expertise;
+   may or may not yield enough headroom.
+2. **Disable Phase 8.2 in default preset** — keep code, ship as
+   opt-in for future re-evaluation. Done in this commit.
+3. **Skip 8.2 entirely, jump to 8.4 (Q4_K via W4A16 repack)** — Q4_K
+   model support is independent of perf; this widens GGUF compatibility
+   without making 8.2's regression user-visible.
+4. **Phase 8.3 QKV INT4** — QKV is bandwidth-bound (small input, large
+   output projection), so the 4× DDR-bandwidth saving may net-positive
+   there. Worth profiling on the QKV path before committing to it.
 
 **Critical finding: Phase 8.1 alone is a net regression.** NPU INT4 is
 ~36 % slower than NPU bf16 and ~3 × slower than CPU Q4_0. The root cause
