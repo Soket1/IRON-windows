@@ -201,12 +201,75 @@ dominates the compute envelope.**
 
 - [IRON PR #80](https://github.com/amd/IRON/pull/80) bf16 SwiGLU fusion: 1.32× MLP speedup (5410→4103 µs).
 - [IRON PR #101](https://github.com/amd/IRON/pull/101) introduces `fused_dequant_gemv.cc` standalone bench: **561 µs for 2048×8192 INT4 GEMV**, 665 µs for 8192×2048.
-- [FastFlowLM](https://fastflowlm.com/benchmarks/) ships **66 t/s on Llama 3.2 1B Q4_1** on Strix Point — same IRON+AIE-MLIR stack we use. That's ~20× faster than our 3.4 t/s.
+- [FastFlowLM](https://fastflowlm.com/benchmarks/) ships **66 t/s on Llama 3.2 1B Q4_1** on Strix Point — same IRON+AIE-MLIR stack we use. That's ~20× faster than our 3.4 t/s. Their NPU kernels are **proprietary closed binaries** — not reachable from our open IRON path.
+- [llama.cpp issue #14377](https://github.com/ggml-org/llama.cpp/issues/14377) — official Ryzen AI NPU integration request, auto-closed as stale; community keeps re-opening discussion.
+- [`ggml-hsa` branch on ypapadop-amd/ggml](https://github.com/ypapadop-amd/ggml/tree/hsa-backend/src/ggml-hsa) — AMD employee's open-source GGML HSA backend. Active development, Linux-only (Ubuntu 24/25, ROCm 7.2.1, XDNA driver 1.6). Supports bf16/f16/i8 MUL_MAT, **no quantized formats yet**, SwiGLU/SiLU registered but unimplemented.
 
 Two takeaways:
 
 - The kernel itself CAN run at ~561 µs/call (PR #101 bench), but my Phase 8.2 dispatch ends up at ~14 ms/FFN-layer — ~7 × slower than 3 × 561 µs + 665 µs ≈ 1.9 ms expected. So per-kernel compute is NOT the dominant bottleneck; my chained-xclbin orchestration loses most of the budget.
-- FastFlowLM's 20 × headroom implies the real win is in transformer-block-level fusion (whole attention+FFN per dispatch) rather than per-op micro-kernels. That's a major redesign, not within Phase 8.2 scope.
+- My ggml-xdna implementation is actually AHEAD of AMD's official ggml-hsa upstream on quantized dispatch (Q4_0/Q8_0 GEMV INT4, SwiGLU INT4 PoC, FlowKV decode, transformer-block fusion) — but BEHIND on the dispatch architecture itself (see below).
+
+**BREAKTHROUGH: AMD ggml-hsa uses ASYNC dispatch via HSA AQL queue (2026-05-22, code inspection):**
+
+The dispatch overhead I diagnosed as "untouchable without transformer-block redesign" is **already solved upstream** — just not in my XRT-based backend. Reading `ypapadop-amd/ggml-hsa/aie-kernel.cpp::ggml_hsa_aie_kernel::dispatch()`:
+
+```cpp
+// Build HSA AIE dispatch packet
+hsa_amd_aie_kernel_dispatch_packet_t pkt{};
+pkt.header = HSA_AMD_AIE_PACKET_TYPE_READY << HSA_PACKET_HEADER_TYPE | ...;
+pkt.opcode = HSA_AMD_AIE_PACKET_OPCODE_KMQ;
+pkt.completion_signal.handle = 0;  // TODO add ctx.dispatch_signal
+pkt.insts_addr_low/high = insts_addr;
+pkt.kernarg_address = kernargs;
+
+// Reserve queue slot
+const uint64_t wr_idx = hsa_queue_add_write_index_relaxed(queue, 1);
+
+// Backpressure: only block if queue is full
+while (wr_idx - hsa_queue_load_read_index_scacquire(queue) >= queue->size) {
+    ggml_hsa_wait_dispatches(ctx);
+}
+
+// Write packet + ring doorbell
+*(packet_slot) = pkt;
+hsa_signal_store_screlease(queue->doorbell_signal, wr_idx);
+return GGML_STATUS_SUCCESS;   // ASYNC -- no wait
+```
+
+And in their `graph_compute`:
+
+```cpp
+for each node:
+    if (node->requires_sync) {                    // per-tensor flag set during graph prep
+        ggml_hsa_wait_dispatches(ctx);             // flush queue, sync
+        copy_sources_with_layout_conversion();
+    }
+    tensor_extra.kernel->dispatch(ctx, ...);       // ASYNC submit, returns immediately
+    if (tensor_extra.node.convert_dtype) {
+        ggml_hsa_wait_dispatches(ctx);             // sync only if output needs host conversion
+        copy_back();
+    }
+```
+
+The host **only waits when downstream actually needs the result** (`requires_sync` flag, queue full, final readback). Between independent matmuls, dispatches just pipeline through the HSA queue — NPU consumes them in order without host round-trip.
+
+This is the architectural fix for the dispatch-overhead problem. Not transformer-block fusion — async submission.
+
+**Sopostavlenie / Comparison:**
+
+| Aspect | AMD ggml-hsa | My ggml-xdna |
+|---|---|---|
+| Per-op submit cost | ~0 µs (write packet + ring doorbell, async) | ~2000 µs (xrt::run.execute + run.wait, sync) |
+| In-flight dispatches | many (limited by `queue->size`) | always 1 (we wait per op) |
+| Sync points | queue-full backpressure, requires_sync flag, final readback | every single dispatch |
+| Headroom unlocked | inherent in design | **~5-7× decode** if I copy this pattern |
+
+**Reachable target if I copy the pattern:** 561 µs/matmul (PR #101 bench) × 112 matmuls/token = ~63 ms/token = ~16 t/s on Llama 3.2 1B Q4_0. Compared to current 3.4 t/s — ~5× improvement, completely without touching microkernel or adding fusion.
+
+This re-prioritizes the roadmap (see Phase 9 below).
+
+
 
 **Negative result (kernel-side bias rewrite, 2026-05-22):**
 Tried moving the `aie::sub(8)` out of the per-block inner loop into a
@@ -524,7 +587,66 @@ compute-bound.
 | 8.3 QKV INT4 | 1–2 (or skip) | 3 | only if 8.2 profile shows QKV dominates | ~10–11 | measurement-gated |
 | 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
 | 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
+| **9 Async XRT dispatch** (NEW, see Phase 9 section below) | **3–4** | **7** | mirror AMD ggml-hsa AQL queue pattern: submit-without-wait per op, sync only on data dependency | **target 5×: 3.4 → ~16 t/s INT4, 5.2 → ~25 t/s bf16** | **HIGH PRIORITY** -- single biggest win identified, independent of quant |
 | **Realistic total to target** | **2 weeks** | **3–4 weeks** | Q4_0 + Q4_K on NPU | **5.9 → 9–10 t/s** | |
+
+### Phase 9 — Async XRT dispatch pipeline (NEW, 3-4 days P50)
+
+**Origin:** code inspection of `ypapadop-amd/ggml@hsa-backend` on 2026-05-22 revealed
+AMD's official open-source GGML NPU backend uses a fundamentally different
+dispatch model than mine: async submission to a HSA AQL queue with
+sync-on-demand, no `wait()` per op. See "BREAKTHROUGH: AMD ggml-hsa uses
+ASYNC dispatch" section above for the full diagnosis.
+
+**Goal:** replace the per-op `xrt::run.execute(); rl.wait();` synchronous
+pattern in `ggml_backend_xdna_graph_compute` with async submit, retaining
+a tensor-level `requires_sync` flag (modeled on
+`ggml_backend_hsa_tensor_extra.requires_sync`). Wait only when:
+
+1. Next op needs the result on host (layout/dtype conversion).
+2. Queue depth limit reached (backpressure).
+3. Graph compute ends.
+
+**Why it should work for XRT:**
+
+- `xrt::run::start()` is non-blocking (just submits to NPU hw_ctx).
+- `xrt::run::wait()` and `xrt::run::state()` allow synchronization on demand.
+- `xrt::runlist` already batches multiple runs (used by SwiGLU bf16); the
+  primitive for chained async is there, just needs to span the whole graph
+  instead of one matched pattern.
+
+**Expected return:** ~5× decode improvement on INT4 (3.4 → ~16 t/s) and bf16
+(5.2 → ~25 t/s) without touching microkernels or adding new fusion. This is
+the single biggest perf lever still available without redesigning IRON
+kernels.
+
+**Risks / unknowns to validate in step 1:**
+
+- XRT may or may not pipeline multiple in-flight runs cleanly across
+  different xclbins (need to verify whether the NPU queue serializes
+  correctly per hw_context).
+- BO lifetime: with async dispatch the input BO must not be reused until
+  the consumer kernel actually executes. Need a per-BO inflight tracker.
+- Existing `mul_mat_gemv_int4` and `mul_mat_swiglu_int4` reference the
+  output immediately on return (`dst->data` populated). Need to defer
+  this to a sync point.
+
+**Step plan:**
+
+1. **Spike (1 day):** prototype async submit on one path (e.g.
+   `mul_mat_gemv_int4`). Test: submit N runs without waiting, measure
+   total time and verify correctness. Confirms XRT semantics.
+2. **Tensor-extra refactor (1 day):** add `requires_sync` flag plumbing,
+   wait points before dependent reads. Mirror `ggml-hsa` pattern.
+3. **Roll out to all NPU ops (1 day):** mul_mat_gemv, mul_mat_gemv_int4,
+   mul_mat_swiglu, mul_mat_swiglu_int4, decode_batch, etc.
+4. **Bench + tune (1 day):** measure decode t/s; tune queue depth if
+   backpressure hits before NPU saturates.
+
+Once Phase 9 lands, the existing Phase 8.x perf measurements should
+re-run — Phase 8.2's "regression vs 8.1" may flip net-positive because
+the async pipeline gives chained kernel calls a real benefit.
+
 
 ## Что делегировать Build агенту
 
