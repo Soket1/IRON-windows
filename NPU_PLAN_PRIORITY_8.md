@@ -130,14 +130,35 @@ search path than the conda Python interpreter loading pyxrt directly.
 | BO allocation / DMA sync | ✅ no errors |
 | Kernel dispatch (xrt::run + wait) | ✅ completes without crash |
 | Output values vs CPU | ✅ byte-exact (3/3 tests) |
-| Decode rate | ~3-4 t/s first-touch (compile inline), faster on subsequent runs once xclbin cache is warm |
+
+**Throughput measurement (2026-05-22, llama-3.2-1B-Instruct, n_predict=64,
+`--bench` mode of `correctness_test.py`):**
+
+| Config | Decode t/s | Prompt t/s |
+|---|---:|---:|
+| CPU Q4_0 (`cpu_baseline`) | **10.70** | 205.3 |
+| NPU bf16 (`npu_chat_safe`, BF16 model) | 5.30 | 127.2 |
+| NPU INT4 (`npu_int4`, Q4_0 model) | **3.40** | 127.4 |
+
+**Critical finding: Phase 8.1 alone is a net regression.** NPU INT4 is
+~36 % slower than NPU bf16 and ~3 × slower than CPU Q4_0. The root cause
+is that turning on `GEMV_INT4` disables the existing NPU fusion path for
+Q4_0 weights — they bypass `decode_batch`, SwiGLU, and the
+transformer-block xclbin (those operators are bf16-only today), so each
+Q4_0 matmul becomes an individual `xrt::run` dispatch with full DMA
+round-trip overhead. The 4× DDR-bandwidth saving from INT4 packing
+cannot compensate for losing batched dispatch + kernel fusion.
+
+**Implication for the roadmap:** Phase 8.2 (SwiGLU INT4) and/or 8.3 (QKV
+INT4) are now **required** for INT4 to pay off, not "nice to have".
+Until then, `XDNA_ENABLE_GEMV_INT4=1` should remain default-off.
 
 **Open items (deferred to future phases):**
 
-1. **N2 kernel-side `aie::sub(8)`** — replace the host bias compensation
+1. **Phase 8.2 SwiGLU INT4 (HIGH PRIORITY)** — restores fusion on the
+   FFN path; without this the INT4 dispatch path is a regression.
+2. **N2 kernel-side `aie::sub(8)`** — replace the host bias compensation
    with an in-kernel offset. Removes ~50 µs/matmul of CPU work.
-2. **Throughput measurement** — full t/s vs CPU-Q4_0 baseline (the
-   harness measures correctness; perf is a separate test).
 3. **Q4_K_M re-quantize → W4A16 path** (Phase 8.4).
 
 **Original plan text below preserved for the file-by-file detail:**
@@ -418,8 +439,8 @@ compute-bound.
 |---|---|---|---|---|---|
 | 8.0 Validation | 0.5 | 1 | INT4 kernel works on STX | 5.9 (baseline) | ⚪ partial (pyxrt blocked for pytest; compile.py via system() works) |
 | 8.1 Q4_0 GEMV scaffolding (enum + supports_op + repack + compile.py) | landed | landed | safe default-off scaffolding | 5.9 (unchanged) | ✅ commit 35ae3fee1 |
-| 8.1 Q4_0 GEMV dispatch path (BO + kernel + bias + tile_in selector) | landed | landed | NPU dispatch for bare Q4_0 mul_mat, byte-exact vs CPU on 3 regression tests | first-touch ~3–4 (compile inline) | ✅ DONE (2026-05-21) |
-| 8.2 Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, main win | ~9–10 | not started |
+| 8.1 Q4_0 GEMV dispatch path (BO + kernel + bias + tile_in selector) | landed | landed | NPU dispatch for bare Q4_0 mul_mat, byte-exact vs CPU on 3 regression tests | **decode 3.40 t/s** measured (regression vs NPU bf16 5.30 t/s -- fusion lost) | ✅ DONE (2026-05-21) |
+| 8.2 Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, restores fusion -- needed to net-positive on 8.1 | target ≥9–10 | **HIGH PRIORITY** -- 8.1 alone regresses |
 | 8.3 QKV INT4 | 1–2 (or skip) | 3 | only if 8.2 profile shows QKV dominates | ~10–11 | measurement-gated |
 | 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
 | 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
