@@ -360,8 +360,86 @@ compute-bound.
 2. **Task 2** (stacked on PR 1): Phase 8.2 SwiGLU INT4 — новый IRON op в `IRON-windows`, host swiglu dispatch в `llama.cpp-xdna`. Двух-репный PR.
 3. Phase 8.3/8.4/8.5 — отдельные таски после замера на 8.2.
 
-Phase 8.0 можно выполнить руками сейчас (один `pytest` запуск на NPU-машине)
-— это не код, а проверка готовности.
+## Prerequisites validation log (2026-05-21)
+
+Status of the pre-flight steps before any Phase 8.x coding can start.
+
+### Q4_0 / Q4_K_M GGUF — DONE
+
+```powershell
+cd C:\llama.cpp-xdna
+.\build\bin\Release\llama-quantize.exe `
+    models\llama-3.2-1b-instruct-BF16.gguf `
+    models\llama-3.2-1b-instruct-Q4_0.gguf q4_0
+.\build\bin\Release\llama-quantize.exe `
+    models\llama-3.2-1b-instruct-BF16.gguf `
+    models\llama-3.2-1b-instruct-Q4_K_M.gguf q4_k_m
+```
+
+| File | Size | BPW | Sanity (CPU-only, --temp 0 -s 42) |
+|---|---|---|---|
+| llama-3.2-1b-instruct-BF16.gguf | 2.4 GB | 16.00 | "The capital of France is Paris." |
+| llama-3.2-1b-instruct-Q4_0.gguf | 736 MB | 4.94 | "The capital of France is Paris." (13.1 t/s) |
+| llama-3.2-1b-instruct-Q4_K_M.gguf | 771 MB | 5.18 | "The capital of France is Paris." |
+
+All three produce byte-identical responses on the Paris test, so the
+re-quantizations are correct and ready for NPU acceleration comparison.
+
+### IRON pytest on Windows — BLOCKED
+
+Attempted N1 (run `pytest iron/operators/fused_dequant_gemv/` on Windows
+to validate the kernel before any wire-up). Result:
+
+```
+ImportError: DLL load failed while importing pyxrt
+```
+
+`pyxrt.pyd` at
+`C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\python\pyxrt.pyd`
+fails to load under the conda env's Python 3.12. Adding PATH to driver
+directories (`kipudrv.inf_amd64_*`, `System32`) and `os.add_dll_directory`
+did not help — the binding is built against a different Python ABI
+(or has unresolved external DLL deps we don't have here).
+
+Pre-built XRT Python binding is only present at one location on this
+system; there is no Python 3.12-compatible version. Source is available
+at `XRT-202610.2.23.0_Canonical/src/python/pybind11/`, but rebuilding
+requires the full MSVC + CMake + Python dev headers toolchain and
+takes ~30-60 min of one-time setup. Out of scope for this session.
+
+**Implication for Phase 8.0:**
+
+The kernel `fused_dequant_gemv` is verified by IRON contributors elsewhere
+(they ship the test). We cannot independently re-verify on this Windows
+box without the pyxrt fix. Two paths forward:
+
+1. **Trust the upstream test.** The kernel is already present at
+   `aie_kernels/aie2p/fused_dequant_gemv.cc` and tested in CI by IRON
+   maintainers. Proceed to Phase 8.1 wire-up without local validation;
+   treat any post-landing dispatch failure as a kernel/host integration
+   issue, not a kernel correctness issue.
+2. **Run validation on a Linux/WSL box** with a working `pyxrt`.
+   Recommended if available — gives a clean confirmation before
+   spending 3-5 days on Phase 8.1.
+
+For this codebase's day-to-day workflow, path 1 is fine — the existing
+W8A16 (Q8_0) integration was wired up the same way without local IRON
+pytest, and it works.
+
+### Updated Phase 8.0 status
+
+| Step | Status | Notes |
+|---|---|---|
+| Q4_0 GGUF generated | ✅ | `models/llama-3.2-1b-instruct-Q4_0.gguf` |
+| Q4_K_M GGUF generated | ✅ | `models/llama-3.2-1b-instruct-Q4_K_M.gguf` |
+| llama-quantize.exe present | ✅ | already built |
+| IRON pytest runs | ❌ | pyxrt blocker; trust upstream OR run on Linux |
+| Compile-only check (kernel xclbin produces) | not attempted | requires Python entry-point that doesn't import iron.common |
+
+**Recommendation**: skip the IRON pytest step, proceed directly to
+Phase 8.1 wire-up using `correctness_test.py` for end-to-end validation
+on the Windows host (NPU-on vs CPU-baseline comparison on the Q4_0
+model, using a min_prefix_match tolerance for bf16 vs INT4 drift).
 
 ---
 
