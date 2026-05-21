@@ -197,6 +197,29 @@ dominates the compute envelope.**
    output projection), so the 4× DDR-bandwidth saving may net-positive
    there. Worth profiling on the QKV path before committing to it.
 
+**External reference points (web search, 2026-05-22):**
+
+- [IRON PR #80](https://github.com/amd/IRON/pull/80) bf16 SwiGLU fusion: 1.32× MLP speedup (5410→4103 µs).
+- [IRON PR #101](https://github.com/amd/IRON/pull/101) introduces `fused_dequant_gemv.cc` standalone bench: **561 µs for 2048×8192 INT4 GEMV**, 665 µs for 8192×2048.
+- [FastFlowLM](https://fastflowlm.com/benchmarks/) ships **66 t/s on Llama 3.2 1B Q4_1** on Strix Point — same IRON+AIE-MLIR stack we use. That's ~20× faster than our 3.4 t/s.
+
+Two takeaways:
+
+- The kernel itself CAN run at ~561 µs/call (PR #101 bench), but my Phase 8.2 dispatch ends up at ~14 ms/FFN-layer — ~7 × slower than 3 × 561 µs + 665 µs ≈ 1.9 ms expected. So per-kernel compute is NOT the dominant bottleneck; my chained-xclbin orchestration loses most of the budget.
+- FastFlowLM's 20 × headroom implies the real win is in transformer-block-level fusion (whole attention+FFN per dispatch) rather than per-op micro-kernels. That's a major redesign, not within Phase 8.2 scope.
+
+**Negative result (kernel-side bias rewrite, 2026-05-22):**
+Tried moving the `aie::sub(8)` out of the per-block inner loop into a
+per-group scalar accumulator (pre-compute S[g] once, then
+`row_bias += 8.0f * sf * S_g[g]` per group; output = `acc - row_bias`).
+Hypothesis was that the data dependency
+`as_bf16 → sub → mul → mac` was breaking AIE pipelining. Result:
+**WORSE** -- 2.80 → 1.10 t/s, 2.5 × regression. Reverted. Conclusion:
+the per-block sub is not the bottleneck; the AIE compiler is likely
+spilling the static `bfloat16 S_g[256]` buffer or failing to pipeline
+the scalar `float row_bias` accumulator. A real kernel optimization
+needs AIE compiler/IR analysis, not high-level algebra tricks.
+
 **Critical finding: Phase 8.1 alone is a net regression.** NPU INT4 is
 ~36 % slower than NPU bf16 and ~3 × slower than CPU Q4_0. The root cause
 is that turning on `GEMV_INT4` disables the existing NPU fusion path for
