@@ -77,19 +77,77 @@ kernel (subtract-after-unpack).
 ### Phase 8.1 — Q4_0 GEMV на NPU, W4A16 (3–5 дней)
 
 **Progress (2026-05-21):** scaffolding **landed** in commit
-`Soket1/llama.cpp-xdna@35ae3fee1`. Specifically:
+`Soket1/llama.cpp-xdna@35ae3fee1`, dispatch helper added in `c9e9fad19`,
+and **end-to-end pipeline enabled** in `f3b441a5d`. Specifically:
 
 | Sub-step | Status | Where |
 |---|---|---|
 | 8.1.1 `compile.py` `fused-dequant-gemv` subcommand + cache key | ✅ DONE | `compile.py` lines ~78-112, ~810-862, ~1219-1235 |
 | 8.1.2 `XDNA_OP_GEMV_INT4 = 10` enum entry | ✅ DONE | `ggml-xdna.cpp` line ~93 |
 | 8.1.3 `xdna_repack_q4_0_to_fused_int4()` host-side repack | ✅ DONE | `ggml-xdna.cpp` lines ~957-1044 |
-| 8.1.4 Weight BO caching | ⏳ TODO | mirror of `swiglu_warm_weight_int8` |
-| 8.1.5 Dispatch path in `mul_mat_gemv` | ⏳ TODO | ~200 LOC |
-| 8.1.6 `supports_op` claim for Q4_0 under `XDNA_ENABLE_GEMV_INT4` | ✅ DONE | gated default-off |
-| 8.1.7 `decode_batch` integration | ⏳ TODO | |
-| 8.1.8 Unit + end-to-end tests | ⚪ partial | `correctness_test.py` Q4_0 cases ready, will flip from CPU fallback to NPU once dispatch lands |
-| Kernel-side `aie::sub(8)` (review note N2) | ⏳ BLOCKED | needs IRON compile pipeline; pyxrt blocker on this env |
+| 8.1.4 Weight BO caching | ✅ DONE | `mul_mat_gemv_int4` lazy alloc by `src0->data` |
+| 8.1.5 Dispatch path in `mul_mat_gemv` | ✅ DONE | new helper `mul_mat_gemv_int4` (~150 LOC) |
+| 8.1.6 `supports_op` claim for Q4_0 under `XDNA_ENABLE_GEMV_INT4` | ✅ DONE | gated default-off, safe to enable |
+| 8.1.7 `decode_batch` integration | ✅ DONE (excluded) | Q4_0 skipped, routes through bare `mul_mat_gemv` |
+| 8.1.8 End-to-end test | ⚠️ FUNCTIONAL but OUTPUT WRONG | "GGGG" instead of meaningful text |
+| Host-side bias compensation math | ⏳ NEEDS DEBUG | likely culprit for "GGGG" output |
+| Kernel-side `aie::sub(8)` (review note N2) | ⏳ FUTURE | optimization; remove bias compute |
+
+**Major correction to N1 (Prerequisites log):** the pyxrt ABI mismatch
+that blocks the IRON Python pytest does **NOT** block ggml-xdna's
+compile pipeline. ggml-xdna invokes `compile.py` via `system()` /
+`cmd.exe`, which uses a different DLL search path than the conda
+Python interpreter loading pyxrt directly. On the test run we observed
+compile.py successfully build 4 INT4 xclbins
+(`gemv_int4_K2048_N8192_8col_g32`, `K8192_N2048`, `K2048_N2048`,
+`K2048_N512`) and cache them in `npu_kernels_win_8col/`. The kernel
+xclbins load cleanly via xrt and dispatch executes for all 16 layers.
+
+**Current state on enabling `XDNA_ENABLE_GEMV_INT4=1`:**
+
+| Aspect | Status |
+|---|---|
+| Build | ✅ clean |
+| Kernel compile (compile.py) | ✅ produces xclbins per (K, N) shape |
+| xclbin load + hw_ctx + xrt::kernel | ✅ no errors |
+| INT4 weight repack | ✅ runs on first-touch per src0->data, caches |
+| BO allocation / DMA sync | ✅ no errors |
+| Kernel dispatch (xrt::run + wait) | ✅ completes without crash |
+| Output values | ❌ wrong — model produces "GGGG" |
+| Process exit code | ✅ 0 (clean) |
+| Decode rate | ~0.5 t/s on first run (compile inline); should be much higher when cached |
+
+**Next debug step: accuracy bug.** Generation produces "GGGG" — likely
+causes in order of probability:
+
+1. **Host-side bias compensation formula wrong.** The kernel computes
+   `output[i] = sum_g sf[i,g] * sum_k_in_g (nibble[i,k] * x[k])`. We
+   want `(nibble - 8) * sf * x`. The bias to subtract is `8 * sum_g
+   sf[i,g] * sum_k_in_g (x[k])`. If the formula is off (e.g. wrong
+   sign, wrong scale, wrong order of dims), outputs are wrong but the
+   pipeline doesn't crash.
+
+2. **Repack nibble ordering bug.** GGML Q4_0 packs `byte j = (e[j] &
+   0xF) | ((e[j+16] & 0xF) << 4)` — element j and j+16 share a byte.
+   IRON expects `byte k = e[2k] | (e[2k+1] << 4)` — elements 2k and
+   2k+1 share a byte. My repack unpacks as `e[j] = qs[j] & 0xF`,
+   `e[j+16] = (qs[j] >> 4) & 0xF`, then re-packs `byte k = e[2k] |
+   (e[2k+1] << 4)`. Need to verify the element-index mapping matches
+   what the model semantics require.
+
+3. **tile_offset calculation in bias scan.** For row i, my code
+   computes `flat_tile = col * tiles_per_col + tile_idx` where
+   `col = i / rows_per_col`. If the kernel internally walks the
+   packed buffer in a different order, the per-row scales we read
+   don't match the per-row weights the kernel actually used.
+
+Recommended debug approach: add a unit test (Python or small C++
+probe) that:
+  - Picks one Q4_0 weight from the model (e.g., `blk.0.attn_q.weight`)
+  - Runs CPU dequant + GEMV in float32 for ground truth
+  - Runs the NPU INT4 path and compares per-element
+  - Pinpoints where numbers first diverge (is the kernel output
+    self-consistent? does bias subtract the right amount?)
 
 **Current behavior with the scaffolding:**
 - `XDNA_ENABLE_GEMV_INT4` unset (default): nothing changes. Q4_0
