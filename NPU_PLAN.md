@@ -1,14 +1,23 @@
 # IRON-windows NPU Optimization Plan
 
-> Last updated: 2026-05-20
+> Last updated: 2026-05-21
 
-## Current Status: **FlowKV + RMSNorm on NPU, 5.9 t/s (near baseline 6.0 t/s)**
+## Current Status: **5.5–5.9 t/s on STX NPU2 depending on chat-mode**
 
-FlowKV decode attention is integrated and produces correct output on STX NPU2.
-Debug flowkv.bat: Step 2 (no FlowKV) = "The capital of France is Paris." ✅
+- **Single-query** (`--single-turn` or one prompt per process): all NPU
+  operators safe, including RMS_NORM → **5.9 t/s**.
+- **Chat-mode multi-query** (`-cnv` with multiple turns in one process):
+  RMS_NORM⊕QKV interference breaks Q2+ output. Workaround: set
+  `XDNA_ENABLE_RMS_NORM=0`. RMS_NORM falls back to CPU → **5.5 t/s**.
+  See `## Known bug: multi-query garbage` below for details and the
+  proposed long-term fix (multi-column RMS_NORM with reduction).
+
+Baseline (no FlowKV, no RMS_NORM on NPU) = **6.0 t/s** generation.
+
+`debug_flowkv.bat` Step 2 (no FlowKV) = "The capital of France is Paris." ✅
                     Step 3 (with FlowKV) = "The capital of France is Paris." ✅
 
-Benchmark (run_flowkv_bench.bat, 32 tokens):
+Benchmark (`run_flowkv_bench.bat`, 32 tokens, single-query):
 
 | Config | Prompt | Generation |
 |--------|--------|------------|
@@ -50,41 +59,58 @@ Both bugs masked each other. After both fixes, model produces correct output.
 
 ## Component Status
 
-| Component | Status | NPU? | Per-dispatch | Per token (×12) |
+| Component | Status | NPU? | Per-dispatch | Per token |
 |---|---|---|---|---|
-| QKV projection | ✅ Working | NPU | 1.17 ms | 14.0 ms |
-| SwiGLU (gate+up+silu+down) | ✅ Working | NPU | 3.62 ms | 43.4 ms |
-| Output projection (decode batch) | ✅ Working | NPU | 1.06 ms | 12.7 ms |
-| **Attention (FlowKV decode)** | ✅ Working | NPU | ~2 ms × 8 | ~16 ms |
-| RMSNorm + MUL (gain) | ❌ CPU | CPU | — | ~15-20 ms |
-| Residual ADD, RoPE, KV cache | ❌ CPU | CPU | — | ~10-15 ms |
+| QKV projection | ✅ Working | NPU (8col) | 1.17 ms | 14.0 ms (×12 layers) |
+| SwiGLU (gate+up+silu+down) | ✅ Working | NPU (8col) | 3.62 ms | 43.4 ms |
+| Output projection (decode batch) | ✅ Working | NPU (8col) | 1.06 ms | 12.7 ms |
+| **Attention (FlowKV decode, batched)** | ✅ Working | NPU (4col, num_cols=4) | ~0.56 ms × 2 batches | ~13.4 ms (×16 layers, 32 dispatches total) |
+| RMSNorm (full-row tile, no gain) | ⚠ Conditional NPU (1col) | NPU single-query / CPU chat-mode | ~0.05 ms | ~1.6 ms (when on NPU) |
+| MUL (gain), Residual ADD, RoPE, KV cache | ❌ CPU | CPU | — | ~10-20 ms total |
 
-## Dispatch pattern per layer
+**Important asymmetry**: RMS_NORM is the only **1-col** operator. It works
+correctly in isolation and in single-query mode, but its 1-col hw_context
+conflicts with the 8-col QKV context in chat-mode multi-query (root cause
+documented in `## Known bug` section). Until a multi-column RMS_NORM
+design lands, chat-mode users should set `XDNA_ENABLE_RMS_NORM=0`.
+
+**Historical FlowKV dispatch counts**: earlier text mentioned "8 dispatches
+× ~2 ms" for FlowKV (per-KV-head, num_cols=1). That predates the batched
+path. Current production path is `num_cols=4` batching → **2 dispatches
+per layer** = **32 per token** for Llama-3.2-1B (16 layers × 2 batches of
+4 KV heads each), each ~0.56 ms NPU exec. The legacy per-head dispatch
+function (`ggml_backend_xdna_flowkv_per_head`) is dead code — kept in
+the source but `xdna_plan_flowkv()` returns empty in the current
+cgraph layout, so it never fires. Scheduled for removal.
+
+## Dispatch pattern per layer (current production path)
 
 ```
 graph_compute n_nodes=1   → SOFT_MAX (skipped when FlowKV enabled)
 graph_compute n_nodes=N   → Main layer:
-  RMS_NORM      → CPU
-  MUL (gain)    → CPU
-  MUL_MAT ×3    → NPU via QKV dispatch (1.17 ms)
+  RMS_NORM      → NPU 1-col (single-query) | CPU (chat-mode w/ workaround)
+  MUL (gain)    → CPU (one weighted-RMSNorm fusion attempt failed, see lessons)
+  MUL_MAT ×3    → NPU via QKV dispatch (8col, 1.17 ms)
   ROPE ×2       → CPU
   KV cache ops  → CPU
-  CONT + attn   → FlowKV POC dispatch (8 × ~2 ms = ~16 ms)
+  CONT + attn   → FlowKV POC dispatch (4col, 2 batches × ~0.56 ms = ~1.12 ms NPU,
+                  + ~16 ms total per-token across 16 layers including host overhead)
   ADD           → CPU (residual)
-  RMS_NORM      → CPU
+  RMS_NORM      → as above
   MUL (gain)    → CPU
-  GLU/SwiGLU    → NPU (3.62 ms)
+  GLU/SwiGLU    → NPU (8col, 3.62 ms)
   ADD           → CPU (residual)
 ```
 
 ## Per-dispatch profiling (decode M=1)
 
-| Operation | Total |
+| Operation | NPU exec time |
 |---|---|
 | SwiGLU | 3620 µs |
 | QKV | 1165 µs |
-| decode_batch | 1055 µs |
-| FlowKV (per KV head) | ~2000 µs × 8 dispatches |
+| O_proj (decode_batch) | 1055 µs |
+| **FlowKV (batched, ~0.56ms × 2)** | **~1120 µs per layer = ~13.4 ms/token** |
+| RMSNorm (when on NPU) | ~50 µs |
 
 ## What DOESN'T work (lessons learned)
 
@@ -643,7 +669,7 @@ Both should output "The capital of France is Paris."
 set XDNA_ENABLE_GEMV=1
 set XDNA_ENABLE_SWIGLU=1
 set XDNA_ENABLE_QKV=1
-set XDNA_ENABLE_RMS_NORM=1
+set XDNA_ENABLE_RMS_NORM=0        :: 1 for single-query (+0.4 t/s), 0 for chat-mode
 set XDNA_ENABLE_SWIGLU_PREFILL=0
 set XDNA_ENABLE_DECODE_BATCH=1
 set XDNA_ENABLE_TRANSFORMER_BLOCK=1
@@ -651,19 +677,128 @@ set XDNA_ENABLE_FLOWKV_DECODE=1
 set GGML_XDNA_NUM_COLS=8
 ```
 
+**Note on `GGML_XDNA_NUM_COLS=8`:** Earlier text in this document (and
+NPU_PLAN's Priority 6) claimed XRT "hard-limits" user contexts to 4
+columns. That turned out to be operator-specific: SequentialPlacer
+fails for a single 8-col IRON design, but QKV/SwiGLU (compiled as
+8col) actually do dispatch and run on this STX NPU2 alongside
+FlowKV (4col). Concretely the current cache has:
+- `qkv_K2048_Nq2048_Nk512_Nv512_8col` ← runs
+- `swiglu_*_8col` ← runs
+- `flowkv_*_4col` ← runs
+- `rms_norm_S2048_bf16_1c1ch_t2048` ← runs but conflicts with QKV in chat-mode
+
+So `GGML_XDNA_NUM_COLS=8` is the right value for QKV/SwiGLU; FlowKV
+hardcodes its own `num_cols=4` internally; RMS_NORM hardcodes 1. The
+plan's earlier "4 col hard limit" wording is outdated and should be
+read as "mixed col counts coexist except the 1-vs-8 case".
+
 ## Milestones
 
 | Milestone | Current | Target |
 |---|---|---|
-| Steady-state (no FlowKV) | **5.8 t/s** | — |
+| Steady-state (no FlowKV) | **5.8–6.0 t/s** | — |
 | + Attention on NPU (FlowKV num_cols=1) | **4.8 t/s** | — |
 | + Batch 4 KV heads (num_cols=4) | **5.5 t/s** | — |
-| + RMSNorm on NPU | **5.9 t/s** | — |
-| + Multi-column parallelism (8 cols) | BLOCKED (XRT 4 col limit) | ~8-10 t/s |
-| + Merge QKV+batch | — | ~12-13 t/s |
-| Full model on NPU | — | ~15+ t/s |
+| + RMSNorm on NPU (single-query only) | **5.9 t/s** | — |
+| + RMSNorm on NPU also in chat-mode | BLOCKED (RMS⊕QKV) | 5.9 t/s |
+| + Multi-row FlowKV parallelism (4×4 split per KV group) | — | ~7-8 t/s |
+| + INT4 weights for QKV/SwiGLU/O_proj | — | ~9-12 t/s |
+| + Speculative decoding | — | ~15-25 t/s |
+| Full model on NPU + all of the above | — | aspirational |
+
+(Removed earlier "Merge QKV+O_proj" milestone — Priority 2 below
+explicitly marks that fusion as NOT FEASIBLE due to incompatible
+src[1] tensors, so it can't appear as a roadmap target.)
 
 ## Architecture
+
+### Authoritative FlowKV ABI (host ↔ kernel contract, as of 2026-05-21)
+
+**This section is the single source of truth.** If `design.py` /
+`flowkv.cc` / host code disagree, the host code (ggml-xdna.cpp POC
+dispatch block, lines ~11100-11800) is what actually runs and should
+be matched.
+
+**Kernel arguments** (xrt::run.set_arg index → semantics):
+
+| Arg # | Name in xclbin | group_id | Host BO | Purpose |
+|-------|---------------|----------|---------|---------|
+| 0 | opcode | — | inline u32 = 3 | xrt instruction opcode |
+| 1 | insts | — | `fk_entry->insts_bo` | NPU microcode buffer |
+| 2 | insts_size | — | inline u32 | size of insts in bytes |
+| 3 | DDR_buf_0 | 3 | `fk_entry->bo_k` | K-only mirror (see below) |
+| 4 | DDR_buf_1 | 4 | `fk_entry->bo_v` | **K+V combined** in one BO |
+| 5 | DDR_buf_2 | 5 | `fk_entry->bo_q` | Q + angles + actual_seq_len + magic |
+| 6 | DDR_buf_3 | 6 | `fk_entry->bo_out` | output (kqv_out for the batch) |
+| 7 | (unknown) | — | inline u32 = 0 | reserved |
+
+**Why arg3 (bo_k) duplicates K from arg4 (bo_v):** the IRON compiler
+emits DMA descriptors that read the K stream from arg0 (which we route
+to bo_k via group_id 3). It reads the V stream from arg1 (bo_v) at
+offset `aligned_v_region_offset_bytes`. So the K data lives in **two
+host BOs** (kernel reads it once via the K-stream DMA from bo_k), and
+the V data lives only in bo_v after the K region. The host writes K
+into bo_v[0 : kv_region_size) first, then `memcpy`s the same K bytes
+into bo_k. Cost is ~32 KB per dispatch, negligible.
+
+**Layout inside `bo_v`** (the K+V combined buffer, total
+`num_cols * 2 * aligned_head_stride_bytes`):
+
+```
+offset 0
+  ┌─────────────────────────────────────────────┐
+  │ K region (num_cols × aligned_head_stride)   │  ← K_col0, K_col1, …, K_col(N-1)
+  ├─────────────────────────────────────────────┤  ← aligned_v_region_offset_bytes
+  │ V region (num_cols × aligned_head_stride)   │  ← V_col0, V_col1, …, V_col(N-1)
+  └─────────────────────────────────────────────┘
+```
+
+Each `K_col_i` and `V_col_i` is laid out as `[seq_len][head_dim]` bf16
+row-major (positions [0..actual_seq_len) populated, the rest zeroed by
+a `memset(bo_v_ptr, 0, …)` at the start of each batch).
+
+`aligned_head_stride_bytes = ceil(seq_len * head_dim * 2 / 64) * 64`
+(Shim DMA needs 64-byte alignment for parallel channels).
+
+`aligned_v_region_offset_bytes =
+   ceil(num_cols * aligned_head_stride_bytes / 64) * 64`.
+
+**Layout inside `bo_q`** (per kv-head-group, repeated `num_cols`
+times):
+
+```
+offset col * q_group_stride
+  ┌───────────────────────────────────────────────────────┐
+  │ Q group: q_heads_per_kv × head_dim bf16              │
+  ├───────────────────────────────────────────────────────┤  ← angles_off
+  │ angles[head_dim]: cos/sin pairs (currently identity:  │
+  │   cos=1.0=0x3F80, sin=0.0=0x0000 — kernel ignores)    │
+  ├───────────────────────────────────────────────────────┤
+  │ actual_seq_len: 1 bf16 (host writes (uint16)(f32_to_bf16(int_to_f32))) │
+  ├───────────────────────────────────────────────────────┤
+  │ probe_magic: 1 bf16 (diagnostic, kernel may ignore)   │
+  └───────────────────────────────────────────────────────┘
+```
+
+`q_group_stride = ceil((q_heads_per_kv * head_dim + head_dim + 2) * 2 / 64) * 64`.
+
+`angles_off = q_heads_per_kv * head_dim * 2` bytes from group start.
+
+`actual_seq_len` lives at `angles_off + head_dim * 2` bytes.
+
+**Layout inside `bo_out`**: `num_cols * aligned_out_stride_bytes`
+where `aligned_out_stride_bytes = ceil(q_heads_per_kv * head_dim * 2 / 64) * 64`.
+Each column-slot holds `q_heads_per_kv * head_dim` bf16 outputs.
+Host scatters columns back into the model's `kqv_out` tensor in
+contiguous q_head order.
+
+**RoPE status (clarification):** the kernel reads the angles buffer
+but currently treats it as identity (cos=1.0, sin=0.0). Q and K
+delivered to the kernel are **already RoPE-rotated** by the ggml ROPE
+op upstream (CPU). So the angles buffer is functionally dead but kept
+in the ABI for future re-enabling of in-kernel RoPE. Do not document
+this as "fused RoPE" — the kernel does no rotation work.
 
 ### FlowKV Decode Attention
 

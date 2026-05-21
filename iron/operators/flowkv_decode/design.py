@@ -100,6 +100,11 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     # L3 (DDR) buffer types
     # -------------------------------------------------------------------------
+    # AUTHORITATIVE ABI: see NPU_PLAN.md "Authoritative FlowKV ABI" section.
+    # Earlier text in this file contained two contradictory descriptions
+    # of how K and V are routed between host BOs and kernel args; ignore
+    # both and refer to NPU_PLAN.md for the single source of truth.
+    #
     # K and V data are combined in a single buffer (arg1 = bo_v).
     # IRON compiler bug: both K_fifos and V_fifos DMA read from arg1.
     # Workaround: K data at offset 0, V data at offset kv_region_size.
@@ -376,8 +381,13 @@ def my_flowkv_decode(
         rt.start(*all_workers)
 
         for batch_idx in range(num_batches):
-            # K and V use SEPARATE buffers (arg0=K, arg1=V) to avoid
-            # DMA offset corruption seen when sharing one buffer.
+            # AUTHORITATIVE ABI: see NPU_PLAN.md. The comment below described
+            # the original "separate buffers" sketch — in production the
+            # host actually puts K+V together in arg1 (bo_v) AND mirrors K
+            # into arg0 (bo_k) so the K-stream DMA finds the data. Treat
+            # this loop's parameter routing as the source of truth for the
+            # IRON-side wiring, but for the host-side BO layout always
+            # consult NPU_PLAN.md "Authoritative FlowKV ABI".
             tg_k = rt.task_group()
             tg_v = rt.task_group()
 
