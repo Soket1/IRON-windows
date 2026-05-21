@@ -76,6 +76,54 @@ kernel (subtract-after-unpack).
 
 ### Phase 8.1 — Q4_0 GEMV на NPU, W4A16 (3–5 дней)
 
+**Progress (2026-05-21):** scaffolding **landed** in commit
+`Soket1/llama.cpp-xdna@35ae3fee1`. Specifically:
+
+| Sub-step | Status | Where |
+|---|---|---|
+| 8.1.1 `compile.py` `fused-dequant-gemv` subcommand + cache key | ✅ DONE | `compile.py` lines ~78-112, ~810-862, ~1219-1235 |
+| 8.1.2 `XDNA_OP_GEMV_INT4 = 10` enum entry | ✅ DONE | `ggml-xdna.cpp` line ~93 |
+| 8.1.3 `xdna_repack_q4_0_to_fused_int4()` host-side repack | ✅ DONE | `ggml-xdna.cpp` lines ~957-1044 |
+| 8.1.4 Weight BO caching | ⏳ TODO | mirror of `swiglu_warm_weight_int8` |
+| 8.1.5 Dispatch path in `mul_mat_gemv` | ⏳ TODO | ~200 LOC |
+| 8.1.6 `supports_op` claim for Q4_0 under `XDNA_ENABLE_GEMV_INT4` | ✅ DONE | gated default-off |
+| 8.1.7 `decode_batch` integration | ⏳ TODO | |
+| 8.1.8 Unit + end-to-end tests | ⚪ partial | `correctness_test.py` Q4_0 cases ready, will flip from CPU fallback to NPU once dispatch lands |
+| Kernel-side `aie::sub(8)` (review note N2) | ⏳ BLOCKED | needs IRON compile pipeline; pyxrt blocker on this env |
+
+**Current behavior with the scaffolding:**
+- `XDNA_ENABLE_GEMV_INT4` unset (default): nothing changes. Q4_0
+  models still fall back to CPU via ggml-sched. Harness 10/10 pass.
+- `XDNA_ENABLE_GEMV_INT4=1`: `supports_op` claims Q4_0, scheduler
+  routes Q4_0 mul_mat into ggml-xdna's graph_compute, which currently
+  has no INT4 dispatch branch -> **will crash or produce garbage**.
+  Do NOT set this env var until step 8.1.5 lands.
+
+**Remaining work (3-5 days realistically):**
+
+1. Weight BO cache: allocate `xrt::bo` of `_packed_buffer_size()` on
+   first-touch per `src0->data`, repack into the mapped pointer via
+   `xdna_repack_q4_0_to_fused_int4`, `bo.sync(TO_DEVICE)`. Reuse on
+   subsequent dispatches.
+2. Dispatch in `mul_mat_gemv` when `src0->type == GGML_TYPE_Q4_0`:
+   `compile_fused_dequant_gemv_cached` -> `get_or_load_kernel(... XDNA_OP_GEMV_INT4)`
+   -> `kernel(opcode=3, insts, n_insts, bo_packed, bo_vec, bo_out)`.
+3. Host bias compensation: per-token `S[g] = sum_{k in g} x[k]` (one
+   pass), then per row `bias[i] = 8 * sum_g sf[i,g] * S[g]`, subtract
+   from kernel output. Bias scales read from the packed BO at offset
+   `m_input * K / 2` per tile. Cost ~50 us / matmul on CPU.
+4. correctness_test.py: add `npu_int4` preset (`XDNA_ENABLE_GEMV_INT4=1`)
+   and flip the Q4_0 test cases from CPU-fallback comparison to NPU
+   dispatch comparison.
+
+**Original plan text below preserved for the file-by-file detail:**
+
+---
+
+(original 8.1 plan continues from here ↓)
+
+### Phase 8.1 (original detail) — Q4_0 GEMV на NPU, W4A16 (3–5 дней)
+
 **Цель**: dispatch Q4_0 `mul_mat` с M=1 на NPU через fused_dequant_gemv.
 Эффект: O_proj decode (12×0.56ms) + bare-MM decode → ~3× быстрее на этих
 узлах, ожидаемо `5.9 → 7.0 t/s`.
@@ -342,15 +390,16 @@ compute-bound.
 
 ## Roadmap
 
-| Phase | Дни | Выход | t/s |
-|---|---|---|---|
-| 8.0 Validation | 0.5 | INT4 kernel работает на STX | 5.9 (baseline) |
-| 8.1 Q4_0 GEMV | 3–5 | NPU dispatch для bare Q4_0 mul_mat | ~7.0 |
-| 8.2 Q4_0 SwiGLU FFN | 3–4 | FFN на INT4, основная победа | ~9–10 |
-| 8.3 QKV INT4 | 1–2 (опц.) | если QKV доминирует | ~10–11 |
-| 8.4 Q4_K (через W4A16 repack) | 3–5 | поддержка Q4_K GGUF | без перфоманс эффекта |
-| 8.5 W4A8 | 5+ (опц.) | INT8 MFMA если упёрлись в bf16 MAC | потенциально 12–15 |
-| **Итого до целевой точки** | **~2 недели** | Q4_0+Q4_K на NPU | **5.9 → 9–10 t/s** |
+| Phase | Дни P50 | Дни P90 | Выход | t/s | Status |
+|---|---|---|---|---|---|
+| 8.0 Validation | 0.5 | 1 | INT4 kernel works on STX | 5.9 (baseline) | ⚪ partial (pyxrt blocked, see Prerequisites log) |
+| 8.1 Q4_0 GEMV scaffolding (enum + supports_op + repack + compile.py) | landed | landed | safe default-off scaffolding | 5.9 (unchanged) | ✅ commit 35ae3fee1 |
+| 8.1 Q4_0 GEMV dispatch path (BO + kernel + bias) | 3–5 | 7–8 | NPU dispatch for bare Q4_0 mul_mat | ~7.0 | ⏳ next |
+| 8.2 Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, main win | ~9–10 | not started |
+| 8.3 QKV INT4 | 1–2 (or skip) | 3 | only if 8.2 profile shows QKV dominates | ~10–11 | measurement-gated |
+| 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
+| 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
+| **Realistic total to target** | **2 weeks** | **3–4 weeks** | Q4_0 + Q4_K on NPU | **5.9 → 9–10 t/s** | |
 
 ## Что делегировать Build агенту
 
