@@ -80,8 +80,18 @@ void dual_fused_dequant_matvec(uint32_t m,
                 aie::vector<bfloat16, block_size> as_bf16 =
                     aie::to_float<bfloat16>(as_int16, 0);
 
+                // CRITICAL: Q4_0 stores values as biased uint4 (signed = uint - 8).
+                // The host bias compensation that fused_dequant_gemv relies on
+                // does NOT work here -- SiLU is non-linear, so we cannot
+                // subtract the bias post-hoc from the FIFO output. Bake the
+                // -8 offset into the dequant pipeline.
+                aie::vector<bfloat16, block_size> offset =
+                    aie::broadcast<bfloat16, block_size>(8.0f);
+                aie::vector<bfloat16, block_size> as_signed =
+                    aie::sub(as_bf16, offset);
+
                 aie::vector<bfloat16, block_size> w_dequant =
-                    aie::mul(as_bf16, sf_broadcast).template to_vector<bfloat16>();
+                    aie::mul(as_signed, sf_broadcast).template to_vector<bfloat16>();
 
                 aie::vector<bfloat16, block_size> b_vec = aie::load_v<block_size>(b_ptr);
                 b_ptr += block_size;
