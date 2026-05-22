@@ -78,17 +78,7 @@ Baseline 6.0 t/s = 167 ms, FlowKV 5.4 t/s = 185 ms. Difference = 18 ms, dispatch
 
 ## Two bugs found and fixed (2026-05-19)
 
-### Bug 1 (v10): K DMA routing
-IRON compiler reads K FIFO from arg0 (bo_k), not arg1 (bo_v) as assumed.
-Host wrote K only to bo_v[0] → tile saw zeros.
-Fix: mirror K data into bo_k via memcpy after writing to bo_v.
-
-### Bug 2 (v11): CONT node skip
-`continue` skipped CONT node after FlowKV dispatch. MUL_MAT read from
-CONT output buffer (empty), not from kqv_out->data (CONT input).
-Fix: removed `continue`, let CONT execute in CPU range.
-
-Both bugs masked each other. After both fixes, model produces correct output.
+These historical bugs have been resolved. Details of the discovery and fixes are documented in the [Appendix: Debugging History Log](#two-bugs-found-and-fixed-2026-05-19).
 
 ## Component Status
 
@@ -186,47 +176,47 @@ graph_compute n_nodes=N   → Main layer:
 
 ## Priorities
 
-### Priority 1: Attention → NPU ✅ DONE
+### Priority 1: Attention → NPU ✅ DONE [TASK-P1]
 
 FlowKV decode integrated and working (2026-05-19).
-- Per-KV-head dispatch (Option 3)
-- 8 dispatches for Llama 3.2 1B (group_size=4, 8 KV heads)
-- Gate: `XDNA_ENABLE_FLOWKV_DECODE=1`
-- Identity RoPE angles (Q already rotated by graph)
-- Two bugs fixed: K DMA routing + CONT node skip
+- **[TASK-P1.1]** Per-KV-head dispatch (Option 3)
+- **[TASK-P1.2]** 8 dispatches for Llama 3.2 1B (group_size=4, 8 KV heads)
+- **[TASK-P1.3]** Gate: `XDNA_ENABLE_FLOWKV_DECODE=1`
+- **[TASK-P1.4]** Identity RoPE angles (Q already rotated by graph)
+- **[TASK-P1.5]** Two bugs fixed: K DMA routing + CONT node skip
 
-### Priority 2: Merge QKV + O_proj (NOT FEASIBLE)
+### Priority 2: Merge QKV + O_proj (NOT FEASIBLE) [TASK-P2]
 
 QKV accepts input activation as src[1]. O_proj accepts attention output as src[1].
 Different tensors — cannot concatenate into one GEMV. Different xclbins → different
 hw_context → XRT runlist throws on add(). QKV already 1 submission for decode (M=1).
 
-### ✅ Priority 3: RMSNorm → NPU (DONE)
+### ✅ Priority 3: RMSNorm → NPU (DONE) [TASK-P3]
 
 RMSNorm runs on NPU with full-row tile_size (2048). Single AIE core processes
 entire row — avoids per-tile independent normalization bug (tile_size=32).
 
-Fix: `xdna_select_rms_norm_params()` now uses `tile_size = size` (not hardcoded 32).
-Result: **5.9 t/s** (from 5.5 t/s). FlowKV overhead reduced to 2%.
-Note: weighted variant (gain) still applied via separate CPU MUL.
+**[TASK-P3.1]** Fix: `xdna_select_rms_norm_params()` now uses `tile_size = size` (not hardcoded 32).
+**[TASK-P3.2]** Result: **5.9 t/s** (from 5.5 t/s). FlowKV overhead reduced to 2%.
+**[TASK-P3.3]** Note: weighted variant (gain) still applied via separate CPU MUL.
 
-### Priority 4: Batch KV heads per dispatch ✅ DONE (2026-05-20)
+### Priority 4: Batch KV heads per dispatch ✅ DONE (2026-05-20) [TASK-P4]
 
 **Problem:** FlowKV dispatches 8 times per layer (1 per KV head) = 96 dispatches per token.
 Dispatch overhead (xrt::run.wait hardware time) dominates.
 
 **Solution:** Batch 4 KV heads into a single xrt::run call.
-- Dispatch count: 8 → 2 per layer (24 per token instead of 96)
-- IRON design uses 4 columns, runtime sequence fills 4 KV heads in parallel
-- Cache key: `flowkv_H16_KV4_d64_S256_C32_4col`
+- **[TASK-P4.1]** Dispatch count: 8 → 2 per layer (24 per token instead of 96)
+- **[TASK-P4.2]** IRON design uses 4 columns, runtime sequence fills 4 KV heads in parallel
+- **[TASK-P4.3]** Cache key: `flowkv_H16_KV4_d64_S256_C32_4col`
 
-**Root cause of previous failures:**
+**[TASK-P4.4]** **Root cause of previous failures:**
 `num_heads` param passed to `get_or_load_flowkv_kernel()` was `q_heads_per_kv` (4) instead of `q_heads_per_kv * num_cols` (16). This compiled xclbin with `group_size=1` while host prepared data for `group_size=4`, causing DMA misalignment and garbage output.
 
-**Aligned stride (PDF fix):**
+**[TASK-P4.5]** **Aligned stride (PDF fix):**
 For S256, `raw_head_bytes = 256*64*2 = 32768` — already 64-byte aligned. The PDF fix only matters when `raw_head_bytes % 64 != 0`. Still applied for correctness with arbitrary seq_len.
 
-### Priority 5: Fuse FlowKV + Output Projection (future, high complexity)
+### Priority 5: Fuse FlowKV + Output Projection (future, high complexity) [TASK-P5]
 
 **Idea:** Fuse FlowKV attention + O_proj GEMV into a single xrt::run dispatch per layer.
 
@@ -241,91 +231,91 @@ FlowKV+O_proj dispatch (est. 0.7ms) → bo_final → host
 ```
 
 **Savings analysis:**
-- Eliminate 12 O_proj dispatches: 12 × 0.56ms = 6.7 ms/token
-- Fused dispatch slightly slower: ~0.7ms × 12 = 8.4ms (vs 6.7ms FlowKV-only)
-- Net savings: ~5 ms/token
-- Result: ~5.6 t/s (from 5.4 t/s)
+- **[TASK-P5.1]** Eliminate 12 O_proj dispatches: 12 × 0.56ms = 6.7 ms/token
+- **[TASK-P5.2]** Fused dispatch slightly slower: ~0.7ms × 12 = 8.4ms (vs 6.7ms FlowKV-only)
+- **[TASK-P5.3]** Net savings: ~5 ms/token
+- **[TASK-P5.4]** Result: ~5.6 t/s (from 5.4 t/s)
 
 **Challenges:**
-- O_proj weight = 2048×2048 bf16 = 8MB. Tile memory = 32KB. Needs tiling/streaming.
-- Cross-column dependency: each column computes 4 Q heads, but O_proj needs all 8 KV heads' outputs.
-- Would need new IRON design with fused attention + GEMV workers.
-- IRON fusion framework (`FusedMLIROperator`) exists but is designed for simple chains, not complex attention patterns.
+- **[TASK-P5.5]** O_proj weight = 2048×2048 bf16 = 8MB. Tile memory = 32KB. Needs tiling/streaming.
+- **[TASK-P5.6]** Cross-column dependency: each column computes 4 Q heads, but O_proj needs all 8 KV heads' outputs.
+- **[TASK-P5.7]** Would need new IRON design with fused attention + GEMV workers.
+- **[TASK-P5.8]** IRON fusion framework (`FusedMLIROperator`) exists but is designed for simple chains, not complex attention patterns.
 
-**Verdict:** ROI is low (large complexity for ~0.2 t/s gain). Main bottleneck is NPU compute time (13.4 ms/token = 83% of overhead), which fused kernel doesn't reduce.
+**[TASK-P5.9]** **Verdict:** ROI is low (large complexity for ~0.2 t/s gain). Main bottleneck is NPU compute time (13.4 ms/token = 83% of overhead), which fused kernel doesn't reduce.
 
-### Priority 6: Multi-column parallelism (BLOCKED)
+### Priority 6: Multi-column parallelism (BLOCKED) [TASK-P6]
 
 XDNA 2 physically has 8 compute columns, but XRT runtime allocates only 4 per user context.
 Remaining 4 are reserved for OS background AI tasks (Windows Studio Effects, noise cancellation).
 SequentialPlacer fails with "Failed to find a tile matching column 2: tried until column 8".
-**num_cols=4 is the hard limit** for user XRT contexts on client Ryzen AI processors.
+**[TASK-P6.1]** **num_cols=4 is the hard limit** for user XRT contexts on client Ryzen AI processors.
 
-### Priority 7: Speculative decoding (from albiol2004, ggml-org/llama.cpp#21725)
+### Priority 7: Speculative decoding (from albiol2004, ggml-org/llama.cpp#21725) [TASK-P7]
 
 albiol2004 notes: "XDNA NPUs are not designed for LLMs — decode is memory-bound,
 NPU compute underutilized. Speculative decoding can still squeeze a lot of performance."
 
-Speculative decoding drafts 4-8 tokens in parallel, then verifies in one batch.
-This transforms decode from memory-bound (1 token) to compute-bound (N tokens),
+**[TASK-P7.1]** Speculative decoding drafts 4-8 tokens in parallel, then verifies in one batch.
+**[TASK-P7.2]** This transforms decode from memory-bound (1 token) to compute-bound (N tokens),
 充分利用 NPU parallelism. NPU has 4 columns × 4 rows = 16 tiles — ideal for
 batch verification.
 
-Estimated gain: 3-5x throughput if speculative draft is fast (small model on CPU).
+**[TASK-P7.3]** Estimated gain: 3-5x throughput if speculative draft is fast (small model on CPU).
 
-### Priority 8: INT4 quantization (from albiol2004)
+### Priority 8: INT4 quantization (from albiol2004) [TASK-P8]
 
 albiol2004: "FLM appears to work only at INT4. Want to support both INT8 and INT4
 so that virtually every GGUF runs on it."
 
-INT4 reduces weight memory 4x vs bf16,大幅 reducing DMA transfer time.
-Current bottleneck is NPU execution (13.4 ms/token) which is dominated by
+**[TASK-P8.1]** INT4 reduces weight memory 4x vs bf16,大幅 reducing DMA transfer time.
+**[TASK-P8.2]** Current bottleneck is NPU execution (13.4 ms/token) which is dominated by
 weight streaming from DDR. INT4 would cut this proportionally.
 
-Challenge: need INT4 dequantization kernel on AIE tiles, or host-side dequant.
+**[TASK-P8.3]** Challenge: need INT4 dequantization kernel on AIE tiles, or host-side dequant.
 
-### Priority 9: 64K SMMU alignment (from ic, ggml-org/llama.cpp#21725)
+### Priority 9: 64K SMMU alignment (from ic, ggml-org/llama.cpp#21725) [TASK-P9]
 
 ic reports: "IRON contact with 64K alignment matching SMMU page got 41 t/s"
 (vs 4 t/s without alignment, vs 61 t/s with FLM).
 
-Current implementation uses 64-byte alignment. 64K alignment may reduce
+**[TASK-P9.1]** Current implementation uses 64-byte alignment. 64K alignment may reduce
 SMMU page table overhead for DMA transfers. Worth benchmarking.
 
-### Priority 10: Async NPU dispatch (from XDNA_OPTIMIZATION_PLAN.md)
+### Priority 10: Async NPU dispatch (from XDNA_OPTIMIZATION_PLAN.md) [TASK-P10]
 
 Submit NPU run, immediately continue with CPU ops (residual add, RMSNorm).
 Wait for NPU only when result is needed. Overlap NPU compute with CPU-side ops.
 
-Currently we block on `rl.wait()` every time. If we overlap NPU compute with
+**[TASK-P10.1]** Currently we block on `rl.wait()` every time. If we overlap NPU compute with
 CPU residual add + RMSNorm — estimated 10-15% improvement from pipelining.
 
-### Priority 11: KV cache persistent on NPU (from XDNA_OPTIMIZATION_PLAN.md)
+### Priority 11: KV cache persistent on NPU (from XDNA_OPTIMIZATION_PLAN.md) [TASK-P11]
 
 Pre-allocate KV cache BO at model load for max seq_len. Only DMA the new K/V
 row each token, not the full cache. NPU reads cache directly from device memory.
 
-Currently FlowKV re-uploads full K/V cache (256 × 128 bytes) every dispatch.
-Persistent KV cache would save ~1.7 ms/token (the memcpy+sync overhead).
+**[TASK-P11.1]** Currently FlowKV re-uploads full K/V cache (256 × 128 bytes) every dispatch.
+**[TASK-P11.2]** Persistent KV cache would save ~1.7 ms/token (the memcpy+sync overhead).
 
-### Priority 12: Quick wins (from XDNA_OPTIMIZATION_PLAN.md)
+### Priority 12: Quick wins (from XDNA_OPTIMIZATION_PLAN.md) [TASK-P12]
 
-1. **Weight BO lookup O(1)** — replace `unordered_map<void*, xrt::bo>` with
+1. **[TASK-P12.1]** **Weight BO lookup O(1)** — replace `unordered_map<void*, xrt::bo>` with
    `std::vector<xrt::bo>` indexed by layer+slot. O(1) instead of hash lookup.
 
-2. **Prefetch next layer** — while NPU processes layer N, CPU prepares BO args
+2. **[TASK-P12.2]** **Prefetch next layer** — while NPU processes layer N, CPU prepares BO args
    for layer N+1. Double-buffering: zero setup latency between layers.
 
-3. **Remove mutex on hot path** — `weights_mutex` lock on every dispatch.
+3. **[TASK-P12.3]** **Remove mutex on hot path** — `weights_mutex` lock on every dispatch.
    Decode is single-threaded — no contention. Use atomics or thread-local state.
 
-### Future work
+### Future work [TASK-PFUTURE]
 
-- **Multi-layer packing** — pack N consecutive transformer blocks into one ELF.
+- **[TASK-PFUTURE.1]** **Multi-layer packing** — pack N consecutive transformer blocks into one ELF.
   Reduces host dispatch by Nx. Requires major IRON compiler changes.
-- **Compile-time tile profiling** — benchmark tile_m/tile_k/tile_n combinations,
+- **[TASK-PFUTURE.2]** **Compile-time tile profiling** — benchmark tile_m/tile_k/tile_n combinations,
   build lookup table for optimal tiles per shape. Useful for new xclbin shapes.
-- **Multi-column RMS_NORM with cross-core reduction** — unblocks
+- **[TASK-PFUTURE.3]** **Multi-column RMS_NORM with cross-core reduction** — unblocks
   `XDNA_ENABLE_RMS_NORM=1` in chat-mode (currently breaks multi-query
   via RMS_NORM⊕QKV interference; see hypothesis #2 below). Needs a new
   IRON design with a two-pass or shared-memory reduction step so the
@@ -380,305 +370,9 @@ or attention computation with contaminated cache from previous queries.
 changes + kernel signature modification). See user's suggestion about
 kernel-side position_offset mask.
 
-### Diagnostic session (2026-05-21): reproduced multi-query garbage
+### Historical Diagnostics (2026-05-21)
 
-Build `b8953-50f826233` (head of `ggml-xdna`, three-invariant fix applied).
-
-**Setup:** Test driven from MSYS bash on Windows. Configuration matches
-`debug_flowkv.bat` (XDNA_ENABLE_FLOWKV_DECODE=1, num_cols=8 cache dir).
-
-**PowerShell stderr capture gotcha:** PS5.1 `2>` redirect silently dropped
-all native-process stderr from llama-cli.exe in our reproducer — stderr.log
-ended up 0 bytes despite the binary printing ~2.6 MB of diagnostics. Same
-binary under MSYS bash captured everything. **For FlowKV debugging on
-Windows, use `cmd /c` or `Start-Process -RedirectStandardError` — not PS `2>`.**
-
-**Tests:**
-| Mode | Result |
-|------|--------|
-| Single-query (`--single-turn`) | "The capital of France is Paris." ✅ 4.2 t/s, 224 POC dispatches |
-| Single-query + `GGML_SCHED_KV_OFFLOAD=1` | "The capital of France is Paris." ✅ 5.6 t/s |
-| Chat-mode (`-cnv`, stdin-piped 2 queries) | Q1 "Paris." ✅, Q2 "Hellofnfnf...fawfahav" ❌ |
-
-`GGML_SCHED_KV_OFFLOAD=1` did not break single-query — earlier suspicion ruled out.
-
-**stderr analysis (chat mode, 2.6 MB):**
-- 2 prefill rounds at lines 8 and 410 — **both happen before any M=1 decode**
-- 71 decode tokens (1136 layer-events / 16 layers), all M=1, all from line 746+
-- 2272 POC dispatches (32 per token = 16 layers × 2 num_cols=4 batches)
-- BO addresses constant across all dispatches (no DMA layout drift):
-  `bo_k=0x3F2D000  bo_v=0x3F4D000  bo_q=0x3F1C000  bo_out=0x3F1D000`
-- V-K delta = 131072 bytes (exactly `k_size`) — no driver metadata insertion
-- Both single-query and chat-mode use **identical** POC mechanics: same BO sizes,
-  group_ids, addresses. POC fires for every layer of every decode token in both.
-
-**Implication:** the transition from "correct" (~first 10 decodes = Q1 response)
-to "garbage" (~next 60 decodes = Q2 response) happens DURING one continuous
-M=1 decode stream. POC fires the same way for both halves — but data fed into
-the BOs (sourced via `flowkv_poc_*_perm->data` pointers) is correct for Q1's
-decodes and corrupted for Q2's.
-
-**Why the three-invariant fix doesn't help:**
-Inv #1 invalidates `flowkv_poc_valid` only when prefill (M>1) is detected in
-the first 30 nodes of a graph_compute. In chat-mode both prefills fire BEFORE
-any decode — so the chat-boundary between Q1's EOT and Q2's first decode token
-sees no prefill in any segment. POC pointers from Q1 leak across the boundary
-into Q2's decodes. Three-invariant Inv #2 (PERMUTE shape matching) is correct
-but irrelevant — POC stays valid through the boundary regardless.
-
-**Side finding:** Inv #2's V-PERMUTE matcher `nd->ne[0] > hd && nd->ne[1] == hd`
-silently fails when `seq_len ≤ 64` (early generation, short prompt) because
-V's `ne[0] = seq_len ≤ 64` doesn't satisfy `> hd`. POC silently disabled in
-that regime. Not the cause of current bug, but a hidden gating issue.
-
-**Next minimal fix tried — did NOT work:** Invalidate POC across cgraph
-segments where QKV is not refreshed. Tracked last cgraph pointer; invalidated
-when `cgraph_changed && !has_decode_qkv`. This dropped POC dispatch count
-to **zero** even on single-query test — confirming a3ef22209's reasoning
-that QKV and CONT really do live in different graph_compute calls. The
-CONT segment (no QKV in first 30 nodes) was being invalidated right before
-it could consume POC. Reverted.
-
-**actual_seq_len heuristic is NOT the bug.** With `XDNA_DEBUG=1`, the binary
-search returns expected values throughout chat (Q1: 43→49 token-by-token,
-jump to 61 at Q2 prefill boundary, Q2: 61→123). Monotonic increments confirm
-the K-zero scan is working correctly for this case (cache is contiguous,
-no gaps). `actual_seq_len` is correctly encoded into Q BO at angles[head_dim].
-
-**V11 MATH_DIAG (NPU vs CPU reference) is broken for num_cols>1.** The CPU
-reference at lines 11806-11807 hard-codes `k=bo_v[0]`, `v=bo_v[seq_len*row_bytes]`
-— that's the num_cols=1 layout. With num_cols=4, V actually lives at
-`aligned_v_region_offset_bytes` (~128 KB), not `seq_len*row_bytes` (32 KB).
-So MATH_DIAG produces FAIL for every dispatch regardless of correctness
-(including known-good Q1 dispatches that produce "Paris."). The diagnostic
-needs to be updated before it can isolate the bug. Until then, isolating
-"is the NPU computing right?" requires either:
-1. Fix V11 MATH_DIAG for num_cols=4 layout (read V from offset
-   `aligned_v_region_offset_bytes`, not `seq_len*row_bytes`).
-2. Force `num_cols=1` to use the MATH_DIAG's existing layout assumption.
-3. Probe kqv_out delta (NPU result minus CPU result-before-overwrite) and
-   compare across "correct" Q1 decodes and "garbage" Q2 decodes.
-
-**Other observations from this session:**
-- POC mechanics are byte-identical between known-good Q1 decodes and garbage
-  Q2 decodes: same BO addresses (`0x3F2D000` / `0x3F4D000` / `0x3F1C000` /
-  `0x3F1D000`), same sizes, same kernel group_ids, same V-K delta (131072).
-- Q2's first decoded token is often coherent ("Bonjour"/"Hello"/"It") before
-  text degenerates — suggesting attention is partially right then drifts.
-- Decode rate ~5.3-5.7 t/s during both correct (Q1) and garbage (Q2) phases
-  — no slowdown indicating the dispatch path is unchanged.
-
-### MATH_DIAG breakthrough (after num_cols>1 fix in commit 250eed45b)
-
-With the V offset fixed, V11 MATH_DIAG now produces meaningful numbers:
-- **max_abs stable at 0.0006-0.014 across ALL ~1120 dispatches** (Q1 correct
-  AND Q2 garbage). No jump at the chat boundary, no drift over time.
-- `FAIL` verdict only because rel_threshold=0.10 trips on near-zero values
-  (tiny abs error becomes large relative). Absolute error is well within
-  bf16 precision (~0.004).
-- **NPU output matches CPU reference computed over the same BO data.**
-
-**This sharply changes the diagnosis.** The NPU computes attention correctly
-in absolute terms. Both NPU and CPU agree on the result of the (Q, K, V)
-data sitting in the BOs. So either:
-
-1. **Host-side BO data is wrong** for Q2 — `flowkv_poc_*_perm->data` reads
-   stale/corrupt source data, both NPU and CPU agree because they read the
-   same (wrong) BO. This is consistent with the stale-Q-pointer or
-   memory-pool-reuse hypothesis. Next probe: dump first 32 bytes of Q/K/V
-   BO contents for first decode of Q1 vs first decode of Q2, compare with
-   a CPU pre-image scan of `cache_k`/`cache_v`/`Qcur` source tensors.
-
-2. **Downstream of POC is wrong** — POC correctly overwrites `kqv_out`,
-   but a later op reads from somewhere it shouldn't. Less likely since
-   single-query works with the same downstream sequence.
-
-POC mechanics, kernel computation, and `actual_seq_len` are now ruled out
-as direct causes. Focus shifts to **what `flowkv_poc_*_perm->data` actually
-points to** at the Q1→Q2 boundary.
-
-## Multi-query garbage — ROOT CAUSE: RMS_NORM ⊕ QKV interference (2026-05-21)
-
-After exhausting FlowKV-side hypotheses (NPU computation, actual_seq_len,
-POC pointer staleness, host data prep), did a bisect by toggling
-`XDNA_ENABLE_*` env vars while keeping FlowKV OFF:
-
-| Config | Q2 output |
-|---|---|
-| All NPU OFF | ✅ "Hello. Is there something I can help you with..." |
-| GEMV only | ✅ "Hello again. It's nice to meet you..." |
-| GEMV + SWIGLU + QKV | ✅ "It's nice to meet you. Is there something..." |
-| GEMV + SWIGLU + QKV + DECODE_BATCH | ✅ "Hello. How can I assist you today?" |
-| + TRANSFORMER_BLOCK (no RMS_NORM) | ✅ "Bonjour! How can I assist you today?" |
-| + RMS_NORM (= full original config minus FlowKV) | ❌ "Hellodies Hajivalido..." |
-| RMS_NORM **only** (everything else OFF) | ✅ "Hello again. What would you like..." |
-| **RMS_NORM + QKV** (clean pair) | ❌ "Bonjourïnaïdalectinearadvi..." |
-| RMS_NORM + GEMV | ✅ |
-| RMS_NORM + GEMV + SWIGLU | ✅ |
-
-**Verdict: Multi-query garbage is NOT a FlowKV bug.** It is an interference
-between `XDNA_ENABLE_RMS_NORM=1` and `XDNA_ENABLE_QKV=1`. Either one alone
-works correctly in chat-mode. Both together: Q1 ok, Q2 garbage.
-
-Possible mechanisms (untested):
-1. **Shared static state.** Both RMS_NORM and QKV cache kernel entries
-   and BOs via `static` containers in graph_compute. If the cache key
-   collides or one path invalidates the other's BO, Q2's dispatch reads
-   stale data.
-2. **XRT context column-set conflict.** RMS_NORM is single-column;
-   QKV uses 8 columns (`GGML_XDNA_NUM_COLS=8`). Switching between
-   contexts mid-graph may leak state if the previous context's columns
-   aren't fully released.
-3. **In-place output overwrite.** RMS_NORM writes to its output tensor;
-   QKV consumes that as `src[1]`. If RMS_NORM's NPU path doesn't fully
-   flush before QKV reads (DMA pipeline races), the first decode of Q2
-   may see partially-updated activation.
-
-### Hypothesis verdicts (2026-05-21, code-reading only — no runtime test)
-
-**#1 Shared static state: RULED OUT.**
-- Each operator owns its own context-level cache (`rms_norm_cache`,
-  `qkv_cache`, `swiglu_cache`, …) keyed by distinct cache_key strings.
-  Per-weight BO caches inside each entry are keyed by `data` pointer —
-  no cross-operator collision possible.
-- No shared static state in the hot-path dispatch functions.
-
-**#3 DMA pipeline race: RULED OUT.**
-- `ggml_backend_xdna_rms_norm` does `out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE)`
-  + CPU memcpy/convert to `node->data` BEFORE returning. Subsequent ops
-  see fresh data.
-- Between RMS_NORM and QKV the cgraph has a CPU MUL (gain weight),
-  which reads RMS_NORM's output and writes its own output entirely on
-  the host side. QKV reads `src1_input->data` from host memory, not
-  from any device BO of RMS_NORM. No NPU-host pipeline straddles the
-  data path.
-
-**#2 XRT column-set conflict: leading candidate.**
-- Precompiled kernel cache shows three column counts in use:
-  `flowkv: 4col`, `qkv/swiglu: 8col`, `rms_norm: 1c1ch (= 1col)`.
-- FlowKV (4col) and QKV (8col) coexist without garbage. The bug only
-  appears when the **1-col** RMS_NORM is added — and RMS_NORM is the
-  only 1-col operator in the pipeline.
-- Each kernel creates its own `xrt::hw_context(device, uuid)`, and the
-  XRT runtime time-multiplexes these contexts as different operators
-  dispatch. A 1-col hw_ctx and an 8-col hw_ctx must overlap on physical
-  column 0; if XRT's context-switch doesn't fully reset tile memory
-  state, the 1-col path can leave residue that corrupts the 8-col
-  path's read on the next dispatch — visible only on the second query
-  because the first query's tile state is still "clean enough".
-
-### Concrete next experiment
-
-Recompile RMS_NORM xclbin for 8 columns (the kernel logically uses 1
-core but allocates all 8 columns to match QKV's footprint, eliminating
-the 1-vs-8 switch). Requires running the Python compile pipeline
-(MLIR-AIE + Peano) to produce
-`rms_norm_S2048_bf16_8c1ch_t2048/combined.xclbin`, then updating
-`xdna_select_rms_norm_params()` to return `*out_cols = ctx->num_cols`
-instead of hard-coded 1.
-
-If 8-col RMS_NORM coexists with QKV in chat-mode without garbage →
-hypothesis #2 confirmed and the right long-term fix is to keep all
-operators at the same col count.
-
-If garbage still appears with 8-col RMS_NORM → root cause is elsewhere
-(maybe deeper in the kernel itself, IRON design, or XRT runtime).
-
-### Result of the 8-col compile attempt (2026-05-21): BLOCKED
-
-Tried changing `xdna_select_rms_norm_params()` to return
-`*out_cols = max_cols` (8) and triggering the auto-compile path. `compile.py`
-rejects the parameter set:
-
-```
-ValueError: size (2048) must be a multiple of
-  num_aie_columns * num_channels * tile_size (16384)
-```
-
-The RMS_NORM IRON design enforces `size = cols × channels × tile_size`.
-With `cols=8` and `size=2048`, the only legal tile_size is `2048 / 8 = 256`
-— which reintroduces the **per-tile mean bug** (each of the 8 cores
-computes mean over its own 256-element shard rather than the full 2048-
-element row; RMS_NORM by definition needs the full-row mean to normalize
-correctly).
-
-The existing kernel has no cross-core reduction step, so cannot operate
-correctly with tile_size < size. NPU_PLAN already noted this earlier
-under "❌ RMSNorm on NPU (tile_size=32 bug)" — fix would need a two-pass
-or shared-memory reduction design, which isn't a small change.
-
-**Conclusion on hypothesis #2 confirmation:** cannot validate by simply
-relabelling the existing kernel as 8-col. Confirming or refuting #2
-requires either:
-1. A new IRON design with multi-column reduction (substantial kernel work)
-2. Some runtime trick to force the XRT placer to put the 1-col
-   RMS_NORM kernel on a column that's not used by QKV (currently the
-   hw_context allocator's decision, not directly steerable from host)
-3. A 1-col kernel using `cols=1 channels=8 tile_size=256` — still 1-col
-   hw_context footprint, doesn't validate column-conflict hypothesis,
-   and would need cross-channel reduction anyway
-
-**Current status:** `XDNA_ENABLE_RMS_NORM=0` remains the only known
-workaround for chat-mode. Loss is ~0.4 t/s (5.9 → 5.5 single-query).
-
-Pre-fix verification (FlowKV OFF, RMS_NORM ON, QKV ON) gives garbage but
-~6 t/s, vs full config 5.9 t/s — so the regression isn't from FlowKV
-overhead, it's the RMS_NORM⊕QKV pair.
-
-The prior "FlowKV multi-query bug" framing was misleading: garbage was
-present even when FlowKV was disabled. NPU_PLAN earlier sections that
-claim "FlowKV works correctly for single queries" remain technically
-true, but the multi-query problem is unrelated to FlowKV.
-
-Next steps to localize the actual fault:
-- Compare BO addresses and cache keys touched by RMS_NORM vs QKV
-  between Q1 first decode and Q2 first decode. If any address collision
-  or cache-key reuse appears across operators, that is the smoking gun.
-- Audit `static` containers in `xdna_select_rms_norm_params`,
-  `get_or_load_rms_norm_kernel`, and `ggml_backend_xdna_mul_mat_qkv`
-  for shared state that is not partitioned per-operator.
-- Test with `GGML_XDNA_NUM_COLS=4` to rule out the column-set hypothesis.
-- Force a `XCL_BO_SYNC_BO_FROM_DEVICE` on RMS_NORM output before any
-  subsequent NPU op reads it, to rule out DMA pipeline races.
-
-Added a host-side probe that dumps 8 bf16 values from each of (Q_src, K_src,
-V_src, Q_bo, K_bo, V_bo) at positions 0, mid, and last_active, gated on
-`kv_h==0` so it fires once per layer per decode. Result for first decode
-of Q1 (actual_seq=43, layer 0) vs first decode of Q2 (actual_seq=61, layer 0):
-
-| Probe | Q1 first decode | Q2 first decode | Verdict |
-|-------|-----------------|-----------------|---------|
-| K_src@0 (BOS K, dim 0..7) | `31E2 2D0B 3146 ...` | `31E2 2D0B 3146 ...` | identical (correct — same BOS) |
-| V_src@0 (BOS V, seq 0..7) | `8A86 2E4E 2AE8 ...` | `8A86 2E4E 2AE8 ...` | identical (correct) |
-| K_bo@0 / V_bo@0 | identical to Q1 | identical to Q1 | host write preserved data |
-| K_src@last (pos 42 / pos 60) | legitimate non-zero | legitimate non-zero | new K written correctly by QKV |
-| V_src@last | nonzero then zeros (correct — only positions ≤actual_seq filled) | same pattern | layout consistent |
-
-Cache types: Q=F32, K=F16, V=F16. Strides: nb_K=[2,1024,128], nb_V=[2,1024,65536]
-(reflects cache_v underlying max_seq=512 from `-c 512`, viewed as 256-window).
-
-**Three host-data-prep hypotheses are now ruled out:**
-1. Stale Q pointer — Q_src looks fresh, Q_bo = bf16-truncate(Q_src) byte-exact
-2. Wrong K/V stride/offset — host write matches what's in the source tensor
-3. KV cache contamination — position 0 identical Q1/Q2 (correct BOS),
-   newly-appended positions are plausible non-zero values
-
-Combined with MATH_DIAG showing NPU output ≈ CPU reference within bf16
-precision: the kernel computes correct attention over correct inputs.
-**Yet the model produces garbage from Q2.**
-
-Possible remaining causes:
-- POC's `kqv_out->data` overwrite lands in the right address but downstream
-  CONT (CPU range) doesn't read from there at the chat boundary (state in
-  the segment delegation / cpu_run_start tracking)
-- Some other op in the cgraph between POC and the next layer reads from a
-  different buffer than POC wrote to
-- Sampling-stage state corruption (much less likely)
-
-Next probe: dump first 8 bf16 of `kqv_out->data` immediately AFTER POC
-finishes the scatter (line ~11797), AND inspect what downstream MUL_MAT
-(blk.N.attn_output) reads at its `src[1]` data pointer. If those two
-differ, the bug is in the buffer routing between POC and O_proj.
+All diagnostic sessions and investigations relating to multi-query garbage, `MATH_DIAG` breakthroughs, and `RMS_NORM ⊕ QKV` interference have been moved to the [Appendix: Debugging History Log](#appendix-debugging-history-log) at the end of the file.
 
 ## Testing
 
@@ -893,4 +587,324 @@ DRIVER:      C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_*
 PYTHON:      C:\Python313\python.exe
 MODEL:       models\llama-3.2-1b-instruct-BF16.gguf
 REPO:        https://github.com/Soket1/IRON-windows (branch: devel)
+```
+
+## Appendix: Debugging History Log
+
+This appendix consolidates all historical debugging logs, diagnostic sessions, and breakthroughs for reference.
+
+### Two bugs found and fixed (2026-05-19)
+
+#### Bug 1 (v10): K DMA routing
+IRON compiler reads K FIFO from arg0 (bo_k), not arg1 (bo_v) as assumed.
+Host wrote K only to bo_v[0] → tile saw zeros.
+Fix: mirror K data into bo_k via memcpy after writing to bo_v.
+
+#### Bug 2 (v11): CONT node skip
+`continue` skipped CONT node after FlowKV dispatch. MUL_MAT read from
+CONT output buffer (empty), not from kqv_out->data (CONT input).
+Fix: removed `continue`, let CONT execute in CPU range.
+
+Both bugs masked each other. After both fixes, model produces correct output.
+
+### Diagnostic session (2026-05-21): reproduced multi-query garbage
+
+Build `b8953-50f826233` (head of `ggml-xdna`, three-invariant fix applied).
+
+**Setup:** Test driven from MSYS bash on Windows. Configuration matches
+`debug_flowkv.bat` (XDNA_ENABLE_FLOWKV_DECODE=1, num_cols=8 cache dir).
+
+**PowerShell stderr capture gotcha:** PS5.1 `2>` redirect silently dropped
+all native-process stderr from llama-cli.exe in our reproducer — stderr.log
+ended up 0 bytes despite the binary printing ~2.6 MB of diagnostics. Same
+binary under MSYS bash captured everything. **For FlowKV debugging on
+Windows, use `cmd /c` or `Start-Process -RedirectStandardError` — not PS `2>`.**
+
+**Tests:**
+| Mode | Result |
+|------|--------|
+| Single-query (`--single-turn`) | "The capital of France is Paris." ✅ 4.2 t/s, 224 POC dispatches |
+| Single-query + `GGML_SCHED_KV_OFFLOAD=1` | "The capital of France is Paris." ✅ 5.6 t/s |
+| Chat-mode (`-cnv`, stdin-piped 2 queries) | Q1 "Paris." ✅, Q2 "Hellofnfnf...fawfahav" ❌ |
+
+`GGML_SCHED_KV_OFFLOAD=1` did not break single-query — earlier suspicion ruled out.
+
+**stderr analysis (chat mode, 2.6 MB):**
+- 2 prefill rounds at lines 8 and 410 — **both happen before any M=1 decode**
+- 71 decode tokens (1136 layer-events / 16 layers), all M=1, all from line 746+
+- 2272 POC dispatches (32 per token = 16 layers × 2 num_cols=4 batches)
+- BO addresses constant across all dispatches (no DMA layout drift):
+  `bo_k=0x3F2D000  bo_v=0x3F4D000  bo_q=0x3F1C000  bo_out=0x3F1D000`
+- V-K delta = 131072 bytes (exactly `k_size`) — no driver metadata insertion
+- Both single-query and chat-mode use **identical** POC mechanics: same BO sizes,
+  group_ids, addresses. POC fires for every layer of every decode token in both.
+
+**Implication:** the transition from "correct" (~first 10 decodes = Q1 response)
+to "garbage" (~next 60 decodes = Q2 response) happens DURING one continuous
+M=1 decode stream. POC fires the same way for both halves — but data fed into
+the BOs (sourced via `flowkv_poc_*_perm->data` pointers) is correct for Q1's
+decodes and corrupted for Q2's.
+
+**Why the three-invariant fix doesn't help:**
+Inv #1 invalidates `flowkv_poc_valid` only when prefill (M>1) is detected in
+the first 30 nodes of a graph_compute. In chat-mode both prefills fire BEFORE
+any decode — so the chat-boundary between Q1's EOT and Q2's first decode token
+sees no prefill in any segment. POC pointers from Q1 leak across the boundary
+into Q2's decodes. Three-invariant Inv #2 (PERMUTE shape matching) is correct
+but irrelevant — POC stays valid through the boundary regardless.
+
+**Side finding:** Inv #2's V-PERMUTE matcher `nd->ne[0] > hd && nd->ne[1] == hd`
+silently fails when `seq_len ≤ 64` (early generation, short prompt) because
+V's `ne[0] = seq_len ≤ 64` doesn't satisfy `> hd`. POC silently disabled in
+that regime. Not the cause of current bug, but a hidden gating issue.
+
+**Next minimal fix tried — did NOT work:** Invalidate POC across cgraph
+segments where QKV is not refreshed. Tracked last cgraph pointer; invalidated
+when `cgraph_changed && !has_decode_qkv`. This dropped POC dispatch count
+to **zero** even on single-query test — confirming a3ef22209's reasoning
+that QKV and CONT really do live in different graph_compute calls. The
+CONT segment (no QKV in first 30 nodes) was being invalidated right before
+it could consume POC. Reverted.
+
+**actual_seq_len heuristic is NOT the bug.** With `XDNA_DEBUG=1`, the binary
+search returns expected values throughout chat (Q1: 43→49 token-by-token,
+jump to 61 at Q2 prefill boundary, Q2: 61→123). Monotonic increments confirm
+the K-zero scan is working correctly for this case (cache is contiguous,
+no gaps). `actual_seq_len` is correctly encoded into Q BO at angles[head_dim].
+
+**V11 MATH_DIAG (NPU vs CPU reference) is broken for num_cols>1.** The CPU
+reference at lines 11806-11807 hard-codes `k=bo_v[0]`, `v=bo_v[seq_len*row_bytes]`
+— that's the num_cols=1 layout. With num_cols=4, V actually lives at
+`aligned_v_region_offset_bytes` (~128 KB), not `seq_len*row_bytes` (32 KB).
+So MATH_DIAG produces FAIL for every dispatch regardless of correctness
+(including known-good Q1 dispatches that produce "Paris."). The diagnostic
+needs to be updated before it can isolate the bug. Until then, isolating
+"is the NPU computing right?" requires either:
+1. Fix V11 MATH_DIAG for num_cols=4 layout (read V from offset
+   `aligned_v_region_offset_bytes`, not `seq_len*row_bytes`).
+2. Force `num_cols=1` to use the MATH_DIAG's existing layout assumption.
+3. Probe kqv_out delta (NPU result minus CPU result-before-overwrite) and
+   compare across "correct" Q1 decodes and "garbage" Q2 decodes.
+
+**Other observations from this session:**
+- POC mechanics are byte-identical between known-good Q1 decodes and garbage
+  Q2 decodes: same BO addresses (`0x3F2D000` / `0x3F4D000` / `0x3F1C000` /
+  `0x3F1D000`), same sizes, same kernel group_ids, same V-K delta (131072).
+- Q2's first decoded token is often coherent ("Bonjour"/"Hello"/"It") before
+  text degenerates — suggesting attention is partially right then drifts.
+- Decode rate ~5.3-5.7 t/s during both correct (Q1) and garbage (Q2) phases
+  — no slowdown indicating the dispatch path is unchanged.
+
+### MATH_DIAG breakthrough (after num_cols>1 fix in commit 250eed45b)
+
+With the V offset fixed, V11 MATH_DIAG now produces meaningful numbers:
+- **max_abs stable at 0.0006-0.014 across ALL ~1120 dispatches** (Q1 correct
+  AND Q2 garbage). No jump at the chat boundary, no drift over time.
+- `FAIL` verdict only because rel_threshold=0.10 trips on near-zero values
+  (tiny abs error becomes large relative). Absolute error is well within
+  bf16 precision (~0.004).
+- **NPU output matches CPU reference computed over the same BO data.**
+
+**This sharply changes the diagnosis.** The NPU computes attention correctly
+in absolute terms. Both NPU and CPU agree on the result of the (Q, K, V)
+data sitting in the BOs. So either:
+
+1. **Host-side BO data is wrong** for Q2 — `flowkv_poc_*_perm->data` reads
+   stale/corrupt source data, both NPU and CPU agree because they read the
+   same (wrong) BO. This is consistent with the stale-Q-pointer or
+   memory-pool-reuse hypothesis. Next probe: dump first 32 bytes of Q/K/V
+   BO contents for first decode of Q1 vs first decode of Q2, compare with
+   a CPU pre-image scan of `cache_k`/`cache_v`/`Qcur` source tensors.
+
+2. **Downstream of POC is wrong** — POC correctly overwrites `kqv_out`,
+   but a later op reads from somewhere it shouldn't. Less likely since
+   single-query works with the same downstream sequence.
+
+POC mechanics, kernel computation, and `actual_seq_len` are now ruled out
+as direct causes. Focus shifts to **what `flowkv_poc_*_perm->data` actually
+points to** at the Q1→Q2 boundary.
+
+### Multi-query garbage — ROOT CAUSE: RMS_NORM ⊕ QKV interference (2026-05-21)
+
+After exhausting FlowKV-side hypotheses (NPU computation, actual_seq_len,
+POC pointer staleness, host data prep), did a bisect by toggling
+`XDNA_ENABLE_*` env vars while keeping FlowKV OFF:
+
+| Config | Q2 output |
+|---|---|
+| All NPU OFF | ✅ "Hello. Is there something I can help you with..." |
+| GEMV only | ✅ "Hello again. It's nice to meet you..." |
+| GEMV + SWIGLU + QKV | ✅ "It's nice to meet you. Is there something..." |
+| GEMV + SWIGLU + QKV + DECODE_BATCH | ✅ "Hello. How can I assist you today?" |
+| + TRANSFORMER_BLOCK (no RMS_NORM) | ✅ "Bonjour! How can I assist you today?" |
+| + RMS_NORM (= full original config minus FlowKV) | ❌ "Hellodies Hajivalido..." |
+| RMS_NORM **only** (everything else OFF) | ✅ "Hello again. What would you like..." |
+| **RMS_NORM + QKV** (clean pair) | ❌ "Bonjourïnaïdalectinearadvi..." |
+| RMS_NORM + GEMV | ✅ |
+| RMS_NORM + GEMV + SWIGLU | ✅ |
+
+**Verdict: Multi-query garbage is NOT a FlowKV bug.** It is an interference
+between `XDNA_ENABLE_RMS_NORM=1` and `XDNA_ENABLE_QKV=1`. Either one alone
+works correctly in chat-mode. Both together: Q1 ok, Q2 garbage.
+
+Possible mechanisms (untested):
+1. **Shared static state.** Both RMS_NORM and QKV cache kernel entries
+   and BOs via `static` containers in graph_compute. If the cache key
+   collides or one path invalidates the other's BO, Q2's dispatch reads
+   stale data.
+2. **XRT context column-set conflict.** RMS_NORM is single-column;
+   QKV uses 8 columns (`GGML_XDNA_NUM_COLS=8`). Switching between
+   contexts mid-graph may leak state if the previous context's columns
+   aren't fully released.
+3. **In-place output overwrite.** RMS_NORM writes to its output tensor;
+   QKV consumes that as `src[1]`. If RMS_NORM's NPU path doesn't fully
+   flush before QKV reads (DMA pipeline races), the first decode of Q2
+   may see partially-updated activation.
+
+#### Hypothesis verdicts (2026-05-21, code-reading only — no runtime test)
+
+**#1 Shared static state: RULED OUT.**
+- Each operator owns its own context-level cache (`rms_norm_cache`,
+  `qkv_cache`, `swiglu_cache`, …) keyed by distinct cache_key strings.
+  Per-weight BO caches inside each entry are keyed by `data` pointer —
+  no cross-operator collision possible.
+- No shared static state in the hot-path dispatch functions.
+
+**#3 DMA pipeline race: RULED OUT.**
+- `ggml_backend_xdna_rms_norm` does `out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE)`
+  + CPU memcpy/convert to `node->data` BEFORE returning. Subsequent ops
+  see fresh data.
+- Between RMS_NORM and QKV the cgraph has a CPU MUL (gain weight),
+  which reads RMS_NORM's output and writes its own output entirely on
+  the host side. QKV reads `src1_input->data` from host memory, not
+  from any device BO of RMS_NORM. No NPU-host pipeline straddles the
+  data path.
+
+**#2 XRT column-set conflict: leading candidate.**
+- Precompiled kernel cache shows three column counts in use:
+  `flowkv: 4col`, `qkv/swiglu: 8col`, `rms_norm: 1c1ch (= 1col)`.
+- FlowKV (4col) and QKV (8col) coexist without garbage. The bug only
+  appears when the **1-col** RMS_NORM is added — and RMS_NORM is the
+  only 1-col operator in the pipeline.
+- Each kernel creates its own `xrt::hw_context(device, uuid)`, and the
+  XRT runtime time-multiplexes these contexts as different operators
+  dispatch. A 1-col hw_ctx and an 8-col hw_ctx must overlap on physical
+  column 0; if XRT's context-switch doesn't fully reset tile memory
+  state, the 1-col path can leave residue that corrupts the 8-col
+  path's read on the next dispatch — visible only on the second query
+  because the first query's tile state is still "clean enough".
+
+#### Concrete next experiment
+
+Recompile RMS_NORM xclbin for 8 columns (the kernel logically uses 1
+core but allocates all 8 columns to match QKV's footprint, eliminating
+the 1-vs-8 switch). Requires running the Python compile pipeline
+(MLIR-AIE + Peano) to produce
+`rms_norm_S2048_bf16_8c1ch_t2048/combined.xclbin`, then updating
+`xdna_select_rms_norm_params()` to return `*out_cols = ctx->num_cols`
+instead of hard-coded 1.
+
+If 8-col RMS_NORM coexists with QKV in chat-mode without garbage →
+hypothesis #2 confirmed and the right long-term fix is to keep all
+operators at the same col count.
+
+If garbage still appears with 8-col RMS_NORM → root cause is elsewhere
+(maybe deeper in the kernel itself, IRON design, or XRT runtime).
+
+#### Result of the 8-col compile attempt (2026-05-21): BLOCKED
+
+Tried changing `xdna_select_rms_norm_params()` to return
+`*out_cols = max_cols` (8) and triggering the auto-compile path. `compile.py`
+rejects the parameter set:
+
+```
+ValueError: size (2048) must be a multiple of
+  num_aie_columns * num_channels * tile_size (16384)
+```
+
+The RMS_NORM IRON design enforces `size = cols × channels × tile_size`.
+With `cols=8` and `size=2048`, the only legal tile_size is `2048 / 8 = 256`
+— which reintroduces the **per-tile mean bug** (each of the 8 cores
+computes mean over its own 256-element shard rather than the full 2048-
+element row; RMS_NORM by definition needs the full-row mean to normalize
+correctly).
+
+The existing kernel has no cross-core reduction step, so cannot operate
+correctly with tile_size < size. NPU_PLAN already noted this earlier
+under "❌ RMSNorm on NPU (tile_size=32 bug)" — fix would need a two-pass
+or shared-memory reduction design, which isn't a small change.
+
+**Conclusion on hypothesis #2 confirmation:** cannot validate by simply
+reformatting the existing kernel as 8-col. Confirming or refuting #2
+requires either:
+1. A new IRON design with multi-column reduction (substantial kernel work)
+2. Some runtime trick to force the XRT placer to put the 1-col
+   RMS_NORM kernel on a column that's not used by QKV (currently the
+   hw_context allocator's decision, not directly steerable from host)
+3. A 1-col kernel using `cols=1 channels=8 tile_size=256` — still 1-col
+   hw_context footprint, doesn't validate column-conflict hypothesis,
+   and would need cross-channel reduction anyway
+
+**Current status:** `XDNA_ENABLE_RMS_NORM=0` remains the only known
+workaround for chat-mode. Loss is ~0.4 t/s (5.9 → 5.5 single-query).
+
+Pre-fix verification (FlowKV OFF, RMS_NORM ON, QKV ON) gives garbage but
+~6 t/s, vs full config 5.9 t/s — so the regression isn't from FlowKV
+overhead, it's the RMS_NORM⊕QKV pair.
+
+The prior "FlowKV multi-query bug" framing was misleading: garbage was
+present even when FlowKV was disabled. NPU_PLAN earlier sections that
+claim "FlowKV works correctly for single queries" remain technically
+true, but the multi-query problem is unrelated to FlowKV.
+
+Next steps to localize the actual fault:
+- Compare BO addresses and cache keys touched by RMS_NORM vs QKV
+  between Q1 first decode and Q2 first decode. If any address collision
+  or cache-key reuse appears across operators, that is the smoking gun.
+- Audit `static` containers in `xdna_select_rms_norm_params`,
+  `get_or_load_rms_norm_kernel`, and `ggml_backend_xdna_mul_mat_qkv`
+  for shared state that is not partitioned per-operator.
+- Test with `GGML_XDNA_NUM_COLS=4` to rule out the column-set hypothesis.
+- Force a `XCL_BO_SYNC_BO_FROM_DEVICE` on RMS_NORM output before any
+  subsequent NPU op reads it, to rule out DMA pipeline races.
+
+Added a host-side probe that dumps 8 bf16 values from each of (Q_src, K_src,
+V_src, Q_bo, K_bo, V_bo) at positions 0, mid, and last_active, gated on
+`kv_h==0` so it fires once per layer per decode. Result for first decode
+of Q1 (actual_seq=43, layer 0) vs first decode of Q2 (actual_seq=61, layer 0):
+
+| Probe | Q1 first decode | Q2 first decode | Verdict |
+|-------|-----------------|-----------------|---------|
+| K_src@0 (BOS K, dim 0..7) | `31E2 2D0B 3146 ...` | `31E2 2D0B 3146 ...` | identical (correct — same BOS) |
+| V_src@0 (BOS V, seq 0..7) | `8A86 2E4E 2AE8 ...` | `8A86 2E4E 2AE8 ...` | identical (correct) |
+| K_bo@0 / V_bo@0 | identical to Q1 | identical to Q1 | host write preserved data |
+| K_src@last (pos 42 / pos 60) | legitimate non-zero | legitimate non-zero | new K written correctly by QKV |
+| V_src@last | nonzero then zeros (correct — only positions ≤actual_seq filled) | same pattern | layout consistent |
+
+Cache types: Q=F32, K=F16, V=F16. Strides: nb_K=[2,1024,128], nb_V=[2,1024,65536]
+(reflects cache_v underlying max_seq=512 from `-c 512`, viewed as 256-window).
+
+**Three host-data-prep hypotheses are now ruled out:**
+1. Stale Q pointer — Q_src looks fresh, Q_bo = bf16-truncate(Q_src) byte-exact
+2. Wrong K/V stride/offset — host write matches what's in the source tensor
+3. KV cache contamination — position 0 identical Q1/Q2 (correct BOS),
+   newly-appended positions are plausible non-zero values
+
+Combined with MATH_DIAG showing NPU output ≈ CPU reference within bf16
+precision: the kernel computes correct attention over correct inputs.
+**Yet the model produces garbage from Q2.**
+
+Possible remaining causes:
+- POC's `kqv_out->data` overwrite lands in the right address but downstream
+  CONT (CPU range) doesn't read from there at the chat boundary (state in
+  the segment delegation / cpu_run_start tracking)
+- Some other op in the cgraph between POC and the next layer reads from a
+  different buffer than POC wrote to
+- Sampling-stage state corruption (much less likely)
+
+Next probe: dump first 8 bf16 of `kqv_out->data` immediately AFTER POC
+finishes the scatter (line ~11797), AND inspect what downstream MUL_MAT
+(blk.N.attn_output) reads at its `src[1]` data pointer. If those two
+differ, the bug is in the buffer routing between POC and O_proj.
+```
 ```
