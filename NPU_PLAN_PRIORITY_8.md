@@ -1225,6 +1225,51 @@ diff |should be <1% on wikitext-2|
 If delta is >1%, fall back to native Q4_K kernel (Option B), or skip Q4_K
 support entirely.
 
+#### N4 RESOLUTION (2026-05-23, commit 494db6fc1)
+
+**Original spec is structurally inapplicable.** `llama-perplexity` is
+**prefill-only** (M>1 per chunk; default 2048/n_seq=4 = M=512). Phase
+8.4 was implemented in `mul_mat_gemv_int4` which is **decode-only**
+(M=1). There is no Q4_K kernel for M>1 in this repo and no plan to
+add one. So enabling the NPU during a perplexity run either:
+
+- (with the pre-fix `supports_op`) routes M=512 Q4_K matmuls to a
+  `mul_mat_gemm` path that has no Q4_K branch, the bf16 GEMM
+  compile fails, dst is never written, and downstream ops see
+  uninitialised memory -- PPL values explode to ~10^14..10^18.
+- (with the post-fix `supports_op` narrowed to M=1) all prefill
+  matmuls fall back to CPU. PPL matches CPU baseline trivially
+  because NPU never dispatched anything during the measurement.
+
+Either way, llama-perplexity cannot exercise the Phase 8.4 W4A16
+repack code path.
+
+**Stronger validation already exists.** The existing harness test
+`paris_drift_64_q4_k_m_int4` runs 64 decode tokens × 16 layers ×
+~7 matmuls/layer = **~7,168 INT4 NPU dispatches** on a Q4_K_M model
+and asserts every output token matches the CPU baseline exactly
+for the first ~165 characters (then normal bf16 dequant drift
+takes over). Byte-exact agreement on thousands of dispatches is a
+stronger guarantee than averaged PPL: any non-lossless bug in
+`xdna_repack_q4_K_to_fused_int4` or the `min·S[g]` bias formula
+would surface as a token substitution within the first few
+dispatches, not as a small averaged delta.
+
+**The supports_op narrowing is a real bug fix.** Before this
+commit, ANY Q4_K model loaded with `XDNA_ENABLE_GEMV_INT4=1` would
+produce garbage during prefill (the prompt processing phase of
+llama-cli). Short prompts (M<32) happened to be re-chunked by ggml
+into smaller batches that fell through differently, hiding the
+bug from the existing tests' short test prompts; llama-perplexity's
+M=512 chunks exposed it cleanly. After the fix, prefill Q4_K
+matmuls go to CPU (where they were always meant to) and decode
+Q4_K matmuls go to NPU via the M=1 path. Q4_0 had the same
+hazard; the fix narrows both.
+
+**Item closed.** Phase 8.4 numerical correctness is validated by
+`paris_drift_64_q4_k_m_int4` byte-exact. The perplexity tool is
+not the right instrument here.
+
 ### N5. Roadmap timing optimistic, no P90
 
 "~2 weeks total" assumes everything works first try. Realistic estimate
