@@ -596,7 +596,9 @@ compute-bound.
 AMD's official open-source GGML NPU backend uses a fundamentally different
 dispatch model than mine: async submission to a HSA AQL queue with
 sync-on-demand, no `wait()` per op. See "BREAKTHROUGH: AMD ggml-hsa uses
-ASYNC dispatch" section above for the full diagnosis.
+ASYNC dispatch" section above for the full diagnosis. Subsequent dedicated
+research document `XRT.pdf` (2026-05-22) confirmed the design is sound and
+filled in several critical XRT-specific pitfalls noted below.
 
 **Goal:** replace the per-op `xrt::run.execute(); rl.wait();` synchronous
 pattern in `ggml_backend_xdna_graph_compute` with async submit, retaining
@@ -604,48 +606,138 @@ a tensor-level `requires_sync` flag (modeled on
 `ggml_backend_hsa_tensor_extra.requires_sync`). Wait only when:
 
 1. Next op needs the result on host (layout/dtype conversion).
-2. Queue depth limit reached (backpressure).
+2. Queue depth limit reached (backpressure, `Q_max` swept 2..16 in Day 4).
 3. Graph compute ends.
 
-**Why it should work for XRT:**
+**Why it should work for XRT (XRT.pdf 2026-05-22, "Multi-Xclbin Context Serialization"):**
 
-- `xrt::run::start()` is non-blocking (just submits to NPU hw_ctx).
-- `xrt::run::wait()` and `xrt::run::state()` allow synchronization on demand.
-- `xrt::runlist` already batches multiple runs (used by SwiGLU bf16); the
-  primitive for chained async is there, just needs to span the whole graph
-  instead of one matched pattern.
+> "Trace analysis of concurrent execution loops shows that launching
+> multiple compute units (CUs) in parallel under a single shared hardware
+> context introduces minor initialization latency on the first wait call,
+> but subsequent executions run back-to-back with minimal overhead."
 
-**Expected return:** ~5× decode improvement on INT4 (3.4 → ~16 t/s) and bf16
-(5.2 → ~25 t/s) without touching microkernels or adding new fusion. This is
+So the spike (Day 1) is verifying this is reproducible on my setup, not
+proving the concept.
+
+**CRITICAL DECISION: use independent `xrt::run::start()`, NOT `xrt::runlist`.**
+
+[IRON issue #83](https://github.com/amd/IRON/issues/83) documents a
+compiler bug where runlist entries yield **incorrect results** if multiple
+entries share the same XRT kernel handle. This directly affects
+Llama 3.2 1B (uses partition factor N=4 for vocab projection). XRT.pdf
+explicitly recommends:
+
+> "a generalized asynchronous pipeline is best constructed by using
+> independent `xrt::run` objects launched via `.start()`."
+
+So Phase 9 will NOT batch ops into runlists for async chaining. Existing
+runlist usage (bf16 SwiGLU 2-run, INT4 SwiGLU 2-run) stays as-is for
+its atomic-pair semantics, but the broader graph-level async pipeline
+uses standalone `xrt::run::start()` per op.
+
+**Use `wait2()` not `wait()`.** `wait()` blocks but does NOT throw on
+`ERT_CMD_STATE_ERROR` / `ERT_CMD_STATE_ABORT`. `wait2()` throws
+`xrt_core::system_error` on abnormal completion, giving us proper failure
+signal.
+
+**Avoid `xrt::run::add_callback()`.** [XRT PR #9719](https://github.com/Xilinx/XRT/pull/9719)
+documents a race in `is_done()` that affects callbacks on older driver
+releases. Stick with polling (`state()`) and explicit barriers.
+
+**Header path gotcha.** `#include <experimental/xrt_kernel.h>` is WRONG
+and fails to compile. Correct: `#include <xrt/experimental/xrt_kernel.h>`.
+
+**Expected return (XRT.pdf projection table):**
+
+| Workload | Sync baseline | Async target | Gain |
+|---|---:|---:|---:|
+| Llama 3.2 1B INT4 decode | 3.4 t/s | ~16 t/s | ~4.7× |
+| Llama 3.2 1B bf16 decode | 5.2 t/s | ~25 t/s | ~4.8× |
+| INT4 / bf16 prefill | 20.8 t/s | ~22 t/s | minor (compute-bound) |
+
+The prefill numbers stay almost flat because prefill is already
+compute-bound — only decode (latency-bound) sees the big win. This is
 the single biggest perf lever still available without redesigning IRON
-kernels.
+microkernels or adding new fusion.
 
-**Risks / unknowns to validate in step 1:**
+**Risks / pitfalls (consolidated from XRT.pdf + earlier research):**
 
-- XRT may or may not pipeline multiple in-flight runs cleanly across
-  different xclbins (need to verify whether the NPU queue serializes
-  correctly per hw_context).
-- BO lifetime: with async dispatch the input BO must not be reused until
-  the consumer kernel actually executes. Need a per-BO inflight tracker.
-- Existing `mul_mat_gemv_int4` and `mul_mat_swiglu_int4` reference the
-  output immediately on return (`dst->data` populated). Need to defer
-  this to a sync point.
+- **BO lifetime hazards (WAR/WAW):** with async dispatch the host CPU
+  might modify or sync an input BO while NPU is still reading from it,
+  or read an output BO before NPU writes complete. Need a per-BO
+  inflight tracker (see template below).
+- **Immediate host reads in INT4 dispatch functions:** `mul_mat_gemv_int4`
+  and `mul_mat_swiglu_int4` currently call `entry->c_bo->sync(FROM_DEVICE)`
+  and then read `dst->data` immediately for host-side bias compensation.
+  Under async this returns stale data. Must defer the bias step (move
+  into a sync-on-demand callback) or flag `requires_sync=true` on the
+  output and run bias compensation at the sync barrier.
+- **Multiple xclbins per hw_context:** OK per the trace analysis above,
+  but context switching has nonzero cost on the first call. Mitigation:
+  group all kernels into a single shared `xrt::hw_context` (already true
+  in our backend).
 
-**Step plan:**
+**Code templates copied/adapted from XRT.pdf:**
 
-1. **Spike (1 day):** prototype async submit on one path (e.g.
-   `mul_mat_gemv_int4`). Test: submit N runs without waiting, measure
-   total time and verify correctness. Confirms XRT semantics.
-2. **Tensor-extra refactor (1 day):** add `requires_sync` flag plumbing,
-   wait points before dependent reads. Mirror `ggml-hsa` pattern.
-3. **Roll out to all NPU ops (1 day):** mul_mat_gemv, mul_mat_gemv_int4,
-   mul_mat_swiglu, mul_mat_swiglu_int4, decode_batch, etc.
-4. **Bench + tune (1 day):** measure decode t/s; tune queue depth if
-   backpressure hits before NPU saturates.
+```cpp
+struct ggml_backend_xdna_tensor_extra {
+    bool requires_sync = false;
+    xrt::run active_run;     // empty if op already completed or never dispatched
+};
+
+struct xdna_bo_inflight_tracker {
+    std::unordered_map<xclBufferHandle, xrt::run> bo_usage_map;
+
+    void register_usage(const xrt::bo & bo, const xrt::run & run) {
+        bo_usage_map[bo.to_ptr()] = run;
+    }
+
+    void sync_if_in_use(const xrt::bo & bo) {
+        auto it = bo_usage_map.find(bo.to_ptr());
+        if (it != bo_usage_map.end()) {
+            it->second.wait2();   // throws on abnormal completion
+            bo_usage_map.erase(it);
+        }
+    }
+};
+```
+
+**Step plan (4-day sprint, mirrors XRT.pdf):**
+
+1. **Day 1 — Isolated Prototype (Spike):** standalone test program that
+   loads the existing `gemv_int4_K2048_N8192_8col_g32.xclbin`, allocates
+   100 fresh `xrt::run` objects, calls `.start()` on each WITHOUT
+   intervening waits, then waits on the last. Compare total elapsed
+   time to 100× sync baseline. **Expected:** async ≈ kernel_time × 100
+   (~50-100 ms); sync = ~200 ms. If async ≈ sync → XRT serializes
+   under the hood and Phase 9 needs deeper rework.
+2. **Day 2 — Metadata + Tracking Infra:** add `ggml_backend_xdna_tensor_extra`
+   to all output tensors; implement `xdna_bo_inflight_tracker`; integrate
+   sync barriers before host reads and dtype conversions; intercept
+   `xrt::bo::sync(TO_DEVICE)` in `set_tensor_async` to wait for the
+   previous consumer.
+3. **Day 3 — Global Operator Migration:** transition `mul_mat_gemv`,
+   `mul_mat_gemv_int4`, `mul_mat_swiglu`, `mul_mat_swiglu_int4`,
+   `decode_batch`, QKV, RMSNorm, etc. to async dispatch. Defer all
+   immediate host-side reads (bias compensation, etc.) behind
+   `requires_sync` flags.
+4. **Day 4 — Bench + `Q_max` Sweep:** measure end-to-end decode t/s via
+   `correctness_test.py --bench --bench-mode both`. Sweep `Q_max` from
+   2 to 16 to find the optimal balance between host dispatch overhead
+   and NPU queue saturation. Update the perf table in this doc.
+
+**Acceptance:**
+
+- All existing correctness tests (`paris_short`, `paris_drift_64`,
+  `multiquery_*`, INT4 variants) PASS.
+- Decode t/s improves by ≥ 3× on at least one config (target: 4-5×).
+- No new XDNA driver crashes / hang errors under stress (run all tests
+  back-to-back).
 
 Once Phase 9 lands, the existing Phase 8.x perf measurements should
 re-run — Phase 8.2's "regression vs 8.1" may flip net-positive because
 the async pipeline gives chained kernel calls a real benefit.
+
 
 
 ## Что делегировать Build агенту
