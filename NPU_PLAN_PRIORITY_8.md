@@ -1148,3 +1148,52 @@ Bias compensation: `bias[i] = sum_g (eff_min[i,g] × S[g])`.
 
 Tests: paris_short_q4_k_m (byte-exact), paris_drift_64_q4_k_m_int4
 (165 chars exact then normal bf16 drift). Commit a9819e096.
+
+### Non-Llama Architecture Compatibility (2026-05-22, Qwen3.5-9B test)
+
+Tested Qwen3.5-9B-Q4_0 (5.4 GB Q4_0 model) via `correctness_test.py
+--bench --model qwen` and dedicated tests `qwen35_ml_npu_full` /
+`qwen35_ml_npu_gemv_only`.
+
+**Qwen3.5-9B architecture (from GGUF metadata):**
+- arch: `qwen35`
+- block_count: 32 (vs 16 Llama 1B)
+- embedding: 4096 (vs 2048)
+- ffn: 12288 (vs 8192)
+- heads: 16 / heads_kv: 4 (GQA 4:1, same ratio as Llama)
+- **head_dim: 256** (vs 64 Llama)
+- rope: M-RoPE [11, 11, 10, 0] (multidimensional, vs standard 1D)
+- attention: SWA with full_attention_interval=4 (vs full every layer)
+
+**Blocker: `head_dim != 64` hardcoded in 9 matchers.**
+Lines in ggml-xdna.cpp: 5546, 7184, 7551, 8855, 9030, 10097, 10166,
+10297, plus `const int64_t hd = 64;` at 11447. FlowKV decode,
+attention_prefill, decode_batch, QKV fusion, transformer_block — all
+reject head_dim != 64 and fall back to CPU.
+
+**Bench results** (n_predict=64, --temp 0, median of 2):
+
+| Config | decode t/s | Correctness |
+|---|---:|---|
+| Qwen3.5-9B CPU Q4_0 | **3.2** | ✅ |
+| Qwen3.5-9B NPU INT4 full | 1.6 | ❌ garbage (mixed CN/EN tokens) |
+| Qwen3.5-9B NPU INT4 GEMV-only | **3.5** | ✅ 737 chars exact match vs CPU |
+
+**Why "NPU full" produces garbage even with attention rejected:**
+Attention matchers reject head_dim≠64, but other NPU paths
+(transformer_block, decode_batch) may still partially dispatch shapes
+without an explicit head_dim guard, OR the INT4 compile fails for
+unfamiliar shapes (K=12288 N=4096 is Qwen ffn_down — observed
+"INT4 GEMV compile failed for K=12288 N=4096" repeatedly).
+
+**Workaround: `npu_int4_gemv_only` preset.** Disables every
+architecture-specific NPU op, keeps only the pure-matmul INT4 GEMV
+path. Architecture-agnostic; works on Qwen / Mistral / Gemma /
+anything with Q4_0 weights and shape-compatible matmuls.
+
+**Future Phase 8.5 (not yet planned):** Universal `head_dim` parameter
+for FlowKV/attention paths. Today's hardcoded 64 makes the NPU stack
+Llama-1B-specific; lifting that to a runtime/compile-time tunable
+opens up Llama-3.1-8B, Llama-3.2-3B, Qwen, Mistral, Gemma, etc.
+Estimated: 3-5 days of FlowKV kernel changes + matcher updates.
+
