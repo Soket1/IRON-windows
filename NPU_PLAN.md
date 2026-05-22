@@ -1,8 +1,41 @@
 # IRON-windows NPU Optimization Plan
 
-> Last updated: 2026-05-21
+> Last updated: 2026-05-22
 
-## Current Status: **5.5–5.9 t/s on STX NPU2 depending on chat-mode**
+## Current Status: **5.7 t/s INT4 / 5.3 t/s bf16 on STX NPU2** (Llama 3.2 1B)
+
+After Priority 8 INT4 work (v2 kernel from amd/IRON PR #101 + Q4_K
+support) landed 2026-05-22, INT4 finally beats bf16 on NPU:
+
+| Config (Llama 3.2 1B) | decode t/s |
+|---|---:|
+| CPU Q4_0 (reference) | 11.1 |
+| **NPU INT4 v2 (production default)** | **5.7** |
+| NPU bf16 | 5.3 |
+| NPU INT4 v1 (old) | 3.4 |
+
+Q4_K_M models route through the same v2 kernel via host repack
+(Phase 8.4). See `NPU_PLAN_PRIORITY_8.md` for the full Priority 8
+writeup.
+
+## Supported model architectures
+
+- ✅ **Llama 3.2 1B** (and other head_dim=64 Llama-arch models). All
+  fusion paths (FlowKV, QKV, decode_batch, transformer_block, SwiGLU)
+  active by default.
+- ⚠️ **Non-Llama architectures** (Qwen, Mistral, Gemma, etc with
+  head_dim ≠ 64, M-RoPE, or SWA): use the `npu_int4_gemv_only` preset.
+  Attention runs on CPU; only the pure matmul INT4 GEMV path
+  accelerates FFN/QKV-proj matmuls. Tested on Qwen3.5-9B-Q4_0:
+  3.5 t/s decode (+9% over CPU 3.2 t/s), 737 chars exact match vs
+  CPU baseline before normal bf16 drift.
+- **Why**: `head_dim != 64` is hardcoded in 9 NPU matchers
+  (ggml-xdna.cpp lines 5546, 7184, 7551, 8855, 9030, 10097, 10166,
+  10297, 11447). M-RoPE / SWA are also Llama-MHA-specific.
+  Lifting these is a future Phase 8.5 (3-5 days FlowKV + matcher
+  rework) — not yet on the roadmap.
+
+## Older context
 
 - **Single-query** (`--single-turn` or one prompt per process): all NPU
   operators safe, including RMS_NORM → **5.9 t/s**.
