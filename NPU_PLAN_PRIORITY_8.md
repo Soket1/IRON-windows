@@ -588,7 +588,7 @@ compute-bound.
 | 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
 | 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
 | **9 Async XRT dispatch** (NEW, see Phase 9 section below) | **3–4** | **7** | mirror AMD ggml-hsa AQL queue pattern: submit-without-wait per op, sync only on data dependency | **measured Day 1 spike: 1.10-1.44× per-op; projected end-to-end ~5.5 t/s INT4 (1.6×, not 5×)** | **Day 1 done -- projection revised DOWN; still worth shipping for parity with NPU bf16** |
-| **8.1.v2 Optimized INT4 GEMV kernel (PR #101 port)** | **landed** | **landed** | drop-in v2 of `fused_dequant_gemv.cc` with compile-time DIM_K/G + double-pump + AIE pipelining hints | **measured: 5.60 t/s decode (1.65× vs 8.1, 6% faster than NPU bf16; INT4 finally net-positive)** | ✅ DONE 2026-05-22 (commit 8de4472d8) |
+| **8.1.v2 Optimized INT4 GEMV kernel (PR #101 port)** | **landed** | **landed** | drop-in v2 of `fused_dequant_gemv.cc` with compile-time DIM_K/G + double-pump + AIE pipelining hints. **DEFAULT for Q4_0 models since commit bd4654c73**; v1 reachable via XDNA_DISABLE_GEMV_INT4_V2=1 | **measured: 5.40-5.60 t/s decode (1.65× vs v1, 6% faster than NPU bf16; INT4 finally net-positive)** | ✅ DONE 2026-05-22 (commits 8de4472d8 + bd4654c73) |
 | **Realistic total to target** | **2 weeks** | **3–4 weeks** | Q4_0 + Q4_K on NPU | **5.9 → 9–10 t/s** | |
 
 ### Phase 9 — Async XRT dispatch pipeline (NEW, 3-4 days P50)
@@ -726,8 +726,10 @@ AIE compiler can hide dequant latency behind activation MAC ops.
 
 Direct port landed in `IRON-windows/aie_kernels/aie2p/fused_dequant_gemv_v2.cc`
 + new IRON op `iron/operators/fused_dequant_gemv_v2/` + `compile.py`
-wrapper. Opt-in via `XDNA_ENABLE_GEMV_INT4_V2=1`; v1 stays the default
-for safety.
+wrapper. **V2 is now the production default** (since commit bd4654c73,
+2026-05-22); the `XDNA_DISABLE_GEMV_INT4_V2=1` env var falls back to
+v1 for regression coverage. Cache keys disambiguate ("gemv_int4_v2_K..."
+vs "gemv_int4_K..."), so v1 and v2 xclbins coexist in the cache dir.
 
 Bench (xrt_async_spike, 100 dispatches per shape):
 
