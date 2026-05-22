@@ -298,10 +298,16 @@ Until then, `XDNA_ENABLE_GEMV_INT4=1` should remain default-off.
 
 **Open items (deferred to future phases):**
 
-1. **Phase 8.2 SwiGLU INT4 (HIGH PRIORITY)** — restores fusion on the
-   FFN path; without this the INT4 dispatch path is a regression.
-2. **N2 kernel-side `aie::sub(8)`** — replace the host bias compensation
-   with an in-kernel offset. Removes ~50 µs/matmul of CPU work.
+1. **Phase 8.2 SwiGLU INT4** — ✅ regression reversed by the v2 port
+   (2026-05-23). SwiGLU INT4 now at parity with NPU bf16 but still
+   trails GEMV-only-v2 by ~0.5 t/s, so it remains default-off
+   (`XDNA_ENABLE_SWIGLU_INT4=1` for opt-in). Re-evaluate after
+   Phase 9 async dispatch.
+2. **N2 kernel-side `aie::sub(8)`** — applied for dual SwiGLU
+   INT4 (it was always there because SiLU is non-linear).
+   Still pending for standalone Q4_0 matmul where host bias
+   compensation works fine and the kernel-side variant would only
+   save ~50 µs/matmul of CPU work.
 3. **Q4_K_M re-quantize → W4A16 path** (Phase 8.4).
 
 **Original plan text below preserved for the file-by-file detail:**
@@ -583,7 +589,7 @@ compute-bound.
 | 8.0 Validation | 0.5 | 1 | INT4 kernel works on STX | 5.9 (baseline) | ⚪ partial (pyxrt blocked for pytest; compile.py via system() works) |
 | 8.1 Q4_0 GEMV scaffolding (enum + supports_op + repack + compile.py) | landed | landed | safe default-off scaffolding | 5.9 (unchanged) | ✅ commit 35ae3fee1 |
 | 8.1 Q4_0 GEMV dispatch path (BO + kernel + bias + tile_in selector) | landed | landed | NPU dispatch for bare Q4_0 mul_mat, byte-exact vs CPU on 3 regression tests | **decode 3.40 t/s** measured (regression vs NPU bf16 5.30 t/s -- fusion lost) | ✅ DONE (2026-05-21) |
-| 8.2 Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, restores fusion -- needed to net-positive on 8.1 | **measured 2.80 t/s (regression vs 8.1 -- needs profiling)** | ⚠️ Functionally DONE (byte-exact), perf regression -- 8.3 may help |
+| 8.2 Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, restores fusion -- needed to net-positive on 8.1 | **5.10–5.20 t/s (v2 port 2026-05-23): parity with NPU bf16; trails GEMV-only-v2 by ~0.5 t/s, kept default-off** | ✅ DONE (byte-exact); regression reversed via v2 kernel port |
 | 8.3 QKV INT4 | 1–2 (or skip) | 3 | only if 8.2 profile shows QKV dominates | ~10–11 | measurement-gated |
 | 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
 | 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
@@ -757,6 +763,64 @@ on NPU for the first time.** The 4×+ per-kernel speedup translates to
 (RMSNorm, sampling, FlowKV, attention masks). All three INT4 correctness
 tests (paris_short / paris_drift_64 / multiquery) pass byte-exact vs
 cpu_baseline with v2 enabled.
+
+### Phase 8.2 v2 — SwiGLU INT4 chain on v2 kernels (DONE 2026-05-23)
+
+The Phase 8.2 regression (2.80 t/s vs 3.40 t/s Phase 8.1) was a kernel
+problem, not a dispatch problem. The dual chain ran on the **v1**
+`fused_dequant_gemv` inner loop while the standalone Q4_0 matmul moved
+to v2 in commit `bd4654c73`. Two parallel changes close the gap:
+
+1. **`dual_fused_dequant_gemv_silu_mul.cc` in-place upgraded to v2**:
+   compile-time `DIM_K` / `GROUP_SIZE`, `AIE_PREPARE_FOR_PIPELINING`
+   + `AIE_LOOP_MIN_ITERATION_COUNT` hints, and the double-pump
+   2-group interleaved unpack pattern from `fused_dequant_gemv_v2.cc`.
+   The inline `aie::sub(8)` stays in *each* pump chain — SiLU is
+   non-linear, so the host-side bias compensation trick used by the
+   standalone v2 cannot apply here.
+2. **`swiglu_decode_int4/op.py` down stage swapped** from
+   `AIEFusedDequantGEMV` (v1) to `AIEFusedDequantGEMVv2`, so the entire
+   chain (fused gate+up+silu+mul + down) runs on v2 kernels end-to-end.
+
+Cache invalidation needed bumps on **both** sides — the Python SHA256
+key in `compile.py:swiglu_decode_int4_cache_key` (added `"version": 2`)
+**and** the C++ string key in `ggml-xdna.cpp:make_swiglu_cache_key`
+(appended `_v2` to the format). The C++ runtime cache key is checked
+first; missing it on the Python side alone leaves the C++ host serving
+stale `npu_kernels_win_8col/swiglu_decode_int4_K..._g32/combined.xclbin`
+from before the source change. Validation took 4 s instead of 23 s
+until both keys were bumped, and only the longer timing was a real
+fresh IRON compile.
+
+**Bench (correctness_test.py --bench, median of 2):**
+
+| Config | single | chat |
+|---|---:|---:|
+| CPU Q4_0 | 10.90 | 10.90 |
+| NPU bf16 | 5.20 | 5.20 |
+| NPU INT4 v1 (SwiGLU off, GEMV-v1) | 3.50 | 3.40 |
+| **NPU INT4 v2 (SwiGLU off, GEMV-v2 default)** | **5.60** | **5.70** |
+| NPU INT4 +SwiGLU v2 (this commit) | 5.20 | 5.10 |
+| NPU INT4 +SwiGLU v1 (prior measurement) | 2.80 | 2.80 |
+
+**Result: 2.80 → 5.10–5.20 (1.83×).** The Phase 8.2 regression is
+reversed; SwiGLU INT4 now sits at parity with NPU bf16 (5.20) and
+roughly in line with GEMV-only-v2. Correctness:
+`paris_short_q4_0_int4_swiglu` byte-exact vs `cpu_baseline`.
+
+**Why SwiGLU INT4 v2 still trails GEMV-only-v2 by ~0.5 t/s** (and
+therefore stays default-off): the original hypothesis was that fused
+gate+up+silu+mul would beat 3 standalone matmuls + a CPU silu·mul by
+saving 2 DDR round-trips per FFN layer. Empirically the dual chain's
+inline `aie::sub(8)` (one extra vector op per block, present in both
+pump chains) costs about as much as the saved DMA. Net: parity, not
+the predicted speedup. Keeping the path opt-in via
+`XDNA_ENABLE_SWIGLU_INT4=1` preserves regression coverage and lets
+Phase 9 (async dispatch) re-evaluate — submit-without-wait could
+amortize the chain differently than the standalone path.
+
+**Commits:** IRON-windows `7a2eda2` (kernel + IRON op edits) +
+llama.cpp-xdna `fb2c513b7` (cache key bumps).
 
 
 
