@@ -800,10 +800,41 @@ byte-exact vs `cpu_baseline` under `XDNA_ENABLE_PHASE9=1`.
 **Not migrated** (still sync; future Phase 9 follow-up only if ROI
 investigation shows worth):
 
-- `mul_mat_swiglu_int4` (already default-off after the v2 port)
 - bf16 `mul_mat_gemv` / `mul_mat_swiglu`
 - QKV chain, FlowKV decode, RMSNorm dispatch
 - `decode_batcher`
+
+**SwiGLU INT4 async migration (2026-05-23, commit 45dd4ce40):**
+
+Completed for symmetry with `mul_mat_gemv_int4`. Required two
+support changes first:
+
+1. `xdna_inflight_tracker` now uses a generic `std::function<void()>`
+   `wait_fn` so it can hold either `xrt::run::wait2()` or
+   `xrt::runlist::wait()` uniformly (SwiGLU INT4 uses a chained
+   2-kernel runlist).
+2. `xdna_swiglu_kernel_entry` gets a 3-BO ring
+   (`input_bo_ring`, `intermediate_bo_ring`, `output_bo_ring`) of size
+   `XDNA_PHASE9_RING_SIZE`. Sync path keeps the legacy single BOs.
+
+Result: `paris_short_q4_0_int4_swiglu` byte-exact in both sync and
+async modes. Bench numbers (single-turn, npu_int4_swiglu preset):
+
+| Config | decode t/s |
+|---|---:|
+| sync (Step 2 baseline) | 5.10–5.20 |
+| async (XDNA_ENABLE_PHASE9=1) | 5.20 |
+
+Within ±0.1 t/s noise. **The async win on SwiGLU INT4 is much
+smaller than on standalone INT4 GEMV** because each SwiGLU dispatch
+is long (~14 ms compute envelope per layer; 16 calls/token), so
+the ~399 µs/op host gap async closes is a small relative fraction.
+Standalone GEMV had ~80 short dispatches/token where the same fixed
+gap dominates -- hence the 5-7% gain there.
+
+This makes SwiGLU INT4 a **complete-the-picture** migration, not a
+performance unlock. SwiGLU INT4 (now async) at 5.20 still loses to
+no-SwiGLU + async GEMV at 5.90, so the preset stays default-off.
 
 **Default-on flip:** kept opt-in for first delivery so any
 unforeseen BO lifetime hazard can be reverted with a single env
