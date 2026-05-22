@@ -33,14 +33,38 @@
 #include <stdint.h>
 #include <type_traits>
 
+// HEAD_DIM is a compile-time parameter set by the IRON op via -DHEAD_DIM=N.
+// Supported values: 64, 128, 256. Must be a multiple of 32 (dot-product
+// vector width). Default 64 keeps the legacy single-shape build working
+// when no flag is passed (existing xclbins continue to function).
+#ifndef HEAD_DIM
+#define HEAD_DIM 64
+#endif
+
+static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256,
+              "FlowKV: HEAD_DIM must be 64, 128, or 256");
+static_assert(HEAD_DIM % 32 == 0, "FlowKV: HEAD_DIM must be multiple of 32");
+
+// Precomputed 1/sqrt(HEAD_DIM) -- avoids float runtime call in the score
+// hot loop, and lets the compiler fold the multiplication.
+#if HEAD_DIM == 64
+    static constexpr float HEAD_DIM_INV_SQRT = 0.125f;             // 1/8
+#elif HEAD_DIM == 128
+    static constexpr float HEAD_DIM_INV_SQRT = 0.0883883476f;      // 1/sqrt(128)
+#elif HEAD_DIM == 256
+    static constexpr float HEAD_DIM_INV_SQRT = 0.0625f;            // 1/16
+#endif
+
 // ---------------------------------------------------------------------------
 // Score tile: static softmax state (only used by score tile Worker)
 // ---------------------------------------------------------------------------
 static float score_running_max[4] __attribute__((aligned(64)));
 static float score_running_sum[4] __attribute__((aligned(64)));
 
-// RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk)
-static bfloat16 rotated_q[4 * 64] __attribute__((aligned(64)));
+// RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk).
+// Sized for HEAD_DIM at compile time so larger head dims don't overflow
+// the static buffer.
+static bfloat16 rotated_q[4 * HEAD_DIM] __attribute__((aligned(64)));
 
 // Actual sequence length (number of filled KV positions).
 // Read from Q buffer element [num_q_heads*head_dim + head_dim] = angles[64].
@@ -57,9 +81,9 @@ static inline int32_t bf16_to_int(const bfloat16 * buf, int idx) {
 }
 
 // ---------------------------------------------------------------------------
-// Value tile: accumulated output in f32 for precision
+// Value tile: accumulated output in f32 for precision (sized by HEAD_DIM).
 // ---------------------------------------------------------------------------
-static float value_accum[4 * 64] __attribute__((aligned(64)));
+static float value_accum[4 * HEAD_DIM] __attribute__((aligned(64)));
 
 // Saved denominator from the last chunk (written by accum, read by normalize)
 static float saved_denom[4] __attribute__((aligned(64)));
@@ -130,7 +154,9 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
     event0();
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
-    const float inv_sqrt_d = 0.125f; // 1/sqrt(64) = 1/8
+    // 1/sqrt(HEAD_DIM) precomputed at compile time. The compiler folds the
+    // subsequent multiplication into the dot-product reduction.
+    const float inv_sqrt_d = HEAD_DIM_INV_SQRT;
 
     const int32_t scores_size = chunk_size * num_q_heads;
     bfloat16 *scores_out = packed_out;
@@ -176,16 +202,18 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         for (int pos = 0; pos < eff_chunk; pos++) {
             const bfloat16 *k_pos = k_chunk + pos * head_dim;
 
-            // Vectorized dot product: head_dim=64 using single accum
+            // Vectorized dot product over HEAD_DIM elements in chunks of 32.
+            // The loop is compile-time bounded (HEAD_DIM / 32) so the AIE
+            // compiler can fully unroll without runtime loop overhead.
+            // For HEAD_DIM=64: 2 chunks; 128: 4 chunks; 256: 8 chunks.
             aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
-
-            auto q_vec0 = aie::load_v<32>(q_head);
-            auto k_vec0 = aie::load_v<32>(k_pos);
-            acc = aie::mac(acc, q_vec0, k_vec0);
-
-            auto q_vec1 = aie::load_v<32>(q_head + 32);
-            auto k_vec1 = aie::load_v<32>(k_pos + 32);
-            acc = aie::mac(acc, q_vec1, k_vec1);
+            constexpr int n_chunks = HEAD_DIM / 32;
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < n_chunks; c++) {
+                auto qv = aie::load_v<32>(q_head + c * 32);
+                auto kv = aie::load_v<32>(k_pos  + c * 32);
+                acc = aie::mac(acc, qv, kv);
+            }
 
             bfloat16 score = static_cast<bfloat16>(aie::reduce_add(acc.to_vector<float>()) * inv_sqrt_d);
 

@@ -86,7 +86,11 @@ class AIEFlowKVDecode(AIEOperatorBase):
         assert (
             num_cols == 1 or num_kv_heads % num_cols == 0
         ), "num_kv_heads must be divisible by num_cols (or num_cols=1 for per-head dispatch)"
-        assert head_dim == 64, "Only head_dim=64 is supported"
+        assert head_dim in (64, 128, 256), (
+            f"head_dim must be 64, 128, or 256 (got {head_dim}). "
+            "The flowkv.cc kernel inner-loop unroll is selected at compile "
+            "time via -DHEAD_DIM=N; other values require a kernel update."
+        )
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -124,12 +128,18 @@ class AIEFlowKVDecode(AIEOperatorBase):
             ],
         )
 
+        # Per-head_dim kernel object name so different HEAD_DIM compile
+        # specializations don't collide in the build cache. The
+        # -DHEAD_DIM=N flag selects the static-buffer size and unrolled
+        # dot-product chunk count inside flowkv.cc.
+        kernel_obj_name = f"flowkv_{self.head_dim}d.o"
+
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelObjectArtifact.new(
-                    "flowkv.o",
+                    kernel_obj_name,
                     depends=[
                         SourceArtifact.new(
                             self.context.base_dir
@@ -138,6 +148,7 @@ class AIEFlowKVDecode(AIEOperatorBase):
                             / "flowkv.cc"
                         )
                     ],
+                    extra_flags=[f"-DHEAD_DIM={self.head_dim}"],
                 ),
             ],
         )

@@ -67,8 +67,12 @@ def my_flowkv_decode(
 ):
     group_size = num_heads // num_kv_heads
     num_chunks = seq_len // chunk_size
-    # Kernels in flowkv.o are compiled with fixed head_dim=64 buffers.
-    assert head_dim == 64, "Only head_dim=64 is supported by FlowKV kernels"
+    # Kernel object filename encodes HEAD_DIM (flowkv_{head_dim}d.o) and is
+    # compiled with -DHEAD_DIM=N. Static buffers and the dot-product unroll
+    # specialize at compile time; supported values are 64, 128, 256.
+    assert head_dim in (64, 128, 256), (
+        f"head_dim must be 64, 128, or 256 (got {head_dim})"
+    )
     # group_size = num_heads // num_kv_heads must be exact (no truncation).
     assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
     assert seq_len % chunk_size == 0, "seq_len must be divisible by chunk_size"
@@ -134,17 +138,20 @@ def my_flowkv_decode(
     L3_O_ty = np.ndarray[(num_kv_heads * ALIGNED_OUT_STRIDE_ELEMS,), dtype_in]
 
     # -------------------------------------------------------------------------
-    # Kernel declarations (all from flowkv.o)
+    # Kernel declarations (all from per-head_dim flowkv_{head_dim}d.o).
+    # The kernel object name must match op.py's KernelObjectArtifact.
     # -------------------------------------------------------------------------
+    kernel_obj = f"flowkv_{head_dim}d.o"
+
     score_init = Kernel(
         "flowkv_score_init_bf16",
-        "flowkv.o",
+        kernel_obj,
         [np.int32],
     )
 
     score_rope_q = Kernel(
         "flowkv_score_rope_q_bf16",
-        "flowkv.o",
+        kernel_obj,
         [
             L1_Q_ty,  # q_in (Q heads + packed angles)
             np.int32,  # num_q_heads
@@ -154,7 +161,7 @@ def my_flowkv_decode(
 
     score_chunk = Kernel(
         "flowkv_score_chunk_bf16",
-        "flowkv.o",
+        kernel_obj,
         [
             L1_Q_ty,  # q_in
             L1_KV_chunk_ty,  # k_chunk
@@ -167,13 +174,13 @@ def my_flowkv_decode(
 
     value_init = Kernel(
         "flowkv_value_init_bf16",
-        "flowkv.o",
+        kernel_obj,
         [np.int32, np.int32],
     )
 
     value_accum_fn = Kernel(
         "flowkv_value_accum_bf16",
-        "flowkv.o",
+        kernel_obj,
         [
             L1_inter_ty,  # packed_in
             L1_KV_chunk_ty,  # v_chunk
@@ -185,7 +192,7 @@ def my_flowkv_decode(
 
     value_normalize = Kernel(
         "flowkv_value_normalize_bf16",
-        "flowkv.o",
+        kernel_obj,
         [
             L1_out_ty,  # output
             np.int32,  # num_q_heads
