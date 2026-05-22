@@ -1502,3 +1502,72 @@ exercises FlowKV decode + chat-mode + GQA composition).
    preset (matmul-only path, no FlowKV). Confirms whether head_dim=256
    *kernel* path works even when full attention isn't dispatchable.
 
+#### Phase 8.5 GEMV-path validated end-to-end on 3B (2026-05-23, commit 2ac1ed09a)
+
+llama-3.2-3b-q4_0 (head_dim=128, 28 layers, GQA 3:1) downloaded
+locally. Two new harness tests added (`paris_short_3b_q4_0_int4_v2`,
+`paris_short_3b_q4_0_gemv_only`), both pass byte-exact vs
+`cpu_baseline` with 196 INT4 NPU dispatches per token (28 layers ×
+7 weights). All 4 unique shapes compile cleanly on first touch:
+K=3072 N=8192, K=8192 N=3072, K=3072 N=3072, K=3072 N=1024.
+
+**Validation surfaced TWO unrelated bugs that had to be fixed first:**
+
+1. **N4 fix regression (CRITICAL).** The 2026-05-23 N4 commit
+   narrowed `supports_op` for Q4_0/Q4_K to `src1->ne[1] == 1`,
+   intending to make prefill fall back to CPU. In practice, ggml's
+   scheduler queries `supports_op` at planning time with the
+   *max ubatch* tensor shape (typically `ne[1]=512` from prefill),
+   and that decision is sticky across all decode iterations.
+   The narrow rejected Q4_0/Q4_K at planning, so EVERY matmul --
+   including decode M=1 -- routed to CPU. Llama 3.2 1B tests
+   continued to "PASS byte-exact" because both runs were CPU.
+   "warm int4 weight" log messages had disappeared but no test
+   caught the regression (PASS condition is just CPU==NPU equality,
+   not "NPU dispatched anything").
+
+   **Fix:** restore the all-M `supports_op` claim. Move the M>1
+   guard into `graph_compute` -- Q4_0/Q4_K MUL_MAT with
+   `src1->ne[1] != 1` is now folded into the CPU run accumulator
+   alongside surrounding CPU ops, via the existing
+   `xdna_delegate_range` mechanism. The N4 acceptance (Q4_K M=512
+   prefill doesn't produce garbage) is preserved because the M>1
+   path no longer reaches the broken bf16 GEMM dispatch.
+
+2. **`xdna_shape_dispatchable_gemv` only accepted XDNA_ENABLE_GEMV.**
+   The `npu_int4_gemv_only` preset disables the bf16 GEMV flag (by
+   design -- there is no bf16 GEMV on non-Llama architectures) but
+   enables `XDNA_ENABLE_GEMV_INT4`. `xdna_node_npu_dispatchable`
+   therefore rejected Q4_0 matmuls before they could route through
+   the INT4 GEMV dispatch. Fix: accept either flag.
+
+**Regression confirmed clean on Llama 3.2 1B after fixes:**
+
+- `paris_short_q4_0_int4_v2`: PASS (2.9s)
+- `paris_drift_64_q4_0_int4_v2`: PASS (12.7s, 64-token drift)
+- `multiquery_q4_0_int4_v2`: PASS (4.3s, chat + FlowKV)
+- 112 "warm int4 weight" messages = 16 layers × 7 -- NPU actually
+  dispatching now.
+
+**3B validation results:**
+
+- `paris_short_3b_q4_0_gemv_only`: PASS byte-exact (10.6s NPU vs
+  6.2s CPU; first-touch xclbin compiles included).
+- `paris_short_3b_q4_0_int4_v2`: PASS byte-exact (11.0s NPU; same
+  preset/test variant with full FlowKV/attention env flags set).
+
+**FlowKV head_dim=128 kernel itself NOT exercised.** The FlowKV
+decode matcher (`graph_compute` ~line 11743) didn't fire on the
+3B graph -- the matcher walks ahead looking for specific PERMUTE
+node patterns that may differ between Llama 1B and 3B. Deeper
+investigation deferred. The kernel-side parameterization is in
+place; only the matcher needs to learn 3B's attention layout.
+
+**Lesson for future supports_op changes:** ggml's scheduler asks
+about the *largest* operation (prefill batch) and the answer is
+**sticky for every same-shape op in the graph**, including the
+small decode iterations. Any size-dependent guard belongs in
+`graph_compute` (where we have the actual tensor at dispatch time)
+rather than in `supports_op` (where we only see the max-batched
+shape at scheduling time).
+
