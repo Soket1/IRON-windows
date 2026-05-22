@@ -712,6 +712,43 @@ That puts INT4 at parity with current NPU bf16 (5.2 t/s). Still worth
 shipping (we'd recover the Phase 8.1 regression), but Phase 9 alone is
 no longer "the breakthrough" the PDF predicted.
 
+**Phase 9 re-spike on v2 baseline (2026-05-23):** after v2 GEMV +
+SwiGLU v2 landed (sync baseline = 5.6 t/s), I extended
+`tools/xrt_async_spike.cpp` with a `--token` mode that submits one
+Llama 3.2 1B Q4_0 decode token's worth of dispatches (16 layers × 7
+ops = 112 dispatches across 4 v2 xclbins: attn_q/o K=2048 N=2048,
+attn_k/v K=2048 N=512, ffn_gate/up K=2048 N=8192, ffn_down K=8192
+N=2048). Three modes:
+
+| Mode | NPU work (1 token) | Projected decode | Comment |
+|---|---:|---:|---|
+| SYNC | 76.7 ms | **5.62 t/s** | matches measured 5.6 -- model is consistent with reality |
+| ASYNC_LAYER (7 ops/layer + barrier) | 70.9 ms | 5.81 t/s | realistic lower bound |
+| ASYNC_TOKEN (submit 112, wait once) | 32.0 ms | **7.50 t/s** | upper bound, intra-deps ignored |
+
+The 32 ms ASYNC_TOKEN total matches the sum of v2 per-shape kernel
+times exactly, so it represents the **actual NPU compute envelope**;
+nothing faster is reachable without making the kernels themselves
+faster. The SYNC→ASYNC_TOKEN gap (44.7 ms / 112 ops = 399 µs/op) is
+host overhead between dispatches (wait→start). This gap is much
+larger *relative* to compute on v2 than it was on v1: v1 kernels ran
+~2.2 ms each so the ~80 µs/op submit overhead was a ~4% tax; v2
+kernels run ~286 µs avg so the same fixed overhead becomes a ~140%
+tax in sync mode. **Phase 9 ROI scales with kernel speed -- it's
+more important now than it was at v1-baseline time.**
+
+Realistic Phase 9 outcome (with intra-layer data deps gating
+parallelism + Q_max sliding window for backpressure): somewhere
+between ASYNC_LAYER (5.81) and ASYNC_TOKEN (7.50), most likely
+**6.0–6.3 t/s, +7–12% over current 5.6**. Not the original 1.6×
+projection (which assumed 3.4 t/s v1 baseline) and not the 16 t/s
+PDF projection (which assumed unrealistic non-NPU overhead).
+
+The original Day 1 spike's table below is **superseded by the
+token-sequence numbers** for projection purposes -- it measured 100×
+the same xclbin, which understates the wait→start gap that Phase 9
+would close.
+
 **The real bottleneck identified is NPU compute time** — INT4 GEMV
 takes ~2.2 ms on the dominant shapes when XRT.pdf claimed ~561 µs (PR
 #101 bench). My kernels run **~4× slower** than the upstream IRON
