@@ -1447,3 +1447,58 @@ Llama-1B-specific; lifting that to a runtime/compile-time tunable
 opens up Llama-3.1-8B, Llama-3.2-3B, Qwen, Mistral, Gemma, etc.
 Estimated: 3-5 days of FlowKV kernel changes + matcher updates.
 
+### Phase 8.5 PARTIAL — HEAD_DIM ∈ {64, 128, 256} infrastructure (2026-05-23)
+
+Lifted the hardcoded `head_dim == 64` constraint from the kernel
+through the matchers. End-to-end validation for non-Llama-1B models
+deferred (requires downloading a model with head_dim != 64 locally
+and recompiling xclbins).
+
+**Done:**
+
+| Layer | Change | Commit |
+|---|---|---|
+| AIE kernel `aie_kernels/aie2p/flowkv.cc` | Compile-time `HEAD_DIM` define (default 64); static buffers sized `4*HEAD_DIM`; dot product = `HEAD_DIM/32`-chunk unrolled loop; `inv_sqrt_d` = `HEAD_DIM_INV_SQRT` constexpr per supported value | IRON-windows `56e381a` |
+| IRON op `flowkv_decode/{op,design}.py` | Drop `assert head_dim==64`; allow `{64, 128, 256}`; per-shape `flowkv_{head_dim}d.o` filename + `-DHEAD_DIM=N` flag; design.py Kernel(...) uses local `kernel_obj` variable | IRON-windows `56e381a` |
+| `compile.py:flowkv_decode_cache_key` | Already had `head_dim` in the hash; no change needed | — |
+| C++ matchers (8 rejections + 1 dynamic detection site) | Introduce `xdna_head_dim_supported(hd)` helper; replace all `if (m.head_dim != 64) reject` with the helper; rewrite the FlowKV decode detector to derive `hd` from the Q-perm tensor's `ne[0]` dynamically | llama.cpp-xdna `38eb301a7` |
+
+**Regression validated** (Llama 3.2 1B, head_dim=64): all 3 INT4 v2
+tests pass byte-exact: `paris_short_q4_0_int4_v2`,
+`paris_drift_64_q4_0_int4_v2`, `multiquery_q4_0_int4_v2` (last
+exercises FlowKV decode + chat-mode + GQA composition).
+
+**Not yet validated end-to-end** for head_dim != 64:
+
+- **head_dim=128** (Llama 3.1 8B, 3.2 3B, Mistral 7B): no such model
+  locally. Requires ~2-5GB download + first-touch xclbin recompile
+  (~5-15 min per shape). Expected to "just work" given Llama-family
+  architecture is otherwise unchanged.
+- **head_dim=256** (Gemma 3 1B locally; Qwen 3.5 locally): both have
+  ADDITIONAL non-head_dim blockers that still prevent full NPU
+  dispatch:
+  - **Gemma 3 1B:** `attention.sliding_window=512`; the current
+    attention/FlowKV path doesn't model SWA's local-window
+    constraint. Likely requires per-layer SWA detection in the
+    matcher + kernel modifications to skip outside-window K/V.
+  - **Qwen 3.5-9B:** M-RoPE `[11, 11, 10, 0]` (multidimensional);
+    the current RoPE assumes standard 1D rotation. Plus head_dim=256.
+  Both can be validated separately for at least the GEMV-only path
+  (matmul-only NPU dispatch with attention on CPU) without
+  resolving SWA/M-RoPE.
+
+**Follow-up session needs:**
+
+1. Download Llama 3.2 3B Q4_K_M or Q4_0 (~2 GB) for clean
+   head_dim=128 validation.
+2. Run `paris_short`-style test on the 3B model with full NPU stack
+   enabled. Expected first-touch behavior: cache miss for
+   flowkv_decode key with `head_dim=128`, IRON triggers
+   compile.py, kernel compiles with `-DHEAD_DIM=128`, produces
+   new xclbin under `npu_kernels_win_8col/{hash}/`.
+3. Verify byte-exact match vs CPU baseline.
+4. Bench decode t/s (expect ~1.5-2.5 t/s for 3B at linear scale).
+5. If head_dim=128 works, attempt Gemma 3 1B with `npu_int4_gemv_only`
+   preset (matmul-only path, no FlowKV). Confirms whether head_dim=256
+   *kernel* path works even when full attention isn't dispatchable.
+
