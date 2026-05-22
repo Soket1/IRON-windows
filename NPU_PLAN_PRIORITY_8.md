@@ -587,7 +587,7 @@ compute-bound.
 | 8.3 QKV INT4 | 1–2 (or skip) | 3 | only if 8.2 profile shows QKV dominates | ~10–11 | measurement-gated |
 | 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
 | 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
-| **9 Async XRT dispatch** (NEW, see Phase 9 section below) | **3–4** | **7** | mirror AMD ggml-hsa AQL queue pattern: submit-without-wait per op, sync only on data dependency | **target 5×: 3.4 → ~16 t/s INT4, 5.2 → ~25 t/s bf16** | **HIGH PRIORITY** -- single biggest win identified, independent of quant |
+| **9 Async XRT dispatch** (NEW, see Phase 9 section below) | **3–4** | **7** | mirror AMD ggml-hsa AQL queue pattern: submit-without-wait per op, sync only on data dependency | **measured Day 1 spike: 1.10-1.44× per-op; projected end-to-end ~5.5 t/s INT4 (1.6×, not 5×)** | **Day 1 done -- projection revised DOWN; still worth shipping for parity with NPU bf16** |
 | **Realistic total to target** | **2 weeks** | **3–4 weeks** | Q4_0 + Q4_K on NPU | **5.9 → 9–10 t/s** | |
 
 ### Phase 9 — Async XRT dispatch pipeline (NEW, 3-4 days P50)
@@ -647,18 +647,76 @@ releases. Stick with polling (`state()`) and explicit barriers.
 **Header path gotcha.** `#include <experimental/xrt_kernel.h>` is WRONG
 and fails to compile. Correct: `#include <xrt/experimental/xrt_kernel.h>`.
 
-**Expected return (XRT.pdf projection table):**
+**Expected return (XRT.pdf projection table — NOT confirmed on real HW, see Day 1 spike result below):**
 
-| Workload | Sync baseline | Async target | Gain |
+| Workload | Sync baseline | PDF target | Day 1 spike actual |
 |---|---:|---:|---:|
-| Llama 3.2 1B INT4 decode | 3.4 t/s | ~16 t/s | ~4.7× |
-| Llama 3.2 1B bf16 decode | 5.2 t/s | ~25 t/s | ~4.8× |
-| INT4 / bf16 prefill | 20.8 t/s | ~22 t/s | minor (compute-bound) |
+| Llama 3.2 1B INT4 decode | 3.4 t/s | ~16 t/s | **~5.5 t/s projected** |
+| Llama 3.2 1B bf16 decode | 5.2 t/s | ~25 t/s | **TBD** |
+| INT4 / bf16 prefill | 20.8 t/s | ~22 t/s | minor change expected |
 
-The prefill numbers stay almost flat because prefill is already
-compute-bound — only decode (latency-bound) sees the big win. This is
-the single biggest perf lever still available without redesigning IRON
-microkernels or adding new fusion.
+**Day 1 spike result (2026-05-22) — projection revised DOWN.**
+
+Standalone benchmark `tools/xrt_async_spike.cpp` measured 100 dispatches
+of existing INT4 GEMV xclbins in three patterns (sync, async start+wait_at_end,
+runlist) on the actual target HW (AMD Ryzen AI STX NPU2, Windows, XRT-Win SDK):
+
+| Shape | sync µs/op | async µs/op | runlist µs/op | async win |
+|---|---:|---:|---:|---:|
+| K=2048 N=8192 (ffn_gate/up) | 2434 | 2210 | 2219 | **1.10×** |
+| K=8192 N=2048 (ffn_down)    | 2405 | 2182 | 2200 | **1.10×** |
+| K=2048 N=2048 (attn_q/o)    |  640 |  566 |  594 | **1.13×** |
+| K=2048 N=512  (attn_k/v)    |  227 |  157 |  158 | **1.44×** |
+
+Findings:
+
+1. **`xrt::run::start()` IS confirmed non-blocking** — submit returns in
+   6-9 µs. The driver queue accepts dispatches asynchronously.
+2. **NPU serializes execution inside one hw_context.** Each kernel runs
+   to completion before the next starts; there is no compute/submit
+   overlap on the dominant FFN shapes (single kernel occupies all 8
+   columns, no parallel CUs).
+3. **Async win = host overhead saved**, not compute parallelism. With
+   ~2 ms kernels and ~80 µs host overhead, that's ~3-4 % headroom on
+   the dominant matmul shapes.
+4. **Runlist == independent async runs** on this driver. IRON #83 fears
+   are unwarranted for the perf comparison (correctness is a separate
+   concern; runlist may still be unsafe for shared-kernel patterns).
+
+**Implication for Llama 3.2 1B Q4_0 decode** (per-token NPU matmul budget):
+
+```
+ffn_gate (K=2048 N=8192) × 16 layers = 35 ms  (async) vs 39 ms (sync)
+ffn_up   (K=2048 N=8192) × 16 layers = 35 ms  vs 39 ms
+ffn_down (K=8192 N=2048) × 16 layers = 35 ms  vs 38 ms
+attn_q/o (K=2048 N=2048) × 16 × 2    = 18 ms  vs 20 ms
+attn_k/v (K=2048 N=512)  × 16 × 2    =  5 ms  vs  7 ms
+-----------------------------------------------------
+TOTAL                                = 128 ms vs 143 ms
+```
+
+That's ~7.8 t/s ceiling for the NPU work alone (vs 3.4 t/s sync today).
+Adding sampling/FlowKV/RMSNorm overhead the realistic target is
+**~5-5.5 t/s** — not 16 t/s.
+
+**Phase 9 revised projection: 3.4 → ~5.5 t/s (1.6×), not ~5×.**
+
+That puts INT4 at parity with current NPU bf16 (5.2 t/s). Still worth
+shipping (we'd recover the Phase 8.1 regression), but Phase 9 alone is
+no longer "the breakthrough" the PDF predicted.
+
+**The real bottleneck identified is NPU compute time** — INT4 GEMV
+takes ~2.2 ms on the dominant shapes when XRT.pdf claimed ~561 µs (PR
+#101 bench). My kernels run **~4× slower** than the upstream IRON
+reference. Possible causes:
+- Different `tile_in` / `tile_out` selection
+- Wrong number of compute units instantiated
+- AIE compiler flags missing in my compile.py wrappers
+- A simple kernel/design mismatch I haven't traced
+
+Tracking this 4× kernel-side gap is the next investigation, not Phase 9.
+
+
 
 **Risks / pitfalls (consolidated from XRT.pdf + earlier research):**
 
