@@ -749,6 +749,79 @@ token-sequence numbers** for projection purposes -- it measured 100×
 the same xclbin, which understates the wait→start gap that Phase 9
 would close.
 
+### Phase 9 DONE for INT4 GEMV (2026-05-23, commit 46fdcb91d)
+
+Implemented async dispatch + deferred bias compensation for
+`mul_mat_gemv_int4` only (other operators still sync; future
+follow-up). Opt-in via `XDNA_ENABLE_PHASE9=1` (default off for
+first delivery). `XDNA_PHASE9_QMAX` env var controls ring depth
+(default 4).
+
+**Architecture (concrete):**
+
+- `xdna_inflight_tracker`: backend-context-level FIFO deque of
+  `(xrt::run, dst_data, deferred lambda)`. `submit()` enforces
+  Q_max by popping + completing the oldest entry when full.
+- Per-entry `a_bo_ring[Q]` / `c_bo_ring[Q]` replace the previous
+  shared `a_bo`/`c_bo`. `slot_active[Q]` + `slot_dst_data[Q]`
+  track ring back-pressure -- when picking `next_slot`, if active,
+  `inflight.wait_for(slot_dst_data[slot])` runs the producer's
+  deferred lambda (bias compensation + write to ggml tensor data
+  + clear slot_active) before the new input memcpy.
+- Sync barriers: `inflight.drain()` is called from
+  `xdna_delegate_range` (before CPU graph_compute) and at the end
+  of `ggml_backend_xdna_graph_compute`. `wait_for(src1->data)` at
+  the start of `mul_mat_gemv_int4` covers INT4→INT4 chains.
+
+**Bench (Llama 3.2 1B Q4_0, correctness_test.py --bench, median of 2):**
+
+| Q_max | single decode t/s | chat decode t/s | vs sync 5.6 |
+|---|---:|---:|---:|
+| sync (baseline) | 5.60 | 5.30 | 1.00× |
+| Q_max=2 | 6.00 | — | 1.07× |
+| Q_max=4 | 5.90 | 5.90 | 1.05× |
+| Q_max=8 | 5.90 | — | 1.05× |
+| Q_max=16 | 6.00 | — | 1.07× |
+
+All Q_max measurements within ±0.1 t/s noise. **+5–7% over the
+synchronous baseline**, landing inside the projected 6.0–6.3 range
+predicted from the v2 token-sequence spike.
+
+**Q_max sensitivity is flat** because the NPU serializes execution
+inside one `xrt::hw_context`. Pipelining beyond ~1 op ahead doesn't
+overlap NPU compute; the gain comes purely from amortizing the
+~399 µs/op wait→start gap. Q_max=2 already captures it.
+
+**Correctness:** `paris_short_q4_0_int4_v2`,
+`paris_drift_64_q4_0_int4_v2` (~1000 INT4 dispatches/token × 64
+tokens), `multiquery_q4_0_int4_v2` (chat-mode + FlowKV) all
+byte-exact vs `cpu_baseline` under `XDNA_ENABLE_PHASE9=1`.
+
+**Not migrated** (still sync; future Phase 9 follow-up only if ROI
+investigation shows worth):
+
+- `mul_mat_swiglu_int4` (already default-off after the v2 port)
+- bf16 `mul_mat_gemv` / `mul_mat_swiglu`
+- QKV chain, FlowKV decode, RMSNorm dispatch
+- `decode_batcher`
+
+**Default-on flip:** kept opt-in for first delivery so any
+unforeseen BO lifetime hazard can be reverted with a single env
+var. Recommend flipping default-on in a follow-up commit after
+1-2 weeks of opt-in soak with no reports.
+
+**Why not the 1.34× ceiling:** the v2 token-sequence spike
+projected up to 7.5 t/s in ASYNC_TOKEN mode, but that ignored
+intra-token data deps (Q reads RMSNorm output, attention reads Q/K/V,
+FFN reads attention output, etc.). In real `graph_compute` the
+async window per layer is ~3-4 ops (Q/K/V parallel; gate/up
+parallel) bounded by ggml's sequential walk. Plus `xdna_delegate_range`
+drains for CPU fallback ops (which exist in nearly every layer for
+small ggml ops). Net: ~5-7% is the realistic upper bound for a
+single-operator migration -- to push higher we'd need to migrate
+SwiGLU INT4 + bf16 paths AND restructure the graph_compute to fire
+parallel ops without intervening CPU drains.
+
 **The real bottleneck identified is NPU compute time** — INT4 GEMV
 takes ~2.2 ms on the dominant shapes when XRT.pdf claimed ~561 µs (PR
 #101 bench). My kernels run **~4× slower** than the upstream IRON
