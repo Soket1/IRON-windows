@@ -62,19 +62,19 @@ kernel (subtract-after-unpack).
 
 ## Phase-разбивка
 
-### Phase 8.0 — Валидация (0.5 дня) [TASK-8.0]
+### Phase 8.0 — Валидация (0.5 дня)
 
 **Цель**: убедиться что готовое ядро работает на текущем железе (STX NPU2) и
 оценить latency.
 
-1. **[TASK-8.0.1]** `source /opt/xilinx/xrt/setup.sh && source ironenv/bin/activate`
-2. **[TASK-8.0.2]** `pytest iron/operators/fused_dequant_gemv/ --iterations 1` — extensive=false (2048×2048, 4col, g32).
-3. **[TASK-8.0.3]** Снять `Latency (us)` из метрик теста, сравнить с bf16 GEMV того же размера
+1. `source /opt/xilinx/xrt/setup.sh && source ironenv/bin/activate`
+2. `pytest iron/operators/fused_dequant_gemv/ --iterations 1` — extensive=false (2048×2048, 4col, g32).
+3. Снять `Latency (us)` из метрик теста, сравнить с bf16 GEMV того же размера
    (`pytest iron/operators/gemv/` 2048×2048×4col).
-4. **[TASK-8.0.4]** **Acceptance**: kernel проходит с `rel_tol=0.07`, INT4 latency ≤ 0.5×bf16
+4. **Acceptance**: kernel проходит с `rel_tol=0.07`, INT4 latency ≤ 0.5×bf16
    latency (ожидание 0.25× при memory-bound, 0.5× если есть compute хвост).
 
-### Phase 8.1 — Q4_0 GEMV на NPU, W4A16 (3–5 дней) [TASK-8.1]
+### Phase 8.1 — Q4_0 GEMV на NPU, W4A16 (3–5 дней)
 
 **Status (2026-05-21): ✅ DONE.** End-to-end INT4 dispatch path lands
 correctly and matches `cpu_baseline` byte-exact on three regression tests
@@ -82,17 +82,17 @@ correctly and matches `cpu_baseline` byte-exact on three regression tests
 
 | Sub-step | Status | Where |
 |---|---|---|
-| **[TASK-8.1.1]** `compile.py` `fused-dequant-gemv` subcommand + cache key | ✅ DONE | `compile.py` lines ~97-112, ~825-870, ~1222-1237 |
-| **[TASK-8.1.2]** `XDNA_OP_GEMV_INT4 = 10` enum entry | ✅ DONE | `ggml-xdna.cpp` line ~93 |
-| **[TASK-8.1.3]** `xdna_repack_q4_0_to_fused_int4()` host-side repack | ✅ DONE | `ggml-xdna.cpp` lines ~1023-1091 |
-| **[TASK-8.1.4]** Weight BO caching (keyed by `src0->data`) | ✅ DONE | `mul_mat_gemv_int4` lazy alloc |
-| **[TASK-8.1.5]** Dispatch path in `mul_mat_gemv` | ✅ DONE | helper `mul_mat_gemv_int4` (~180 LOC) |
-| **[TASK-8.1.6]** `supports_op` claim for Q4_0 under `XDNA_ENABLE_GEMV_INT4` | ✅ DONE | gated default-off |
-| **[TASK-8.1.7]** `decode_batch` integration | ✅ DONE (excluded) | Q4_0 skipped, routes through bare `mul_mat_gemv` |
-| **[TASK-8.1.8]** End-to-end byte-exact match vs CPU baseline | ✅ DONE | 3 tests pass, see below |
-| **[TASK-8.1.9]** Host-side bias compensation math | ✅ DONE | `bias[i] = 8 * sum_g sf[i,g] * S[g]` |
-| **[TASK-8.1.10]** `select_gemv_tiles` mirror in C++ (`tile_in` may be 1, 2, 4, or 8) | ✅ DONE | `xdna_select_gemv_tiles_int4()` |
-| **[TASK-8.1.11]** Kernel-side `aie::sub(8)` (review note N2) | ⏳ FUTURE | optimization; would remove the host bias step |
+| 8.1.1 `compile.py` `fused-dequant-gemv` subcommand + cache key | ✅ DONE | `compile.py` lines ~97-112, ~825-870, ~1222-1237 |
+| 8.1.2 `XDNA_OP_GEMV_INT4 = 10` enum entry | ✅ DONE | `ggml-xdna.cpp` line ~93 |
+| 8.1.3 `xdna_repack_q4_0_to_fused_int4()` host-side repack | ✅ DONE | `ggml-xdna.cpp` lines ~1023-1091 |
+| 8.1.4 Weight BO caching (keyed by `src0->data`) | ✅ DONE | `mul_mat_gemv_int4` lazy alloc |
+| 8.1.5 Dispatch path in `mul_mat_gemv` | ✅ DONE | helper `mul_mat_gemv_int4` (~180 LOC) |
+| 8.1.6 `supports_op` claim for Q4_0 under `XDNA_ENABLE_GEMV_INT4` | ✅ DONE | gated default-off |
+| 8.1.7 `decode_batch` integration | ✅ DONE (excluded) | Q4_0 skipped, routes through bare `mul_mat_gemv` |
+| 8.1.8 End-to-end byte-exact match vs CPU baseline | ✅ DONE | 3 tests pass, see below |
+| Host-side bias compensation math | ✅ DONE | `bias[i] = 8 * sum_g sf[i,g] * S[g]` |
+| `select_gemv_tiles` mirror in C++ (`tile_in` may be 1, 2, 4, or 8) | ✅ DONE | `xdna_select_gemv_tiles_int4()` |
+| Kernel-side `aie::sub(8)` (review note N2) | ⏳ FUTURE | optimization; would remove the host bias step |
 
 **Root-cause of the original "GGGG" output bug:** `mul_mat_gemv_int4`
 hardcoded `m_input = 1` in the repack and dispatch sizing, but
@@ -310,13 +310,13 @@ Until then, `XDNA_ENABLE_GEMV_INT4=1` should remain default-off.
 
 (original 8.1 plan continues from here ↓)
 
-### Phase 8.1 (original detail) — Q4_0 GEMV на NPU, W4A16 (3–5 дней) [TASK-8.1-DET]
+### Phase 8.1 (original detail) — Q4_0 GEMV на NPU, W4A16 (3–5 дней)
 
 **Цель**: dispatch Q4_0 `mul_mat` с M=1 на NPU через fused_dequant_gemv.
 Эффект: O_proj decode (12×0.56ms) + bare-MM decode → ~3× быстрее на этих
 узлах, ожидаемо `5.9 → 7.0 t/s`.
 
-#### [TASK-8.1.1-DET] `compile.py`
+#### 8.1.1 `compile.py`
 
 - Добавить `FUSED_DEQUANT_GEMV_KERNEL = ("fused_dequant_gemv",)` (1-kernel xclbin).
 - Добавить `fused_dequant_gemv_cache_key(M, K, num_aie_columns, group_size)`.
@@ -326,13 +326,13 @@ Until then, `XDNA_ENABLE_GEMV_INT4=1` should remain default-off.
 - Добавить CLI subcommand `fused_dequant_gemv` в `__main__`.
 - Использовать существующий select для `tile_size_*` (есть assert в `AIEFusedDequantGEMV.__init__`).
 
-#### [TASK-8.1.2-DET] `ensure_compiled` / `get_or_load_kernel`
+#### 8.1.2 `ensure_compiled` / `get_or_load_kernel`
 
 - Новый `XDNA_OP_GEMV_INT4 = 6` в enum.
 - Кэш-ключ: `gemv_int4_K{K}_N{N}_{cols}col_g{group_size}`.
 - В `make_cache_key` ветка с `op=XDNA_OP_GEMV_INT4`.
 
-#### [TASK-8.1.3-DET] Host-side repack Q4_0
+#### 8.1.3 Host-side repack Q4_0
 
 Новая функция в `ggml-xdna.cpp` после `xdna_repack_q8_0_to_gemv_int8`
 ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:892]]):
@@ -398,7 +398,7 @@ aie::vector<int8, block_size> as_int8s =
 тогда не нужен. Ставлю это в **рекомендацию для production**; вариант с host
 bias оставляем как PoC шаг 1.
 
-#### [TASK-8.1.4-DET] Weight BO кэширование
+#### 8.1.4 Weight BO кэширование
 
 Зеркало `swiglu_warm_weight_int8` ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:2390-2447]]):
 
@@ -408,7 +408,7 @@ bias оставляем как PoC шаг 1.
 - На следующий dispatch: переиспользовать.
 - Память: `M·K/2 + M·(K/32)·2 = 0.5·M·K + M·K/16 = 0.5625·M·K` против `2·M·K` для bf16. Для O_proj (2048²): **2.25 MB вместо 8 MB**.
 
-#### [TASK-8.1.5-DET] Dispatch путь
+#### 8.1.5 Dispatch путь
 
 Расширить `ggml_backend_xdna_mul_mat_gemv` ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:1405]]):
 
@@ -430,7 +430,7 @@ if (use_int4) {
 
 `opcode = 3` тот же что для GEMV (см. [[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:1482]]).
 
-#### [TASK-8.1.6-DET] `supports_op`
+#### 8.1.6 `supports_op`
 
 В `ggml_backend_xdna_device_supports_op` ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:12173]]):
 
@@ -441,7 +441,7 @@ if (int4_ok && src0->type == GGML_TYPE_Q4_0) return true;
 
 Под gate'ом — поведение симметрично `int8_ok` чтобы не ломать графовую сегментацию.
 
-#### [TASK-8.1.7-DET] `decode_batch` integration
+#### 8.1.7 `decode_batch` integration
 
 В `xdna_plan_decode_batch` ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:5061]]) добавить:
 - Включить `GGML_TYPE_Q4_0` weight в eligible set, если `int4_ok`.
@@ -453,34 +453,22 @@ if (int4_ok && src0->type == GGML_TYPE_Q4_0) return true;
 - `w_ptrs` тянутся из кэша `entry->b_bo_cache` (уже repacked).
 - Те же 6 args что для bf16 GEMV.
 
-#### [TASK-8.1.8-DET] Тестирование
+#### 8.1.8 Тестирование
 
-1. **[TASK-8.1.8.1] Unit-тест repack**: пройтись по 100 случайным rows × 32 элементов, сравнить
+1. **Unit-тест repack**: пройтись по 100 случайным rows × 32 элементов, сравнить
    результат GEMV на NPU с `dequantize_row_q4_0 + ref GEMV` на CPU, `abs_tol=0.05`.
-2. **[TASK-8.1.8.2] End-to-end**: `llama-cli -m models/llama-3.2-1b-instruct-q4_0.gguf -p "The capital of France is"`,
+2. **End-to-end**: `llama-cli -m models/llama-3.2-1b-instruct-q4_0.gguf -p "The capital of France is"`,
    ожидаемый ответ "Paris". На двух конфигах:
    - `XDNA_ENABLE_GEMV_INT4=0` (baseline через CPU dequant) — sanity.
    - `XDNA_ENABLE_GEMV_INT4=1` (NPU) — accuracy.
-3. **[TASK-8.1.8.3] Бенчмарк**: 32 токена decode, ожидание ≥7 t/s (1.2× от 5.9 t/s).
+3. **Бенчмарк**: 32 токена decode, ожидание ≥7 t/s (1.2× от 5.9 t/s).
 
-### [TASK-8.3] Phase 8.3 — INT4 QKV (1–2 дня, опционально)
-
-QKV — три GEMV с общим input, разные output. На текущем bf16 пути это один
-fused xclbin ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:5955]]) с
-1.17 ms на dispatch. Переход на INT4:
-
-- **[TASK-8.3.1]** Либо: переиспользовать тот же matcher что в `mul_mat_swiglu_int4`, собрать 3
-  отдельных INT4 GEMV.
-- **[TASK-8.3.2]** Либо: новый `fused_qkv_int4` xclbin (3 параллельных `fused_dequant_gemv` worker'а).
-- **[TASK-8.3.3]** ROI оценить **после Phase 8.2** замером. Если QKV доминирует на профайле —
-  строить. Иначе не трогать.
-
-### [TASK-8.2] Phase 8.2 — INT4 SwiGLU FFN (3–4 дня)
+### Phase 8.2 — INT4 SwiGLU FFN (3–4 дня)
 
 **Цель**: вынести `swiglu_decode` на INT4, забрать 30+ ms/token. Это самая
 дорогая операция (3.62 ms × 12 = 43 ms/token).
 
-#### [TASK-8.2.1] IRON: `swiglu_decode_int4`
+#### 8.2.1 IRON: `swiglu_decode_int4`
 
 Создать `iron/operators/swiglu_decode_int4/{op.py, design.py, reference.py, test.py}`
 по шаблону `swiglu_decode/` но с `AIEFusedDequantGEMV` вместо GEMV:
@@ -489,27 +477,27 @@ fused xclbin ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:5955]]) с
 - Использовать `chain_swiglu_artifacts` ([[file:IRON-windows/iron/operators/swiglu_base.py:10]]).
 - Промежуточные bf16 буфера в L2.
 
-#### [TASK-8.2.2] `compile.py`
+#### 8.2.2 `compile.py`
 
 - `compile_swiglu_decode_int4(embedding_dim, hidden_dim, num_aie_columns,
   output_dir, group_size=32)` — зеркало `compile_swiglu_decode_int8` но c
   IRON `AIESwiGLUDecodeInt4` и `validate_swiglu_decode_int4_shapes`.
 
-#### [TASK-8.2.3] Host-side: `ggml_backend_xdna_mul_mat_swiglu_int4`
+#### 8.2.3 Host-side: `ggml_backend_xdna_mul_mat_swiglu_int4`
 
 Зеркало `_swiglu_int8` ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:2458]]):
 - Три INT4 weight BO: gate, up, down. Repack один раз через `xdna_repack_q4_0_to_fused_int4`.
 - В качестве `m_input` для каждого GEMV: clamp по L1 budget ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:2492-2495]]).
 - Gate: `XDNA_ENABLE_SWIGLU_INT4` (новый env var).
 
-#### [TASK-8.2.4] Matcher
+#### 8.2.4 Matcher
 
 В `ggml_backend_xdna_swiglu_match` ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:5210]]) расширить:
 - `all_q4_0 = (gate_w->type == GGML_TYPE_Q4_0) && (up_w->type == GGML_TYPE_Q4_0) && (down_w->type == GGML_TYPE_Q4_0)`
 - `allow_int4 = (int4_swiglu_enabled) && all_q4_0 && shape_dispatchable`
 - Disjoint от int8 пути (mutually exclusive).
 
-#### [TASK-8.2.5] Acceptance
+#### 8.2.5 Acceptance
 
 - 12 слоёв × ~1 ms = **12 ms/token вместо 43 ms/token**.
 - Ожидаемо: `5.9 → 9–10 t/s` (предполагая что не упёрлись в L1).
@@ -527,76 +515,43 @@ fused xclbin ([[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:5955]]) с
 ROI оценить **после Phase 8.2** замером. Если QKV доминирует на профайле —
 строить. Иначе не трогать.
 
-### Phase 8.4 — Q4_K Support (DONE) [TASK-8.4]
+### Phase 8.4 — Q4_K support (3–5 дней)
 
-**Статус: ✅ Успешно реализовано.**
+Q4_K сложнее: super-block 256 элементов, 8 sub-blocks по 32, 6-битные scales
+и mins ([[file:llama.cpp-xdna/ggml/src/ggml-common.h:317-328]]):
 
-В ходе выполнения данной фазы была полностью добавлена и отлажена поддержка формата `Q4_K` на NPU. 
-
-Формат `Q4_K` сложнее обычного `Q4_0`: здесь используется super-block из 256 элементов, состоящий из 8 sub-blocks по 32 элемента, с 6-битными scales и mins:
 ```
 [fp16 d][fp16 dmin][12 bytes scales/mins][128 bytes qs]
 ```
-Каждый элемент восстанавливается как `q · sub_scale · d − sub_min · dmin`, где sub_scale и sub_min — 6-битные.
 
-Мы успешно реализовали **Вариант А (Host-side repack)**:
-*   **[TASK-8.4.1]** **Совместимость ядер**: Обеспечен бесшовный (lossless) dispatch `Q4_K` через то же самое v2-ядро `fused_dequant_gemv` (INT4) без усложнения AIE-ядер и без необходимости поддерживать двухуровневые шкалы на стороне NPU (Вариант B).
-*   **[TASK-8.4.2]** **Хост-сайд repack**: Реализована функция `xdna_repack_q4_K_to_fused_int4()`, которая разбирает суперблоки, вычисляет эффективные шкалы `effective_scale = d × sub_scale` и минимумы `effective_min = dmin × sub_min` для каждой группы из 32 элементов и записывает их раздельно. 
-*   **[TASK-8.4.3]** **DDR Layout**: Благодаря переупаковке шаг (stride) данных совпадает с форматом `Q4_0`, а минимумы укладываются в плоскую секцию размера `M × num_groups` в конце буфера BO.
-*   **[TASK-8.4.4]** **Компенсация смещения (Bias compensation)**: Вычисляется на хосте по формуле `bias[i] = sum_g (eff_min[i,g] × S[g])`. Потеря качества от этого минимальна и амортизируется при первом обращении (first-touch).
+Каждый элемент: `q · sub_scale · d − sub_min · dmin` где sub_scale, sub_min — 6-битные.
 
-**Результаты тестирования:**
-*   `paris_short_q4_k_m` — посимвольно совпадает с CPU-baseline (byte-exact).
-*   `paris_drift_64_q4_k_m_int4` — 165 символов точного совпадения, далее наблюдается стандартный для bf16 дрейф.
-*   Код успешно зафиксирован в коммите `a9819e096`.
+**Вариант A (рекомендация)**: host-side full dequant → re-quantize в W4A16
+per-group-32:
+1. `dequantize_row_q4_K(src0->data, fp32_buf, row_size)`.
+2. Для каждой группы 32 элементов: compute `scale = max(|x|) / 7.5` (или MSE),
+   re-quantize в `uint4 = round(x / scale + 8)`, clamp `[0..15]`.
+3. Сохранить в IRON-формате, scale в bf16.
 
-#### Совместимость с не-Llama архитектурами (Qwen 3.5 9B) [TASK-8.4.5]
+Потеря качества <0.5% perplexity (то же делает Quark когда конвертирует W4A16
+checkpoint в W4A8, [см. блог про Kimi K2.5](https://rocm.blogs.amd.com/artificial-intelligence/kimi-k2.5-w4a8/)).
+Прохождение по весам один раз при first-touch — амортизируется.
 
-В ходе валидации INT4-пути мы провели тестирование и детальный анализ модели **Qwen3.5-9B-Q4_0** (модель размером 5.4 GB) через сценарии `correctness_test.py --bench --model qwen` и специализированные тесты `qwen35_ml_npu_full` / `qwen35_ml_npu_gemv_only`.
+**Вариант B**: native Q4_K kernel с двухуровневыми scales. Существенно больше
+работы, не критично для PoC. Пропустить до Phase 8.5+.
 
-**Специфика архитектуры Qwen3.5-9B (по метаданным GGUF):**
-*   **arch**: `qwen35`
-*   **block_count**: 32 (против 16 у Llama 1B)
-*   **embedding**: 4096 (против 2048)
-*   **ffn**: 12288 (против 8192)
-*   **heads / heads_kv**: 16 / 4 (GQA 4:1, пропорция совпадает с Llama)
-*   **head_dim**: 256 (против 64 у Llama)
-*   **rope**: M-RoPE `[11, 11, 10, 0]` (многомерный, против стандартного 1D)
-*   **attention**: SWA (sliding window attention) с интервалом `full_attention_interval=4` (против полной обработки на каждом слое)
-
-**Обнаруженное ограничение: `head_dim != 64` жестко зашит в матчерах.**
-Текущая реализация NPU-операторов содержит жестко зашитый размер размерности головы `head_dim = 64` (всего найдено 9 мест с этим ограничением в `ggml-xdna.cpp` на строках 5546, 7184, 7551, 8855, 9030, 10097, 10166, 10297, а также константа `const int64_t hd = 64;` на строке 11447). FlowKV decode, attention_prefill, decode_batch, QKV-слияние, transformer_block — все они отклоняют `head_dim != 64` и перенаправляют выполнение на CPU.
-
-**Результаты бенчмарков** (n_predict=64, --temp 0, медиана из 2 запусков):
-
-| Конфигурация | decode t/s | Корректность |
-|---|---:|---|
-| Qwen3.5-9B CPU Q4_0 | **3.2** | ✅ Проходит |
-| Qwen3.5-9B NPU INT4 full | 1.6 | ❌ Мусор (смесь CN/EN токенов) |
-| Qwen3.5-9B NPU INT4 GEMV-only | **3.5** | ✅ 737 символов точного совпадения с CPU |
-
-**Причина неверного вывода в "NPU full" при отклоненном Attention:**
-Несмотря на то, что матчеры Attention отклоняют head_dim≠64, другие NPU-пути (transformer_block, decode_batch) все равно пытались частично задействовать формы без жесткого контроля head_dim, либо компиляция INT4 ломалась на незнакомых размерах (например, ffn_down у Qwen имеет размер K=12288 N=4096, что вызывало ошибку `INT4 GEMV compile failed for K=12288 N=4096` во время генерации).
-
-#### [TASK-8.4.6] Решение: пресет `npu_int4_gemv_only`
-Этот пресет полностью отключает специфичные для архитектур NPU-операторы, оставляя только чистый GEMV INT4. Этот пресет является независимым от архитектуры и прекрасно работает на Qwen, Mistral, Gemma и любых других моделях с весами Q4_0/Q4_K при совместимых формах матриц.
-
-#### [TASK-8.4.7] Перспектива — Фаза 8.5 (пока не планируется)
-Генерализация параметра `head_dim` для путей FlowKV/attention. Избавление от жестко зашитого размера 64 откроет полноценное NPU-ускорение для Llama-3.1-8B, Llama-3.2-3B, Qwen, Mistral, Gemma и других семейств.
-*Оценка*: 3–5 дней работы по обновлению ядра FlowKV и матчников.
-
-### Phase 8.5 — W4A8 (опционально, 5+ дней) [TASK-8.5]
+### Phase 8.5 — W4A8 (опционально, 5+ дней)
 
 Если W4A16 упёрлось в bf16 MAC throughput (а не в memory): перейти на
 INT4-веса × INT8-активации, INT8 MFMA (см. ROCm Kimi K2.5 блог).
 
-- **[TASK-8.5.1]** Новое ядро: `fused_dequant_gemv_int8.cc` — unpack uint4→int8 (не →bf16),
+- Новое ядро: `fused_dequant_gemv_int8.cc` — unpack uint4→int8 (не →bf16),
   затем `aie::mac` int8×int8→i32, scale-apply в эпилоге.
-- **[TASK-8.5.2]** Активации квантуются per-token (уже есть `xdna_quantize_bf16_to_int8` на
+- Активации квантуются per-token (уже есть `xdna_quantize_bf16_to_int8` на
   [[file:llama.cpp-xdna/ggml/src/ggml-xdna/ggml-xdna.cpp:1033]]).
-- **[TASK-8.5.3]** Theoretical: 2× от W4A16 если compute-bound.
+- Theoretical: 2× от W4A16 если compute-bound.
 
-**[TASK-8.5.4]** **Гейт**: запускать только если Phase 8.2 даёт <10 t/s и профайл показывает
+**Гейт**: запускать только если Phase 8.2 даёт <10 t/s и профайл показывает
 compute-bound.
 
 ## Риски и митигации
@@ -625,18 +580,18 @@ compute-bound.
 
 | Phase | Дни P50 | Дни P90 | Выход | t/s | Status |
 |---|---|---|---|---|---|
-| **[TASK-8.0]** Validation | 0.5 | 1 | INT4 kernel works on STX | 5.9 (baseline) | ⚪ partial (pyxrt blocked for pytest; compile.py via system() works) |
-| **[TASK-8.1]** Q4_0 GEMV scaffolding (enum + supports_op + repack + compile.py) | landed | landed | safe default-off scaffolding | 5.9 (unchanged) | ✅ commit 35ae3fee1 |
-| **[TASK-8.1]** Q4_0 GEMV dispatch path (BO + kernel + bias + tile_in selector) | landed | landed | NPU dispatch for bare Q4_0 mul_mat, byte-exact vs CPU on 3 regression tests | **decode 3.40 t/s** measured (regression vs NPU bf16 5.30 t/s -- fusion lost) | ✅ DONE (2026-05-21) |
-| **[TASK-8.2]** Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, restores fusion -- needed to net-positive on 8.1 | **measured 2.80 t/s (regression vs 8.1 -- needs profiling)** | ⚠️ Functionally DONE (byte-exact), perf regression -- 8.3 may help |
-| **[TASK-8.3]** QKV INT4 | 1–2 (or skip) | 3 | only if 8.2 profile shows QKV dominates | ~10–11 | measurement-gated |
-| **[TASK-8.4]** Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
-| **[TASK-8.5]** W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
-| **[TASK-9.0]** Async XRT dispatch (NEW, see Phase 9 section below) | **3–4** | **7** | mirror AMD ggml-hsa AQL queue pattern: submit-without-wait per op, sync only on data dependency | **measured Day 1 spike: 1.10-1.44× per-op; projected end-to-end ~5.5 t/s INT4 (1.6×, not 5×)** | **Day 1 done -- projection revised DOWN; still worth shipping for parity with NPU bf16** |
-| **[TASK-8.1-V2]** Optimized INT4 GEMV kernel (PR #101 port) | **landed** | **landed** | drop-in v2 of `fused_dequant_gemv.cc` with compile-time DIM_K/G + double-pump + AIE pipelining hints. **DEFAULT for Q4_0 models since commit bd4654c73**; v1 reachable via XDNA_DISABLE_GEMV_INT4_V2=1 | **measured: 5.40-5.60 t/s decode (1.65× vs v1, 6% faster than NPU bf16; INT4 finally net-positive)** | ✅ DONE 2026-05-22 (commits 8de4472d8 + bd4654c73) |
+| 8.0 Validation | 0.5 | 1 | INT4 kernel works on STX | 5.9 (baseline) | ⚪ partial (pyxrt blocked for pytest; compile.py via system() works) |
+| 8.1 Q4_0 GEMV scaffolding (enum + supports_op + repack + compile.py) | landed | landed | safe default-off scaffolding | 5.9 (unchanged) | ✅ commit 35ae3fee1 |
+| 8.1 Q4_0 GEMV dispatch path (BO + kernel + bias + tile_in selector) | landed | landed | NPU dispatch for bare Q4_0 mul_mat, byte-exact vs CPU on 3 regression tests | **decode 3.40 t/s** measured (regression vs NPU bf16 5.30 t/s -- fusion lost) | ✅ DONE (2026-05-21) |
+| 8.2 Q4_0 SwiGLU FFN | 3–4 | 8–10 | FFN on INT4, restores fusion -- needed to net-positive on 8.1 | **measured 2.80 t/s (regression vs 8.1 -- needs profiling)** | ⚠️ Functionally DONE (byte-exact), perf regression -- 8.3 may help |
+| 8.3 QKV INT4 | 1–2 (or skip) | 3 | only if 8.2 profile shows QKV dominates | ~10–11 | measurement-gated |
+| 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
+| 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
+| **9 Async XRT dispatch** (NEW, see Phase 9 section below) | **3–4** | **7** | mirror AMD ggml-hsa AQL queue pattern: submit-without-wait per op, sync only on data dependency | **measured Day 1 spike: 1.10-1.44× per-op; projected end-to-end ~5.5 t/s INT4 (1.6×, not 5×)** | **Day 1 done -- projection revised DOWN; still worth shipping for parity with NPU bf16** |
+| **8.1.v2 Optimized INT4 GEMV kernel (PR #101 port)** | **landed** | **landed** | drop-in v2 of `fused_dequant_gemv.cc` with compile-time DIM_K/G + double-pump + AIE pipelining hints. **DEFAULT for Q4_0 models since commit bd4654c73**; v1 reachable via XDNA_DISABLE_GEMV_INT4_V2=1 | **measured: 5.40-5.60 t/s decode (1.65× vs v1, 6% faster than NPU bf16; INT4 finally net-positive)** | ✅ DONE 2026-05-22 (commits 8de4472d8 + bd4654c73) |
 | **Realistic total to target** | **2 weeks** | **3–4 weeks** | Q4_0 + Q4_K on NPU | **5.9 → 9–10 t/s** | |
 
-### Phase 9 — Async XRT dispatch pipeline (NEW, 3-4 days P50) [TASK-9.0]
+### Phase 9 — Async XRT dispatch pipeline (NEW, 3-4 days P50)
 
 **Origin:** code inspection of `ypapadop-amd/ggml@hsa-backend` on 2026-05-22 revealed
 AMD's official open-source GGML NPU backend uses a fundamentally different
@@ -851,34 +806,34 @@ struct xdna_bo_inflight_tracker {
 
 **Step plan (4-day sprint, mirrors XRT.pdf):**
 
-1. **[TASK-9.0.1]** **Day 1 — Isolated Prototype (Spike):** standalone test program that
+1. **Day 1 — Isolated Prototype (Spike):** standalone test program that
    loads the existing `gemv_int4_K2048_N8192_8col_g32.xclbin`, allocates
    100 fresh `xrt::run` objects, calls `.start()` on each WITHOUT
    intervening waits, then waits on the last. Compare total elapsed
    time to 100× sync baseline. **Expected:** async ≈ kernel_time × 100
    (~50-100 ms); sync = ~200 ms. If async ≈ sync → XRT serializes
    under the hood and Phase 9 needs deeper rework.
-2. **[TASK-9.0.2]** **Day 2 — Metadata + Tracking Infra:** add `ggml_backend_xdna_tensor_extra`
+2. **Day 2 — Metadata + Tracking Infra:** add `ggml_backend_xdna_tensor_extra`
    to all output tensors; implement `xdna_bo_inflight_tracker`; integrate
    sync barriers before host reads and dtype conversions; intercept
    `xrt::bo::sync(TO_DEVICE)` in `set_tensor_async` to wait for the
    previous consumer.
-3. **[TASK-9.0.3]** **Day 3 — Global Operator Migration:** transition `mul_mat_gemv`,
+3. **Day 3 — Global Operator Migration:** transition `mul_mat_gemv`,
    `mul_mat_gemv_int4`, `mul_mat_swiglu`, `mul_mat_swiglu_int4`,
    `decode_batch`, QKV, RMSNorm, etc. to async dispatch. Defer all
    immediate host-side reads (bias compensation, etc.) behind
    `requires_sync` flags.
-4. **[TASK-9.0.4]** **Day 4 — Bench + `Q_max` Sweep:** measure end-to-end decode t/s via
+4. **Day 4 — Bench + `Q_max` Sweep:** measure end-to-end decode t/s via
    `correctness_test.py --bench --bench-mode both`. Sweep `Q_max` from
    2 to 16 to find the optimal balance between host dispatch overhead
    and NPU queue saturation. Update the perf table in this doc.
 
 **Acceptance:**
 
-- **[TASK-9.0.5]** All existing correctness tests (`paris_short`, `paris_drift_64`,
+- All existing correctness tests (`paris_short`, `paris_drift_64`,
   `multiquery_*`, INT4 variants) PASS.
-- **[TASK-9.0.6]** Decode t/s improves by ≥ 3× on at least one config (target: 4-5×).
-- **[TASK-9.0.7]** No new XDNA driver crashes / hang errors under stress (run all tests
+- Decode t/s improves by ≥ 3× on at least one config (target: 4-5×).
+- No new XDNA driver crashes / hang errors under stress (run all tests
   back-to-back).
 
 Once Phase 9 lands, the existing Phase 8.x perf measurements should
@@ -1081,7 +1036,77 @@ multi-kernel chain, MLIR-AIE compiles ~10 min/iter).
 | 8.5 | 5+ | 10+ | INT8 MFMA on AIE2P needs separate kernel design |
 | **Total** | **2 weeks** | **3–4 weeks** | Realistic with debug |
 
-**Action**: update Roadmap ta... PR в `llama.cpp-xdna`."
+**Action**: update Roadmap table with both columns.
+
+### N6. Missing prerequisite: Q4_0 GGUF file
+
+Phase 8.1.8 references `models/llama-3.2-1b-instruct-q4_0.gguf` for the
+end-to-end test. This file does not exist in `models/`. Plan should
+add an explicit prerequisite step:
+
+```
+cd C:\llama.cpp-xdna
+.\build\bin\Release\llama-quantize.exe \
+    models\llama-3.2-1b-instruct-BF16.gguf \
+    models\llama-3.2-1b-instruct-q4_0.gguf \
+    q4_0
+```
+
+Takes ~1 min, output ~750 MB. Same for Q4_K in Phase 8.4.
+
+**Action**: add a "Prerequisites" section before Phase 8.0 with the
+quantize commands.
+
+### N7. W4A8 (Phase 8.5) cites GPU material
+
+> "см. ROCm Kimi K2.5 блог"
+
+ROCm = AMD GPU. AIE-2P MAC instructions are different (vector intrinsics
+`aie::mac`, not MFMA). The conceptual gain (INT8 MAC > bf16 MAC for
+memory-bound ops) carries over but specific implementation details
+don't.
+
+**Action**: rewrite Phase 8.5 around concrete AIE evidence. Step 1:
+write a microbenchmark in `aie_kernels/aie2p/bench/` comparing
+`aie::mac<int8>` vs `aie::mac<bf16>` throughput on AIE-2P. If <2× speedup,
+W4A8 isn't worth the kernel complexity. Don't presume from GPU
+literature.
+
+### N8. Phase 8.3 ROI is likely negative — flag explicitly
+
+Current QKV path is a **fused 8col xclbin** producing all of Q, K, V
+in a single 1.17 ms NPU dispatch (see Authoritative FlowKV ABI section
+in NPU_PLAN.md). Splitting into 3 separate INT4 GEMVs means 3 separate
+dispatches + 3 weight BO syncs. For 2048×512 matrices the INT4 memory
+saving (~3x) may not beat the dispatch overhead of going from 1→3 runs.
+
+Plan says "ROI оценить после Phase 8.2" — agreed, but should be
+*explicitly* marked "may be negative ROI" in the Roadmap so it doesn't
+get treated as a default next step after 8.2.
+
+**Action**: change Phase 8.3 from "опционально, 1–2 days" to "blocked
+on measurement: only proceed if Phase 8.2 profiling shows QKV
+dominates the residual decode time".
+
+### N9. RMS_NORM+QKV interference is not mentioned
+
+The chat-mode bug (RMS_NORM 1-col ⊕ QKV 8-col, see NPU_PLAN.md "Known
+bug" section) means `XDNA_ENABLE_RMS_NORM=0` is the current default.
+With Q4_0 QKV (Phase 8.1), the column count of the new INT4 GEMV
+xclbin needs to be ≥4col to avoid recreating the 1-vs-8 interference.
+
+`AIEFusedDequantGEMV` defaults — check `op.py` for column count
+assumptions. If it inherits `num_aie_columns` from the host, ensure
+the host passes `ctx->num_cols` (8) and not 1. If it has any 1-col
+hard-coding internally, that's a landmine.
+
+**Action**: add a risk row to the table:
+"INT4 GEMV xclbin compiled with cols=1 → may revive RMS+QKV-class
+interference. Mitigation: always compile with num_aie_columns ≥ 4."
+
+### N10. Build-agent delegation note inconsistency
+
+> "Task 1: ... PR в `llama.cpp-xdna`."
 
 Task 1 (Phase 8.0 + 8.1) is mostly one-repo (main repo), correct.
 Task 2 (Phase 8.2) is correctly described as two-repo.
@@ -1112,4 +1137,63 @@ delegation note.
 None of these block the overall plan — it is sound and grounded. They
 just remove ambiguity that would burn an executing agent's time.
 
+### Phase 8.4 — Q4_K Support (DONE 2026-05-22)
+
+Lossless Q4_K dispatch through the same v2 `fused_dequant_gemv` kernel.
+Host-side `xdna_repack_q4_K_to_fused_int4()` parses super-blocks,
+computes per-group effective_scale = d × sub_scale and effective_min =
+dmin × sub_min, writes them separately so the kernel's per-tile stride
+matches Q4_0 (mins go in a flat M×num_groups section at end of BO).
+Bias compensation: `bias[i] = sum_g (eff_min[i,g] × S[g])`.
+
+Tests: paris_short_q4_k_m (byte-exact), paris_drift_64_q4_k_m_int4
+(165 chars exact then normal bf16 drift). Commit a9819e096.
+
+### Non-Llama Architecture Compatibility (2026-05-22, Qwen3.5-9B test)
+
+Tested Qwen3.5-9B-Q4_0 (5.4 GB Q4_0 model) via `correctness_test.py
+--bench --model qwen` and dedicated tests `qwen35_ml_npu_full` /
+`qwen35_ml_npu_gemv_only`.
+
+**Qwen3.5-9B architecture (from GGUF metadata):**
+- arch: `qwen35`
+- block_count: 32 (vs 16 Llama 1B)
+- embedding: 4096 (vs 2048)
+- ffn: 12288 (vs 8192)
+- heads: 16 / heads_kv: 4 (GQA 4:1, same ratio as Llama)
+- **head_dim: 256** (vs 64 Llama)
+- rope: M-RoPE [11, 11, 10, 0] (multidimensional, vs standard 1D)
+- attention: SWA with full_attention_interval=4 (vs full every layer)
+
+**Blocker: `head_dim != 64` hardcoded in 9 matchers.**
+Lines in ggml-xdna.cpp: 5546, 7184, 7551, 8855, 9030, 10097, 10166,
+10297, plus `const int64_t hd = 64;` at 11447. FlowKV decode,
+attention_prefill, decode_batch, QKV fusion, transformer_block — all
+reject head_dim != 64 and fall back to CPU.
+
+**Bench results** (n_predict=64, --temp 0, median of 2):
+
+| Config | decode t/s | Correctness |
+|---|---:|---|
+| Qwen3.5-9B CPU Q4_0 | **3.2** | ✅ |
+| Qwen3.5-9B NPU INT4 full | 1.6 | ❌ garbage (mixed CN/EN tokens) |
+| Qwen3.5-9B NPU INT4 GEMV-only | **3.5** | ✅ 737 chars exact match vs CPU |
+
+**Why "NPU full" produces garbage even with attention rejected:**
+Attention matchers reject head_dim≠64, but other NPU paths
+(transformer_block, decode_batch) may still partially dispatch shapes
+without an explicit head_dim guard, OR the INT4 compile fails for
+unfamiliar shapes (K=12288 N=4096 is Qwen ffn_down — observed
+"INT4 GEMV compile failed for K=12288 N=4096" repeatedly).
+
+**Workaround: `npu_int4_gemv_only` preset.** Disables every
+architecture-specific NPU op, keeps only the pure-matmul INT4 GEMV
+path. Architecture-agnostic; works on Qwen / Mistral / Gemma /
+anything with Q4_0 weights and shape-compatible matmuls.
+
+**Future Phase 8.5 (not yet planned):** Universal `head_dim` parameter
+for FlowKV/attention paths. Today's hardcoded 64 makes the NPU stack
+Llama-1B-specific; lifting that to a runtime/compile-time tunable
+opens up Llama-3.1-8B, Llama-3.2-3B, Qwen, Mistral, Gemma, etc.
+Estimated: 3-5 days of FlowKV kernel changes + matcher updates.
 
