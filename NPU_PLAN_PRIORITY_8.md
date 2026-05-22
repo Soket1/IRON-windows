@@ -1136,3 +1136,15 @@ delegation note.
 
 None of these block the overall plan — it is sound and grounded. They
 just remove ambiguity that would burn an executing agent's time.
+
+### Phase 8.4 — Q4_K Support (DONE 2026-05-22)
+
+Lossless Q4_K dispatch through the same v2 `fused_dequant_gemv` kernel.
+Host-side `xdna_repack_q4_K_to_fused_int4()` parses super-blocks,
+computes per-group effective_scale = d × sub_scale and effective_min =
+dmin × sub_min, writes them separately so the kernel's per-tile stride
+matches Q4_0 (mins go in a flat M×num_groups section at end of BO).
+Bias compensation: `bias[i] = sum_g (eff_min[i,g] × S[g])`.
+
+Tests: paris_short_q4_k_m (byte-exact), paris_drift_64_q4_k_m_int4
+(165 chars exact then normal bf16 drift). Commit a9819e096.
