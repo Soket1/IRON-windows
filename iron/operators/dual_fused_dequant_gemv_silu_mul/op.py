@@ -120,12 +120,19 @@ class AIEDualFusedDequantGEMVSiLUMul(AIEOperatorBase):
             ],
         )
 
+        # Per-shape kernel object name + -DDIM_K/-DGROUP_SIZE flags so the
+        # AIE compiler can specialize the inner loop bounds. Different
+        # (K, group_size) combos produce distinct .o files automatically.
+        kernel_obj_name = (
+            f"dual_fused_dequant_gemv_silu_mul_{self.K}k_g{self.group_size}.o"
+        )
+
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelObjectArtifact.new(
-                    "dual_fused_dequant_gemv_silu_mul.o",
+                    kernel_obj_name,
                     depends=[
                         SourceArtifact.new(
                             self.context.base_dir
@@ -133,6 +140,10 @@ class AIEDualFusedDequantGEMVSiLUMul(AIEOperatorBase):
                             / "aie2p"
                             / "dual_fused_dequant_gemv_silu_mul.cc"
                         )
+                    ],
+                    extra_flags=[
+                        f"-DDIM_K={self.K}",
+                        f"-DGROUP_SIZE={self.group_size}",
                     ],
                 ),
             ],

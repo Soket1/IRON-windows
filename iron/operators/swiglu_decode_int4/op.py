@@ -18,7 +18,7 @@ from iron.operators.dual_fused_dequant_gemv_silu_mul.op import (
     AIEDualFusedDequantGEMVSiLUMul,
     interleave_packed_int4,
 )
-from iron.operators.fused_dequant_gemv.op import AIEFusedDequantGEMV
+from iron.operators.fused_dequant_gemv_v2.op import AIEFusedDequantGEMVv2
 from iron.operators.fused_dequant_gemv.reference import quantize_and_pack
 from iron.common.utils import torch_to_numpy
 
@@ -30,7 +30,7 @@ class AIESwiGLUDecodeInt4(AIEOperatorBase):
 
     Mirror of `AIESwiGLUDecode` (bf16) but uses
     `AIEDualFusedDequantGEMVSiLUMul` for the fused gate+up+silu+mul stage
-    and `AIEFusedDequantGEMV` for the down stage. Both stages share the
+    and `AIEFusedDequantGEMVv2` for the down stage. Both stages share the
     same Q4_0-compatible per-group bf16 scale format (group_size=32).
     """
 
@@ -158,7 +158,7 @@ class AIESwiGLUDecodeInt4(AIEOperatorBase):
             group_size=self.group_size,
         )
 
-        gemv_2 = AIEFusedDequantGEMV(
+        gemv_2 = AIEFusedDequantGEMVv2(
             M=self.embedding_dim,
             K=self.hidden_dim,
             num_aie_columns=down_cols,

@@ -73,17 +73,21 @@ def my_dual_fused_dequant_gemv_silu_mul(dev, cols, M, K, m_input,
     L3_B_ty = np.ndarray[(K,), dtype_vec]
     L3_C_ty = np.ndarray[(M,), dtype_out]
 
+    # V2 kernel: K and group_size baked in via -D flags, dropped from
+    # the runtime arg list. Per-shape kernel object name matches op.py.
+    kernel_obj = f"dual_fused_dequant_gemv_silu_mul_{K}k_g{group_size}.o"
+
     # Dequant-GEMV writing to left_buf (phase=0) or right_buf (phase=1)
     matvec = Kernel(
         "dual_fused_dequant_gemv_bf16",
-        "dual_fused_dequant_gemv_silu_mul.o",
-        [np.int32, np.int32, np.int32, L1_A_ty, L1_B_ty, np.int32, np.int32],
+        kernel_obj,
+        [np.int32, np.int32, L1_A_ty, L1_B_ty, np.int32],
     )
 
     # SiLU+Mul reads static buffers, writes C FIFO
     silu_mul_fn = Kernel(
         "dual_fused_dequant_gemv_silu_mul_bf16",
-        "dual_fused_dequant_gemv_silu_mul.o",
+        kernel_obj,
         [L1_C_ty, np.int32],
     )
 
@@ -100,14 +104,14 @@ def my_dual_fused_dequant_gemv_silu_mul(dev, cols, M, K, m_input,
                     j_i32 = index.casts(T.i32(), j_idx)
                     row_offset = j_i32 * m_input
                     a = A_fifo.acquire(1)
-                    matvec_fn(m_input, K, row_offset, a, b, 0, group_size)
+                    matvec_fn(m_input, row_offset, a, b, 0)
                     A_fifo.release(1)
                 # Phase 1: W2 (up) rows -> right_buf
                 for j_idx in range_(m_output // m_input):
                     j_i32 = index.casts(T.i32(), j_idx)
                     row_offset = j_i32 * m_input
                     a = A_fifo.acquire(1)
-                    matvec_fn(m_input, K, row_offset, a, b, 1, group_size)
+                    matvec_fn(m_input, row_offset, a, b, 1)
                     A_fifo.release(1)
                 # Phase 2: silu(left_buf) * right_buf -> output
                 c = C_fifo.acquire(1)
