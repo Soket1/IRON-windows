@@ -588,6 +588,7 @@ compute-bound.
 | 8.4 Q4_K (via W4A16 repack) | 3–5 | 7 | support for Q4_K GGUF | no perf delta | not started |
 | 8.5 W4A8 | 5+ | 10+ | INT8 MFMA if bf16 MAC bound | maybe 12–15 | not started |
 | **9 Async XRT dispatch** (NEW, see Phase 9 section below) | **3–4** | **7** | mirror AMD ggml-hsa AQL queue pattern: submit-without-wait per op, sync only on data dependency | **measured Day 1 spike: 1.10-1.44× per-op; projected end-to-end ~5.5 t/s INT4 (1.6×, not 5×)** | **Day 1 done -- projection revised DOWN; still worth shipping for parity with NPU bf16** |
+| **8.1.v2 Optimized INT4 GEMV kernel (PR #101 port)** | **landed** | **landed** | drop-in v2 of `fused_dequant_gemv.cc` with compile-time DIM_K/G + double-pump + AIE pipelining hints | **measured: 5.60 t/s decode (1.65× vs 8.1, 6% faster than NPU bf16; INT4 finally net-positive)** | ✅ DONE 2026-05-22 (commit 8de4472d8) |
 | **Realistic total to target** | **2 weeks** | **3–4 weeks** | Q4_0 + Q4_K on NPU | **5.9 → 9–10 t/s** | |
 
 ### Phase 9 — Async XRT dispatch pipeline (NEW, 3-4 days P50)
@@ -715,6 +716,47 @@ reference. Possible causes:
 - A simple kernel/design mismatch I haven't traced
 
 Tracking this 4× kernel-side gap is the next investigation, not Phase 9.
+
+**RESOLVED — v2 kernel landed (2026-05-22).** The 4× gap was the kernel
+itself, not the dispatch. PR #101 implements three optimizations missing
+from the v1 IRON-windows kernel: compile-time `DIM_K`/`GROUP_SIZE` for
+loop bounds, `AIE_PREPARE_FOR_PIPELINING` + `AIE_LOOP_MIN_ITERATION_COUNT`
+annotations, and a double-pump 2-group interleaved unpack chain so the
+AIE compiler can hide dequant latency behind activation MAC ops.
+
+Direct port landed in `IRON-windows/aie_kernels/aie2p/fused_dequant_gemv_v2.cc`
++ new IRON op `iron/operators/fused_dequant_gemv_v2/` + `compile.py`
+wrapper. Opt-in via `XDNA_ENABLE_GEMV_INT4_V2=1`; v1 stays the default
+for safety.
+
+Bench (xrt_async_spike, 100 dispatches per shape):
+
+| Shape | v1 sync µs | v2 sync µs | v2 async µs | sync gain | async gain |
+|---|---:|---:|---:|---:|---:|
+| K=2048 N=8192 (ffn_gate/up) | 2307 | 565 | 495 | **4.08×** | **4.66×** |
+| K=8192 N=2048 (ffn_down) | 2405 | 547 | 473 | **4.40×** | **5.09×** |
+| K=2048 N=2048 (attn_q/o) | 640 | 215 | 139 | 2.98× | 4.60× |
+| K=2048 N=512 (attn_k/v) | 227 | 122 | 50 | 1.86× | 4.54× |
+
+End-to-end on Llama 3.2 1B Q4_0 (correctness_test.py --bench --bench-mode
+single, median of 2):
+
+| Config | decode t/s |
+|---|---:|
+| CPU Q4_0 | 11.10 |
+| NPU bf16 | 5.30 |
+| NPU INT4 (8.1 only) | 3.40 |
+| **NPU INT4 v2** | **5.60** |
+| NPU INT4 (8.1+8.2) | 2.80 |
+
+**v2 reverses the Phase 8.1 regression and INT4 is now faster than bf16
+on NPU for the first time.** The 4×+ per-kernel speedup translates to
+~1.65× end-to-end after Amdahl's law accounts for the non-NPU work
+(RMSNorm, sampling, FlowKV, attention masks). All three INT4 correctness
+tests (paris_short / paris_drift_64 / multiquery) pass byte-exact vs
+cpu_baseline with v2 enabled.
+
+
 
 
 
