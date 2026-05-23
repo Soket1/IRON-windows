@@ -1148,3 +1148,52 @@ the undocumented `XCL_BO_FLAGS` upper bits ("Path 1" from the
 writeup) -- AMD/Xilinx may expose a huge-page-pool flag through
 a non-public API. That's out of scope without external sources.
 **Priority 9 closed.**
+
+### Priority 9 follow-up: XRT binary RE + carveout flag tested (2026-05-24)
+
+Reverse-engineered ipustack.sys, xrt_core.dll, xrt_coreutil.dll
+to find undocumented levers (see `xrt-binary-analysis-smmu.md`).
+Identified `xrt::bo::flags::carveout` (= `XCL_BO_FLAGS_KERNBUF`,
+bit 25) as a separate kernel-buffer allocator path inside the
+driver, potentially backed by `MmAllocateContiguousMemorySpecifyCache`
+which CAN give large-page alignment. The other flag bits and
+xrt.ini settings (`Runtime.xrt_bo`, `Runtime.hardware_context_type`,
+`Runtime.npu_sync_destroy_allocation`) remain unexplored.
+
+**Tested carveout:** `xrt::bo(device, sz, xrt::bo::flags::carveout, 0)`
+throws **"Unknown buffer type"** at construction. This XRT/MCDM
+runtime version (W:\src\sw-stack\XRT-MCDM\, leaked in error
+strings) does NOT recognize the carveout flag despite it being
+declared in xrt_bo.h. Dead end for this driver build.
+
+**Real-world weight BO alignment data** (XDNA_PROBE_BO=1 +
+addr=0x.. mod64K=0x.. in warm logs, Llama 3.2 1B Q4_0,
+GGML_XDNA_NUM_COLS=8):
+
+  * Probe at fresh-device init: 64K probe → addr=0x10000
+    (mod64K=0), 4MB probe → addr=0x10000 (mod64K=0). The
+    driver's first BO slots ARE 64K-aligned.
+  * Real INT4 weight BOs: 63 / 112 (56%) at mod64K=0, the
+    other 44% at mod64K = {0x1000, 0x3000, 0x7000, 0x9000,
+    0xb000, 0xd000, 0xf000} -- pure 4K alignment, NOT 64K.
+  * No correlation between weight size and alignment offset --
+    the misalignment grows from compound BO allocations packing
+    into 4K slots within a 64K page.
+
+This confirms the SMMU pressure hypothesis is REAL: ~44% of
+weight BOs straddle 2 SMMU pages per fetch. But no user-space
+API exists to control this -- the driver does its own packing.
+
+**Probe + addr-logging infrastructure kept** (gated by
+XDNA_PROBE_BO=1; warm logs print address unconditionally). The
+carveout fallback was REMOVED from weight-BO allocation as a
+footgun (XDNA_BO_CARVEOUT=1 → exception → crash).
+
+**Priority 9 stays closed.** All known user-space alignment
+levers are now exhausted and documented:
+  * `cacheable` flag -- breaks coherence
+  * `UserPtrBO` with `_aligned_malloc` -- doesn't propagate to device VA
+  * Explicit CLWB before sync() -- doesn't reach device-side mapping
+  * `carveout` flag -- not supported by current XRT-MCDM build
+  * Path 1 (undocumented flag bits) -- out of scope
+  * xrt.ini `Runtime.*` settings -- not investigated yet (low priority)
