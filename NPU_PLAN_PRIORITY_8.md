@@ -1780,3 +1780,100 @@ FlowKV+head_dim=128 dispatch path validation (Phase 8.5). Perf
 parity with bf16 path on 1B is preserved; 3B/Gemma NPU paths
 lose to CPU due to model-size scaling, not Phase 8.3 specifically.
 
+
+#### 3B Q4_0 NPU profile + scale-up exploration (2026-05-23, deferred work)
+
+To inform the "what's next" on 3B (CPU 5.9 t/s beats NPU 3.0 t/s), I
+added per-dispatch timing to `mul_mat_gemv_int4` (gated on
+`XDNA_DEBUG=1`) and ran a 24-token decode on Llama 3.2 3B Q4_0
+through `npu_int4_v2` preset (sync mode, no Phase 9 async). The
+timing instrumentation was diagnostic-only and reverted after the
+data captured below.
+
+**Per-shape breakdown of NPU dispatch time, 24-token decode:**
+
+| Shape | Per-token count | Avg/call | Per-token total |
+|---|---:|---:|---:|
+| K=3072 N=1024 (attn_k/v) | 56 | 616 µs | 36 ms |
+| K=3072 N=3072 (attn_q/o) | 56 | 1249 µs | 70 ms |
+| K=3072 N=8192 (ffn_gate/up) | 54 | 1781 µs | 96 ms |
+| K=8192 N=3072 (ffn_down) | 27 | 2217 µs | 60 ms |
+| **Total NPU dispatch / token** | **193** | | **262 ms** |
+| Non-NPU (CPU attention + RMSNorm + sampling) | | | 71 ms |
+| Token budget (3.0 t/s) | | | 333 ms |
+
+**Per-call breakdown (K=3072 N=8192 example, 1781 µs avg):**
+
+- `pre` (input write + sync TO_DEVICE + dispatch start): 235 µs (13%)
+- `wait` (kernel execute + sync FROM_DEVICE): 1119 µs (63%)
+- `bias` (host bias compensation): 428 µs (24%)
+
+**Two scaling levers identified:**
+
+1. **Bias-in-NPU (N2):** move the `8 * sum(scale[g] * S[g])`
+   compensation into the kernel via `aie::sub(8)` inline after
+   `aie::unpack`. Same pattern as
+   `dual_fused_dequant_gemv_silu_mul.cc` (proven on SwiGLU INT4
+   path). Saves 24% of dispatch = ~10% of token. Projected 3.0 →
+   ~3.3 t/s on 3B.
+2. **Fused INT4 QKV xclbin (Phase 8.3 mode B):** 3 separate INT4
+   GEMV calls per QKV (mode A, current) cost 1249+616+616 = 2481 µs
+   sequential. A new IRON op running 3 fused_dequant_gemv_v2 workers
+   on disjoint AIE columns (Q on 4, K on 2, V on 2) would parallelise
+   them, costing roughly `max(...) ≈ 1249 µs`. Saves ~12 % of token
+   on 3B. Projected 3.0 → ~3.35 t/s.
+
+**Combined upper bound: ~3.6 t/s on 3B (+20 %).** Still loses to
+CPU 5.9 t/s -- 3B is fundamentally beyond NPU's per-token throughput
+ceiling on this stack until the CPU attention path itself is moved
+to NPU (real FlowKV, see "Path B" in the earlier section).
+
+**Bias-in-NPU attempt 2026-05-23 stalled on IRON build cache opacity.**
+
+Implementation (kernel `#ifdef Q4_SIGNED` + IRON op `signed_int4`
+flag + compile.py `--signed-int4` + C++ `dtype_in="uint4_signed"`
+routing) was wired end-to-end. The kernel source change was verified
+correct by hardcoding `#define Q4_SIGNED 1` in the .cc -- byte-exact
+PASS turned into "diverge at char 3" indicating the inline `aie::sub(8)`
+took effect under host-bias mode (double subtraction). After removing
+the hardcoded define and relying on the `-DQ4_SIGNED=1` extra_flag
+from the IRON op, the `.o` was rebuilt (per filesystem timestamp) but
+behaved as if the flag never reached the compile -- byte-exact under
+host bias confirmed the kernel did NOT do the inline sub.
+
+Root cause not yet isolated. Candidates:
+
+- IRON's `is_available_in_filesystem` only checks file mtime, not
+  hash of extra_flags. May reuse a stale `.o` that lacks the
+  `-DQ4_SIGNED` define.
+- The peano clang invocation may not propagate `-D...` through some
+  intermediate step.
+- The compile is gated behind `xdna_null_redirect()` (`> /dev/null 2>&1`),
+  so we can't see the actual compiler cmd line at runtime.
+
+**Workaround / next session:** add a `XDNA_DUMP_COMPILE_CMD=1` env
+flag in `ensure_compiled()` that captures stdout instead of
+redirecting to NUL, then verify the cmd line includes `-DQ4_SIGNED=1`.
+If it does, the issue is in IRON; if it doesn't, the issue is in
+compile.py argument passing.
+
+All Q4_SIGNED experimental changes were reverted to keep the tree
+clean. The kernel + IRON op + compile.py infrastructure is the
+right shape; only the validation gate needs follow-up.
+
+**Fused INT4 QKV xclbin (mode B) not started.** Requires designing
+a new IRON op that places three `fused_dequant_gemv_v2` workers on
+disjoint column ranges (Q on 4, K on 2, V on 2 cols on an 8-col
+device). The bf16 QKV uses a single fused kernel with concatenated
+output; the INT4 equivalent needs either:
+
+  - A new `qkv_int4_decode` IRON op with 3 parallel workers
+    (cleanest, ~1 day implementation + IRON debug).
+  - A single wide GEMV (K_emb × (q_dim+k_dim+v_dim)) with concatenated
+    weight BO and host-side output split. Simpler but doesn't get
+    parallel-column speedup -- collapses to the same serial NPU
+    execution we see today, so net = ~0 % gain. Not worth doing.
+
+Deferred to next session. Mode A (3 individual INT4 GEMV via the
+existing matcher) shipped earlier today (commit 9cc6eb231) is the
+correctness-correct entry point.
