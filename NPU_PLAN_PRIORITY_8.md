@@ -1571,3 +1571,46 @@ small decode iterations. Any size-dependent guard belongs in
 rather than in `supports_op` (where we only see the max-batched
 shape at scheduling time).
 
+#### Gemma 3 1B Q4_K_M sanity (2026-05-23, commit c8226bbbf)
+
+Gemma 3 1B is the only locally-available head_dim=256 model. Its
+full attention path is blocked by sliding-window attention (SWA)
+and a non-1D RoPE variant; the `npu_int4_gemv_only` preset
+side-steps those by routing only matmul-class ops to NPU.
+
+Out of Gemma's mixed-quant weights (Q5_0 / Q6_K / Q8_0 / Q4_K),
+`supports_op` only claims the Q4_K ones:
+
+- `attn_output` per block (K=1024 N=1152, head_dim*num_heads = 256*4
+  = 1024 -- so head_dim is folded into K, not an explicit kernel
+  parameter on this path).
+- `ffn_down` per block (K=6912 N=1152, ggml internally repacks the
+  Q6_K source through CPU_REPACK to a Q4_K-compatible layout for
+  this backend's dispatch).
+
+That's 39+ Q4_K NPU dispatches per decode token. Both new GEMV
+shapes (K=1024 N=1152 and K=6912 N=1152) compile cleanly via
+IRON on first touch, no errors. First-touch run takes ~15 s extra
+for compile; cached subsequent runs are ~6 s (NPU) vs 5.4 s (CPU).
+
+`paris_short_gemma3_1b_q4_k_m_gemv_only` passes byte-exact vs
+`cpu_baseline`. This validates:
+
+- `xdna_repack_q4_K_to_fused_int4` is correct on a non-Llama
+  weight layout.
+- `min·S[g]` bias compensation works at K=1024 and K=6912.
+- The Phase 8.4 Q4_K dispatch path is architecture-agnostic --
+  works across Llama, Llama 3B, Gemma.
+
+**Still NOT validated end-to-end:** the kernel-side
+`-DHEAD_DIM=256` unroll path. Both attempts to surface that
+(Llama 3B with head_dim=128 + full preset, Gemma 3 1B with
+head_dim=256 + gemv-only) ran with FlowKV bypassed -- on 3B the
+matcher didn't fire on the different attention layout, on Gemma
+the preset explicitly disables FlowKV. To exercise the kernel
+parameterization end-to-end we'd need a model whose attention
+matches the existing Llama-style FlowKV pattern AND uses
+head_dim != 64. That intersection appears empty among
+locally-available models; deferred until either a Llama 3.1 8B
+checkpoint or matcher generalisation lands.
+
