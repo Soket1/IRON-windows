@@ -1877,3 +1877,64 @@ output; the INT4 equivalent needs either:
 Deferred to next session. Mode A (3 individual INT4 GEMV via the
 existing matcher) shipped earlier today (commit 9cc6eb231) is the
 correctness-correct entry point.
+
+#### Real FlowKV PoC blocked by ggml-sched fragmentation (2026-05-23)
+
+Attempted to replace the FlowKV-POC "overwrite kqv_out" pattern
+with skip-CPU-attention via a shadow set. The straightforward
+implementation -- expand `attn_mulmat_indices` to cover the full
+attention chain (Q@K^T → SCALE → ADD(mask) → SOFT_MAX → scores@V
+→ intermediate VIEW/PERMUTE/RESHAPE → CONT(kqv_out)) and skip
+those nodes in `graph_compute` -- compiled cleanly, gated on
+`XDNA_FLOWKV_REAL=1`, and ran without crashes.
+
+But: `attn_mulmat_indices.size() == 0` for every graph_compute
+call, even when FlowKV-POC fires 448 times in the same run. Root
+cause: **ggml-backend-sched fragments the compute graph by
+supports_op**. The attention MUL_MATs use permuted K/Q tensors
+(NOT contiguous in memory), so XDNA's supports_op returns false
+(`if (!ggml_is_contiguous(src0)) return false;` at MUL_MAT). The
+scheduler routes those nodes to a separate CPU sub-cgraph, and
+XDNA's `graph_compute` simply never sees them. The `attn_mulmat`
+forward-scan walks XDNA's sub-cgraph and finds no matching
+matmuls.
+
+The CONT(kqv_out) node ends up in XDNA's sub-cgraph (because
+supports_op claims CONT broadly), which is why FlowKV-POC works:
+it just looks at the node name + uses the pre-saved Q/K/V perm
+tensor pointers, regardless of whether attention matmuls were in
+the same sub-cgraph.
+
+**To make Real FlowKV work in this architecture, the prerequisite
+is non-trivial:**
+
+- Extend `supports_op` to claim Q@K^T / scores@V MUL_MATs **even
+  when src0 / src1 are non-contiguous**. Today that gate rejects.
+- Add a "no-op dispatch" path in `xdna_mul_mat_*` that handles the
+  shadowed case: when called for a Q@K^T whose layer has FlowKV
+  active, write nothing to dst (the FlowKV NPU dispatch will
+  populate kqv_out instead).
+- Ensure ggml's downstream scheduling tolerates an XDNA-claimed
+  node whose dst tensor stays in its allocated buffer with
+  uninitialised data (only the actual consumer reads
+  kqv_out, which gets written by FlowKV NPU separately).
+- Validate that the supports_op widening doesn't break the bf16
+  GEMV fallback / decode_batcher / SwiGLU / QKV matchers.
+
+That's roughly a multi-day refactor of the supports_op surface plus
+careful validation across all bf16/INT4 paths. Deferred.
+
+The cleaner alternative (probably actually worth doing some day):
+modify `ggml_backend_sched` to keep the attention chain in a
+single sub-cgraph with the FlowKV node, regardless of contiguity --
+since XDNA dispatches the whole chain as one FlowKV op anyway, the
+intermediate matmul/softmax/etc nodes don't need to be NPU-claimed
+individually. But that's a ggml-backend-sched-level change.
+
+For now the FlowKV-POC pattern (CPU attention + NPU overwrite,
+double work) is what we have. On 1B BF16 the overhead is ~0
+(NPU attention is faster than CPU bf16). On Q4_0 it's gated off by
+default (XDNA_FLOWKV_ON_INT4=1 required) -- so 1B/3B Q4_0 don't
+double-work today, but also don't get the NPU-attention speedup.
+The empty-shadow-set issue means Real FlowKV PoC was reverted
+without ever running validation.
