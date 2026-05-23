@@ -1723,3 +1723,60 @@ dispatches per QKV is less efficient than a fused-INT4 QKV xclbin
 (Phase 8.3 mode B). The current Phase 8.3 mode A is correctness-
 first; perf can be revisited if QKV INT4 becomes a hot path.
 
+#### Phase 8.3 perf regression diagnosed + fixed (2026-05-23, commit 987b59ae6)
+
+Initial Phase 8.3 landing caused a **~10% decode regression on
+Llama 3.2 1B Q4_0** because the FlowKV-POC dispatch was now firing
+on quantized models. POC OVERWRITES kqv_out after CPU already
+computed attention -- net positive on bf16 (NPU attention faster
+than CPU bf16) but net negative on Q4_0 (CPU attention on
+dequantized fp32 is fast; NPU overwrite is duplicated work).
+
+Fix: default-gate the FlowKV-POC permute scan when the matched
+QKV triple uses Q4_0/Q4_K weights. `XDNA_FLOWKV_ON_INT4=1` forces
+opt-in (for correctness work and the future replace-CPU-attention
+transition). bf16/f16/f32 path unchanged.
+
+**Llama 3.2 1B Q4_0 bench (decode t/s, median of 2):**
+
+| Config | pre-8.3 | 8.3 raw | 8.3 gated (current) |
+|---|---:|---:|---:|
+| NPU INT4 v2 sync | 5.7 | 5.1 | **5.6** |
+| NPU INT4 v2 async (Phase 9) | 5.9 | 5.4 | **6.2** |
+| NPU INT4 +SwiGLU sync | 5.2 | 4.6 | **5.1** |
+| NPU INT4 +SwiGLU async | 5.2 | 4.8 | **5.4** |
+
+Gated version actually exceeds pre-8.3 on async (+5 %): the QKV
+matcher coordinates 3 INT4 GEMV calls back-to-back, which fits the
+Phase 9 ring-buffer pipeline cleanly.
+
+**Llama 3.2 3B Q4_0 bench (head_dim=128, 28 layers):**
+
+| Config | sync | async |
+|---|---:|---:|
+| CPU Q4_0 | **5.9** | 5.7 |
+| NPU INT4 v2 | 2.8 | **3.0** (Phase 9 +7%) |
+| NPU INT4 v2 no-FlowKV | 2.8 | 3.0 |
+| NPU INT4 GEMV-only | 2.9 | 2.9 |
+
+NPU loses to CPU on 3B because 28 layers × K=3072 scales beyond
+NPU's per-op advantage. With or without FlowKV is the same number --
+the gate keeps FlowKV off on this quantized model.
+
+**Gemma 3 1B Q4_K_M bench (head_dim=256, mixed Q5_0/Q6_K/Q8_0/Q4_K):**
+
+| Config | sync | async |
+|---|---:|---:|
+| CPU Q4_K_M | **6.5** | 6.5 |
+| NPU INT4 GEMV | 5.2 | 5.1 |
+
+Only Q4_K weights (attn_output + ffn_down after CPU_REPACK) reach
+NPU -- ~26 % of matmuls. Async gives no measurable gain because
+only ~39 dispatches/token amortize less wait→start overhead than
+1B's ~80. NPU still slower than CPU here.
+
+**Summary:** Phase 8.3 ships green now. The win is enabling
+FlowKV+head_dim=128 dispatch path validation (Phase 8.5). Perf
+parity with bf16 path on 1B is preserved; 3B/Gemma NPU paths
+lose to CPU due to model-size scaling, not Phase 8.3 specifically.
+
