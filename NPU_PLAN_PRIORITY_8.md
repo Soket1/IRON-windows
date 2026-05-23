@@ -1605,12 +1605,55 @@ for compile; cached subsequent runs are ~6 s (NPU) vs 5.4 s (CPU).
 **Still NOT validated end-to-end:** the kernel-side
 `-DHEAD_DIM=256` unroll path. Both attempts to surface that
 (Llama 3B with head_dim=128 + full preset, Gemma 3 1B with
-head_dim=256 + gemv-only) ran with FlowKV bypassed -- on 3B the
-matcher didn't fire on the different attention layout, on Gemma
-the preset explicitly disables FlowKV. To exercise the kernel
-parameterization end-to-end we'd need a model whose attention
-matches the existing Llama-style FlowKV pattern AND uses
-head_dim != 64. That intersection appears empty among
-locally-available models; deferred until either a Llama 3.1 8B
-checkpoint or matcher generalisation lands.
+head_dim=256 + gemv-only) ran with FlowKV bypassed.
+
+#### FlowKV blocker diagnosed: bf16-only QKV matcher (2026-05-23)
+
+Initial assumption was that the 3B attention layout differed from
+1B in shape patterns. The real blocker is more fundamental: the
+FlowKV detector sits INSIDE the QKV-triple branch in
+`graph_compute` (line ~11691 -- only entered when the QKV matcher
+already fired). And `xdna_validate_qkv_triple` (line 5159)
+explicitly rejects non-bf16 weights:
+
+```cpp
+if (w->type != GGML_TYPE_F32 &&
+    w->type != GGML_TYPE_BF16 &&
+    w->type != GGML_TYPE_F16) return false;
+```
+
+So on ANY quantized model (Q4_0 / Q4_K / Q5_0 / Q6_K / Q8_0) the
+QKV matcher rejects → `qkv_plan.triple_at` empty → FlowKV
+detector never runs. Verified empirically:
+
+- Llama 3.2 1B BF16 (`npu_chat_safe`): **144 FlowKV-DIAG lines**
+  per 24-token decode (16 layers × 9 decode iters). Matcher
+  fires correctly on bf16.
+- Llama 3.2 1B Q4_0 (`npu_int4_v2`): **0 FlowKV-DIAG lines**.
+  Q/K/V projections dispatch via individual
+  `mul_mat_gemv_int4` calls; attention scoring runs on CPU.
+- Llama 3.2 3B Q4_0, Gemma 3 1B Q4_K_M: **0 FlowKV-DIAG lines**
+  for the same reason.
+
+So the existing `multiquery_q4_0_int4_v2` test description (in
+correctness_test.py) "V2 + FlowKV + chat-mode composition" is
+slightly misleading -- the test exercises GQA chat composition
+with INT4 GEMV dispatches but does NOT exercise the FlowKV
+decode kernel itself. FlowKV is bf16-only today.
+
+**To validate Phase 8.5 head_dim != 64 end-to-end**, two paths:
+
+- **Path A: download Llama 3.2 3B BF16 GGUF (~6 GB)**. Triggers
+  FlowKV on a head_dim=128 model directly; validates the
+  `-DHEAD_DIM=128` chain in flowkv.cc.
+- **Path B: implement Phase 8.3 (QKV INT4)**. Extend
+  `xdna_validate_qkv_triple` to accept Q4_0/Q4_K + provide an
+  INT4-aware `ggml_backend_xdna_mul_mat_qkv` path. Was deferred
+  earlier as measurement-gated; would also unlock FlowKV-on-
+  quantized as a side effect.
+
+For now: kernel + IRON op + design + C++ matcher parameterization
+for head_dim ∈ {64, 128, 256} all compile cleanly and pass at
+head_dim=64 (1B BF16 + 1B Q4_0 regression chain). Ready to be
+exercised end-to-end when one of the two paths above lands.
 
