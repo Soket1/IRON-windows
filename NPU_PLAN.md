@@ -908,3 +908,72 @@ finishes the scatter (line ~11797), AND inspect what downstream MUL_MAT
 differ, the bug is in the buffer routing between POC and O_proj.
 ```
 ```
+
+### Priority 9 SMMU recon (2026-05-23)
+
+Probed current BO alignment on Llama 3.2 1B Q4_0 via `XDNA_DEBUG=1`
++ printf in `mul_mat_gemv_int4` weight cache warm path. Recorded
+`weight_bo->address()` and BO size for each unique shape, computed
+mod 64 K (SMMU page size on Strix Point).
+
+**Default (`xrt::bo::flags::host_only`):**
+
+| Shape | Weight BO addr mod 64K | Size mod 64K |
+|---|---|---:|
+| K=2048 N=2048 | **0x03000** | 0 (size = 36 × 64K) |
+| K=2048 N=512  | **0x07000** | 0 (size = 9 × 64K)  |
+| K=2048 N=8192 | varies     | 0                   |
+| K=8192 N=2048 | varies     | 0                   |
+
+Size is always a multiple of 64 K (driver rounds up), but **base
+addresses sit on arbitrary 4 K boundaries within the 64 K page**.
+So every large weight BO straddles 2 SMMU pages worth of
+4 K small-page mappings, plus partial pages at edges. The NPU
+DMA fetches across an extra SMMU page boundary on every weight
+read, paying TLB pressure.
+
+**Trial: `xrt::bo::flags::cacheable` instead of `host_only`:**
+
+| Shape | Weight BO addr mod 64K | Size mod 64K |
+|---|---|---:|
+| K=2048 N=2048 | **0x00000** | 0 |
+| K=2048 N=512  | 0x08000 (32K) | 0 |
+
+Cacheable flag drops the large BO to **64 K-aligned base** for the
+shapes whose total size is exact multiples of 64 K. (Smaller shapes
+land on 32 K boundaries — likely an artifact of the cacheable pool's
+sub-allocator.)
+
+**But correctness broke immediately.** `paris_short_q4_0_int4_v2`
+output went from "The capital of France is Paris." to
+"SoundsGGGGGGGG" -- the classic GGGG pattern that means NPU is
+reading stale / wrong weight data. Root cause: `cacheable` BO lives
+in CPU-cacheable host memory; CPU memcpy lands in CPU cache; our
+existing `xrt::bo::sync(XCL_BO_SYNC_BO_TO_DEVICE)` evidently does
+not invalidate the relevant cache lines for the cacheable flag (or
+does, but the timing relative to NPU read is off).
+
+**Conclusion so far:**
+
+- The 64K-alignment win **does exist** -- `cacheable` flag proves
+  the driver can land BOs on 64K boundaries when asked.
+- Just flipping the flag isn't safe -- coherence breaks.
+- To make the win usable we need one of:
+  - explicit CPU cache flush before `sync(TO_DEVICE)` on cacheable
+    BOs (need to find the right XRT/AMD API call);
+  - a different allocation path that gives 64K alignment without
+    cacheable semantics (e.g. `xclAllocUserPtrBO` over a host
+    `_aligned_malloc(size, 65536)` buffer, then BO wraps it);
+  - or a different flag combination if XRT supports it.
+
+**Code reverted** to keep the tree green. The recon code (SMMU-P9
+printf block) was diagnostic-only and removed with the revert.
+This is a real lever (potentially 1.5-2× on weight-DMA-bound
+shapes; not the 10× the ic ggml-org/llama.cpp#21725 report claimed,
+that figure probably bundled multiple optimisations) but needs
+more careful XRT-API work to land safely.
+
+**Open question for next session:** find the right XRT idiom for
+"give me a 64K-aligned coherent BO" on Windows XDNA -- check
+`xrt_bo.h` for additional flags / constructors not used here, or
+the IRON-windows reference for how their bench achieves it.
