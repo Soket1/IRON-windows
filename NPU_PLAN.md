@@ -977,3 +977,66 @@ more careful XRT-API work to land safely.
 "give me a 64K-aligned coherent BO" on Windows XDNA -- check
 `xrt_bo.h` for additional flags / constructors not used here, or
 the IRON-windows reference for how their bench achieves it.
+
+### Priority 9 SMMU follow-up: UserPtrBO doesn't move the device VA (2026-05-23)
+
+Tried path **B** from the SMMU recon section: wrap the weight BO around
+a host buffer pre-allocated with `_aligned_malloc(size, 65536)` via
+`xrt::bo(device, userptr, size, host_only, group_id)`. Cacheable broke
+coherence -- UserPtrBO does NOT, so paris_short_q4_0_int4_v2 stays
+byte-exact in both default and `XDNA_BO_ALIGNED_64K=1` modes.
+
+But bench numbers were identical:
+
+| Config | default | XDNA_BO_ALIGNED_64K=1 |
+|---|---:|---:|
+| NPU INT4 v2 sync | 5.6 | 5.5 |
+| NPU INT4 v2 async (Phase 9) | 6.2 | 6.1 |
+| NPU INT4 +SwiGLU sync | 5.1 | 5.1 |
+| NPU INT4 +SwiGLU async | 5.4 | 5.3 |
+
+All within ±0.1 t/s noise. Investigated by dumping host vs device
+addresses for the weight BOs:
+
+```
+host_userptr=0x000001F20F3D0000 (64K-aligned, last 16 bits = 0)
+dev_addr   =0x0000000000013000 (4K-aligned only, mod 64K = 0x3000)
+```
+
+The user-side allocation IS 64K-aligned, but `xrt::bo::address()`
+returns the **device-side VA** the NPU sees through SMMU, and it's
+still on the same 4K-aligned boundary as in the default
+`host_only` path. The XRT/AMD driver re-maps the user buffer
+through its own SMMU page tables independently of the host
+alignment we provided. Same device VA whether or not we
+hand-aligned the host pointer.
+
+**Implication.** True 64K SMMU-page alignment on AMD XDNA Windows
+is a **driver-level decision**, not user-controllable from the
+xrt::bo API surface we have:
+
+- `host_only` flag: default, 4K-aligned device VA
+- `cacheable` flag: 64K-aligned device VA (proven) but breaks
+  CPU/NPU cache coherence with our existing sync calls
+- User-pointer wrap: zero effect on device VA
+
+To unlock the lever we'd need:
+
+1. A specific XCL ioctl / extension that requests 64K-aligned
+   device VA. Public xrt::bo API doesn't expose one. Worth
+   checking AMD/Xilinx forums for an undocumented flag.
+2. Or use `cacheable` + figure out the right cache-flush API
+   (Windows-specific; ic's IRON might document it).
+3. Or kernel-side patch to the XDNA driver to allocate from
+   a huge-pages-backed pool.
+
+All three are bigger projects than user-mode work. **The lever is
+real but out of reach without driver / IRON-level investigation.**
+ic's reported 41 t/s likely included this driver-level fix
+combined with other IRON-side optimisations -- the ratio is too
+large to be alignment alone on our setup.
+
+Code reverted; UserPtrBO experiment removed. The recon and
+verify printfs are diagnostic-only and not in the tree. Updated
+roadmap: deprioritise Priority 9 until someone identifies the
+correct XRT idiom (or upstream IRON publishes their setup).
