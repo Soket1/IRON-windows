@@ -1106,3 +1106,45 @@ Phase 8.1.v2 (PR #101 kernel optimisations: compile-time
 DIM_K/GROUP_SIZE + double-pump + AIE pipelining hints), and
 the remaining gap on Strix Point is partially hardware (smaller
 NPU than Strix Halo) and partially fused-kernel coverage.
+
+### Priority 9 SMMU follow-up: cacheable+CLWB definitively dead (2026-05-23)
+
+Implemented the user's "Path 2" proposal end-to-end: switch the
+weight BO to `xrt::bo::flags::cacheable`, do an explicit CLWB
+sweep across the BO with `_mm_clwb`/`_mm_clflushopt` + `_mm_sfence`
+before `sync(XCL_BO_SYNC_BO_TO_DEVICE)`. Added probes to verify:
+
+  * `new_packed.map<void*>()` returns the SAME address on every call
+    (no per-call shadow buffer).
+  * Host-side first 16 bytes are identical before and after CLWB.
+  * Host-side first 16 bytes are identical before and after
+    `sync(TO_DEVICE)` (expected -- sync doesn't touch host memory).
+
+With the correct cache dir + 8col config matching the cached
+xclbins, the test still produces "WallGGGGGGGG" garbage on
+`paris_short_q4_0_int4_v2`. Diagnostic dump:
+
+```
+[P9-CLWB] map@repack=00000276F8400000 map@flush=00000276F8400000 (same=1) bytes=2359296
+  pre-CLWB  [repack-ptr]: a4 7e 05 57 d9 58 c4 99 88 6b c5 7c bb a3 d6 6a
+  pre-CLWB  [flush-ptr] : a4 7e 05 57 d9 58 c4 99 88 6b c5 7c bb a3 d6 6a
+[P9-CLWB] post-sync map=00000276F8400000
+  a4 7e 05 57 d9 58 c4 99 88 6b c5 7c bb a3 d6 6a
+```
+
+Host-side bytes are correct, CLWB executes cleanly, BUT the NPU
+reads different bytes. Conclusion: on Windows XDNA the cacheable
+flag changes the device-side SMMU mapping in a way that
+`XCL_BO_SYNC_BO_TO_DEVICE` does NOT cover. The Linux amdxdna
+driver's SYNC_BO ioctl has no public Windows-equivalent path.
+
+**Code reverted clean.** No CLWB infrastructure left in the
+tree. The diagnostic dumps were valuable enough to commit to
+the plan but the patch itself is gone (regressed quality, no
+performance win).
+
+The only remaining angle for Priority 9 is forum research on
+the undocumented `XCL_BO_FLAGS` upper bits ("Path 1" from the
+writeup) -- AMD/Xilinx may expose a huge-page-pool flag through
+a non-public API. That's out of scope without external sources.
+**Priority 9 closed.**
