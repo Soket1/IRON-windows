@@ -1040,3 +1040,69 @@ Code reverted; UserPtrBO experiment removed. The recon and
 verify printfs are diagnostic-only and not in the tree. Updated
 roadmap: deprioritise Priority 9 until someone identifies the
 correct XRT idiom (or upstream IRON publishes their setup).
+
+### Priority 9 SMMU follow-up: context from upstream issue (2026-05-23)
+
+Re-read ggml-org/llama.cpp#21725 in full. The exact wording from
+`ic`'s comment (2026-04-14):
+
+> A contact also tried IRON with specific tuning (**64K alignment
+> to match SMMU page and other parameters**) and got 41 t/s.
+
+The "**and other parameters**" qualifier matters. The 41 t/s is
+NOT a single-lever win from alignment alone -- it's 64K alignment
+**plus other IRON-level tuning**. Our experiments confirm that
+straightforward 64K alignment (either via `cacheable` flag or
+UserPtrBO with `_aligned_malloc`) gives ~0% gain on our
+host_only path because the device VA doesn't propagate from
+user alignment; the lever lives in the driver / IRON kernel
+configuration.
+
+Also important: ic was testing on **Strix Halo** (XDNA2, the
+bigger NPU). We're on Strix Point (regular Ryzen AI, smaller
+compute tile count + bandwidth). The numbers don't translate
+directly -- our hardware ceiling is lower regardless of
+software tuning.
+
+**Other comments worth noting:**
+
+- **albiol2004 (issue author, IRON contributor):** "FLM has
+  optimized fused kernels for specific model architectures
+  which eliminates that [overhead of individual kernel loads].
+  My idea is to have both, foundational blocks of individual
+  kernels and a wide variety of fused kernels for the most
+  common models."
+- **FLM at 61 t/s on Strix Halo INT4** vs **ic's contact's
+  IRON at 41 t/s** -- the gap is explained by fused-vs-individual
+  kernels, not by FLM having mysterious secret sauce.
+- albiol2004 calls out **speculative decoding** as an angle to
+  use NPU more efficiently (a lot of compute is unused at
+  M=1 decode).
+- **albiol2004:** "decode is so memory-bound that it's not
+  possible to have an acceptable performance [on current NPUs]"
+  -- confirms the fundamental decode bottleneck.
+
+**Implication for our roadmap:**
+
+The "biggest available lever" for us in light of this context
+is NOT 64K alignment (driver-bound) but **fused operator
+breadth** -- adding Phase 8.3 mode B (fused INT4 QKV xclbin
+with 3 parallel workers on disjoint AIE columns), and more
+generally matching FLM's pattern of compiling shape-specific
+fused kernels for the hottest layer patterns. The 3B profile
+in this file (2026-05-23) shows +12% from parallel Q+K+V alone,
+and the same approach applies to other small-op clusters.
+
+**Speculative decoding** is a separate orthogonal lever -- the
+NPU is so underutilised at M=1 that running a draft model on
+CPU to produce candidate tokens, then verifying them in a
+batched NPU dispatch, could double or triple effective decode
+throughput. Independent of NPU stack quality.
+
+**Priority 9 SMMU 64K alignment officially deprioritised** -- it
+turns out to be one knob in a tuned bundle, not a 10x lever
+on its own. The "and other parameters" we already cover via
+Phase 8.1.v2 (PR #101 kernel optimisations: compile-time
+DIM_K/GROUP_SIZE + double-pump + AIE pipelining hints), and
+the remaining gap on Strix Point is partially hardware (smaller
+NPU than Strix Halo) and partially fused-kernel coverage.
