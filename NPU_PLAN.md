@@ -1166,6 +1166,22 @@ runtime version (W:\src\sw-stack\XRT-MCDM\, leaked in error
 strings) does NOT recognize the carveout flag despite it being
 declared in xrt_bo.h. Dead end for this driver build.
 
+**Carveout second-pass probe (2026-05-24):** to rule out
+constructor / group_id / context dependency, ran a full sweep
+in `ggml_backend_xdna_mul_mat_gemv_int4` once after kernel
+load (gated by XDNA_PROBE_BO=1). Iterated:
+  * 2 constructors: `xrt::bo(device, sz, carveout, grp)` AND
+    `xrt::bo(hw_context, sz, carveout, grp)`
+  * 8 group_ids: `kernel.group_id(0..3)` (real banks
+    9043967, 8978433, 8978432) + literals {0, 1, 2, 3}
+  * 2 sizes: 64K and 4MB
+
+All 48 combinations failed with the same `"Unknown buffer
+type"` error. The error originates from the `default:` branch
+of a switch on flag value inside `xrt_coreutil.dll`'s buffer
+factory, BEFORE bank-id or context validation. Carveout is
+**definitively** not implemented in this XRT-MCDM build.
+
 **Real-world weight BO alignment data** (XDNA_PROBE_BO=1 +
 addr=0x.. mod64K=0x.. in warm logs, Llama 3.2 1B Q4_0,
 GGML_XDNA_NUM_COLS=8):
