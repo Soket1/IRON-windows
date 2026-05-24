@@ -1237,3 +1237,154 @@ a meaningful performance gain.
 ERT slot allocation. The actual bottleneck is memory bandwidth for weight
 loading (DDR4→AIE), which none of these settings influence. xrt.ini is
 now exhausted as a performance lever.
+
+---
+
+## FastFlowLM Architecture Analysis — The 10× Gap (2026-05-24)
+
+### Benchmark gap discovery
+
+FastFlowLM benchmarks on Ryzen AI 7 350 (Kraken Point = same XDNA2 50 TOPS NPU):
+
+| Model | FastFlowLM t/s | Our t/s | Ratio |
+|---|---|---|---|
+| Llama 3.2 1B Q4_0 | **64.5** | 6.3 | 10.2× |
+| Llama 3.2 3B Q4_0 | **26.3** | 2.8 | 9.4× |
+| Llama 3.1 8B | **12.8** | — | — |
+
+Both systems run on identical NPU hardware. The gap is not hardware; it
+is architectural.
+
+**NOTE on corrected bottleneck diagnosis:** Earlier analysis claimed
+"memory bandwidth is the bottleneck". This was wrong. The actual
+bottleneck breakdown per token (1B Q4_0, 159ms/token):
+
+  * NPU execution time (compute + DMA): ~122ms across ~80 dispatches
+  * CPU synchronisation between dispatches: ~24ms (BO sync, memcpy,
+    prepare next input)
+  * CPU-only ops (RoPE, residuals, etc.): ~13ms
+
+The DDR bandwidth used by the NPU is only ~5.3 GB/s out of 89 GB/s
+available on LPDDR5X (Ryzen AI 9 365). The NPU's internal DMA to AIE
+tiles is the bandwidth constraint, not the DDR bus itself.
+
+---
+
+### FastFlowLM technical approach (from public documentation + analysis)
+
+**1. Single ELF / Full ELF flow**
+
+Standard approach (ours): load one xclbin per operator, ~80 XRT
+submit/wait cycles per token. Each dispatch boundary costs ~50µs
+submit + ~300µs CPU sync overhead.
+
+FastFlowLM approach: entire forward pass (or full transformer layer
+including QKV, attention, FFN, norms) compiled into ONE spatio-temporal
+ELF file. The host issues exactly ONE submit + ONE wait per token. After
+the start signal, the NPU's microcontroller (ERT) executes ctrlcode that
+loops over layers autonomously, with no CPU involvement between layers.
+
+**2. ctrlcode replaces host scheduler**
+
+The layer loop (`for layer in range(N_LAYERS)`) is compiled into ctrlcode
+executed by the NPU's ERT microcontroller. The host does NOT do
+conditional jumps between layers. All DMA descriptor updates between
+layers happen inside the NPU via hardware semaphores. From the host's
+perspective this looks like ONE continuously executing hardware task.
+
+**3. Weight double-buffering (DMA prefetch)**
+
+Memory Tiles (L2, 512KB/column) configured as double-buffered ring
+buffers (ObjectFIFO depth=2). While Compute Tile processes weight
+block W_i, the Shim DMA is loading W_{i+1} from DDR into the second
+half of the L2 buffer. This hides DDR latency entirely behind compute.
+DMA descriptors are set up ONCE at context init; hardware semaphores
+synchronise buffers between tiles without CPU interrupts.
+
+**4. FusedDQP (Fused Dequantization and Projection)**
+
+Equivalent to our fused_dequant_gemv_v2 kernel (already implemented).
+Weights in Q4NX format: 32 int4 values + bf16 scale + bf16 offset per
+32-weight block. The compute tile reads Q4NX from L2, dequantizes "in
+flight" via vector instructions, immediately multiplies with activation
+from local registers. No intermediate bf16 tensor written to DDR.
+
+Our current fused_dequant_gemv_v2 already implements this at the kernel
+level. The missing piece is the execution model (single ELF).
+
+**5. FlowKV (KV cache chunk streaming)**
+
+KV cache cut into chunks, streamed through a pipeline of compute tiles
+with online softmax (no full NxN attention matrix on chip). We already
+have FlowKV but it is dispatched as separate XRT calls.
+
+---
+
+### Performance gap decomposition
+
+| Phase | What changes | Estimated improvement |
+|---|---|---|
+| Baseline | ~80 dispatches, CPU sync loop | 6.3 t/s |
+| Single ELF (no DMA overlap) | Remove 24ms CPU sync overhead | ~7.4 t/s (+17%) |
+| Single ELF + DMA prefetch | Hide weight load latency behind compute | ~15–25 t/s |
+| Full FastFlowLM (ctrlcode + KV in SRAM) | Remove ALL host involvement per layer | ~40–64 t/s |
+
+**Note:** "Single ELF alone" gives only ~17% improvement. The large
+2–3× step requires BOTH single ELF AND DMA double-buffering working
+correctly together. The 10× gap requires the complete architectural
+overhaul described above.
+
+---
+
+### What we already have vs what is missing
+
+| Technology | Status |
+|---|---|
+| FusedDQP kernel (fused_dequant_gemv_v2.cc) | ✅ Done |
+| FlowKV streaming attention | ✅ Done |
+| ObjectFIFO depth=2 (intra-op buffering) | ✅ Done in each op |
+| Q4_K weights (asymmetric = closest to Q4NX) | ✅ Done |
+| Single ELF for ONE layer (tblock_fused) | ✅ Exists for prefill M>=32 |
+| **Single ELF for decode (M=1) — all ops in one dispatch** | ❌ Not done |
+| **ctrlcode N-layer loop (all layers = 1 dispatch)** | ❌ Not done |
+| **Inter-layer DMA double-buffering** | ❌ Not done |
+| **KV cache in AIE SRAM** | ❌ Not feasible at 1MB total SRAM vs >16MB KV |
+
+### Implementation roadmap
+
+**Step 1 (days): Decode-fused single-layer ELF**
+Extend tblock_fused to support seq_len=1 (decode). This changes
+16 layers × 5 dispatches = 80 dispatches → 16 dispatches, each covering
+the full layer (QKV + attention + FFN + norms). Expected: ~7.4 t/s.
+
+**Step 2 (weeks): N-layer ctrlcode loop**
+Compile all N_LAYERS into one ELF where core_body contains
+`for layer_idx in range_(N_LAYERS)` and the DMA descriptor list
+walks through per-layer weights. One dispatch per token instead of 16.
+Expected: ~8–12 t/s (mainly removes remaining CPU overhead, compute
+time dominates).
+
+**Step 3 (weeks): Inter-layer DMA double-buffering**
+Configure Shim DMAs to pre-fetch layer i+1 weights into L2 Memory Tile
+second buffer while compute tiles process layer i. This overlaps DDR
+reads with AIE compute, hiding the ~7ms per-layer DMA time.
+Expected: ~15–25 t/s.
+
+**Step 4 (months): KV streaming optimisation**
+Online Softmax over chunked KV blocks without staging full KV in DDR,
+similar to FastFlowLM's FlowKV. We have a similar kernel but it is
+dispatched with host-side coordination.
+
+### Key constraints
+
+- AIE L1 SRAM: 64KB per tile × 16 tiles = 1MB total. KV cache at 256
+  context for 1B = ~2MB per layer × 16 = 32MB total. KV cannot fit
+  in SRAM; must stream from DDR. This permanently limits decode speed
+  compared to prefill.
+- Q4NX vs Q4_0: our format lacks the per-block zero-point offset that
+  Q4NX provides (Q4_K has it). A Q4NX-aware kernel would reduce bias
+  compensation host-side work.
+- The IRON framework supports single ELF compilation today; the missing
+  piece is designing the decode-optimised design.py that handles the
+  full layer graph for M=1.
+
