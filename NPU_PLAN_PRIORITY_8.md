@@ -1938,3 +1938,51 @@ default (XDNA_FLOWKV_ON_INT4=1 required) -- so 1B/3B Q4_0 don't
 double-work today, but also don't get the NPU-attention speedup.
 The empty-shadow-set issue means Real FlowKV PoC was reverted
 without ever running validation.
+
+### Speculative Decoding — Phase 3+4+5 complete (2026-05-24)
+
+Full spec-dec infrastructure implemented and validated:
+
+**Infrastructure:**
+- `fused_dequant_gemv_v3.cc`: in-kernel M_BATCH loop -- dequant once,
+  accumulate M_BATCH independent dot products. Template params
+  `<block_size, G, DK, M_BATCH>`.
+- IRON op `AIEFusedDequantGEMVv3` (op.py + design.py): M_BATCH×K
+  activation buffer, N×M_BATCH output buffer.
+- `compile.py` subcmd `fused-dequant-gemv-v3`.
+- `ggml-xdna.cpp`: `XDNA_OP_GEMV_INT4_BATCH`, graph_compute Q4 guard
+  extension, v3 dispatch with bias compensation + nb[1]-aware stride.
+- Opt-in: `XDNA_ENABLE_GEMV_INT4_BATCH=1`.
+
+**L1 budget:** K=2048 supports M_BATCH∈{2,4,8}; K>4096 supports
+M_BATCH=2 only (K=8192×8 = 131KB > 64KB AIE L1). K>4096 M>2
+falls back to CPU via Q4 prefill guard.
+
+**Correctness validated** (paris_short_specdec_{cpu_verify,v3_npu}):
+- CPU verify: PASS
+- NPU v3 verify: PASS
+
+**Performance results (Llama 3.2 1B Q4_0, 1B+1B same model):**
+
+| Setup | t/s |
+|---|---|
+| Baseline M=1 (no spec-dec) | 5.7 |
+| Spec-dec CPU verify | 2.8 (-51%) |
+| Spec-dec v3 NPU verify | 2.5 (-56%) |
+
+Using same model as target+draft gives zero speedup potential: draft
+generates at the same rate as target, so overhead dominates.
+
+**Fundamental requirement for spec-dec speedup:** draft << target.
+Theoretical example with 100M-param draft:
+  draft 4 tokens: 4 × 17.5ms = 70ms
+  target verify M=5 (v3 NPU): ~175ms
+  total: 245ms → ~5 tokens → **~20 t/s = 3.5× baseline**
+
+**Actual win requires:** a small (100-300M param) draft model in the
+same Llama-3.2 family. Llama 3.2 1B instruct is too large to be a
+useful draft for a 1B target. The infrastructure is production-ready;
+the bottleneck is model availability.
+
+**Compiled xclbins:** K∈{2048, 3072} × N∈{512,1024,2048,3072,8192}
+× M_BATCH∈{2,4,8}; K=8192 × N∈{2048,3072} × M_BATCH=2 (L1 limit).
