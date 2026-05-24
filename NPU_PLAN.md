@@ -1213,3 +1213,27 @@ levers are now exhausted and documented:
   * `carveout` flag -- not supported by current XRT-MCDM build
   * Path 1 (undocumented flag bits) -- out of scope
   * xrt.ini `Runtime.*` settings -- not investigated yet (low priority)
+
+### xrt.ini Runtime.* investigation (2026-05-24)
+
+Tested all interesting xrt.ini settings against Llama 3.2 1B Q4_0 decode.
+Measurements across 64 tokens, 3 runs each.
+
+| Setting | decode t/s | vs baseline |
+|---|---|---|
+| (no ini, default) | 6.0 | — |
+| hardware_context_type=exclusive | 6.1 | +1.7% |
+| hardware_context_type=typical | 6.1 | +1.7% |
+| ert_slotsize=4096 | 6.1 | +1.7% |
+| ert_slotsize=8192 | 6.1 | +1.7% |
+| npu_sync_destroy_allocation=true | 6.0 | 0% |
+| xrt_bo=false | 6.0 | 0% |
+| exclusive+ert_slotsize=4096 | 6.0 | 0% |
+
+All differences within measurement noise (±0.1 t/s). No setting gives
+a meaningful performance gain.
+
+**Conclusion:** xrt.ini settings affect high-level context management and
+ERT slot allocation. The actual bottleneck is memory bandwidth for weight
+loading (DDR4→AIE), which none of these settings influence. xrt.ini is
+now exhausted as a performance lever.
