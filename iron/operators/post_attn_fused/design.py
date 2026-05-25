@@ -209,7 +209,13 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     # SwiGLU down phase FIFOs (per column).
     # Ad depth=1 for the same L1-budget reason (packed_tile_d ~9 KB).
     Ad_fifos  = [ObjectFifo(L1_Ad_ty,  name=f"Ad_{i}",  depth=1) for i in range(cols)]
-    Bd_fifos  = [ObjectFifo(L1_Bd_ty,  name=f"Bd_{i}",  depth=1) for i in range(cols)]
+    # Bd: silu_buf is the SAME hidden_dim bf16 for every Down worker, so we
+    # broadcast: one shim S2MM into MemTile, fanned out to all cols. Replaces
+    # N per-col Bd_fifos[i] shim fills with 1 broadcast fill — saves
+    # (cols - 1) S2MM channels.
+    silu_l3l2_fifo = ObjectFifo(L1_Bd_ty, name="silu_L3L2", depth=1)
+    silu_mem_fifo  = silu_l3l2_fifo.cons().forward(
+        name="silu_mem", depth=1, placement=Tile(col=0, row=1))
     Cd_fifos  = [ObjectFifo(L1_Cd_ty,  name=f"Cd_{i}",  depth=2) for i in range(cols)]
 
     # ── Core bodies ────────────────────────────────────────────────────────────
@@ -328,7 +334,8 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
 
     down_workers = [
         Worker(down_body,
-               [Ad_fifos[i].cons(), Bd_fifos[i].cons(), Cd_fifos[i].prod(), down_fn])
+               [Ad_fifos[i].cons(), silu_mem_fifo.cons(),
+                Cd_fifos[i].prod(), down_fn])
         for i in range(cols)
     ]
 
@@ -489,10 +496,12 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
         # io[E..E+H] now holds silu_out (silu region of bundle)
 
         # ── Phase 4: SwiGLU down ──────────────────────────────────────────────
+        # Down's Bd input is loaded once via silu_l3l2_fifo (one shim S2MM)
+        # and broadcast through MemTile to all cols' Down workers.
         tg_d = rt.task_group()
         for i in range(cols):
             rt.fill(Ad_fifos[i].prod(), w_d, Ad_taps[i], task_group=tg_d)
-            rt.fill(Bd_fifos[i].prod(), io,  Bd_tap,     task_group=tg_d)
+        rt.fill(silu_l3l2_fifo.prod(), io, Bd_tap, task_group=tg_d)
         for i in range(cols):
             rt.drain(Cd_fifos[i].cons(), io, Cd_taps[i],
                      task_group=tg_d, wait=True)
