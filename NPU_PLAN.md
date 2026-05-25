@@ -199,6 +199,46 @@ Three bugs in the FlowKV graph tensor detector that caused it to silently never 
 - num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
 - Host memcpy optimization: **won't help** — profiling shows memcpy+sync = 1.7 ms/token vs NPU exec = 13.4 ms/token. 83% of overhead is NPU execution.
 
+### ❌ Phase B post_attn_fused (single xclbin fusion, 2026-05-25)
+
+**Idea:** Fuse O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU
+into ONE xclbin / ONE `xrt::execute()` per layer. Would drop layer dispatches
+from 3 (Phase A target) → 1.
+
+**Scaffolding committed:** IRON-windows@b6fe940 (`devel`) — kernel
+`aie_kernels/aie2p/post_attn_fused.cc`, IRON op
+`iron/operators/post_attn_fused/`, and `compile.py post-attn-fused` subcmd.
+
+**Blockers resolved during the attempt:**
+1. ✅ Kernel C++ — RMSNorm scalar Pass 2, canonical INT4 dequant pattern
+   (unpack uint4→uint8→uint16→bf16, mul+`.to_vector<bfloat16>()`, `mac`),
+   tanh-approx SiLU from `silu_mul.cc`.
+2. ✅ AIE2P compute-tile input-DMA limit (= 2): anm_worker originally had
+   3 input FIFOs (anm_s/anm_l/anm_g) → consolidated into a single
+   `anm_in_fifo` with depth=3; worker does `acquire(3)` and indexes
+   `sub[0..2]` for o_proj_out / inpL / gain.
+3. ✅ L1 .bss overflow: `M_OUTPUT_MAX=32` instead of `hidden/cols=4096` —
+   kernel only uses `m_input_gu=8` slots in left/right static buffers.
+4. ✅ All 7 cores now compile, MLIR placer succeeds, L1 fits.
+
+**Final blocker (NPU lowering):** shim DMA BD outer dim limit = 1023.
+Agu_taps outer dim = `2 * tiles_per_col_gu` (gate phase + up phase fills
+on one Agu fifo). For cols=2, rows_per_col_gu=4096:
+  - `m_input_gu=8`  → 2×tiles = **1024** (over by 1)
+  - `m_input_gu=16` → packed_tile = **18432** > 16384 L1 bank size
+  - No integer divisor of 4096 between 8 and 16 exists.
+
+4D TAP with outer dim=2 (phase) puts a 4.7 MB stride into the BD which
+the shim BD stride field can't encode. Two sequential fills break the
+gate↔up per-tile pairing that silu_mul needs. Splitting gate_up worker
+into per-phase workers exceeds the 2-input-DMA tile limit.
+
+**Verdict:** Resolving the last 1024 vs 1023 gap requires either MemTile
+routing for Agu (no IRON Python API — would need raw MLIR) or a
+structural redesign with split workers + L2 staging. Phase A
+(3 dispatches/layer via deferred O_proj) remains the conservative target.
+See memory `project_phase_b_hw_blocker.md` for full constraint analysis.
+
 ## Priorities
 
 ### Priority 1: Attention → NPU ✅ DONE [TASK-P1]
