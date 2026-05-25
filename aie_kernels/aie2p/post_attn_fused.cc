@@ -356,6 +356,145 @@ extern "C" void dual_fused_dequant_gemv_bf16(
     _dual_gemv<32, GROUP_SIZE, DIM_K>(m, row_offset, a, b, phase);
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// 5b. Split-worker SwiGLU GEMV: dequant + matvec writing to a passed buffer.
+//     Used by gate_worker and up_worker (no static buffers, no phase).
+// ────────────────────────────────────────────────────────────────────────────
+
+template <uint32_t block_size, uint32_t G, uint32_t DK>
+static void _gemv_swiglu(uint32_t m,
+                         const uint8_t *__restrict a_in,
+                         const bfloat16 *__restrict b_in,
+                         bfloat16 *__restrict c_out)
+{
+    static_assert(block_size == 32, "block_size must be 32");
+    static_assert(G % block_size == 0, "group_size must be multiple of block_size");
+    constexpr uint32_t groups_per_row = DK / G;
+    constexpr bool can_double_pump = (groups_per_row >= 2) && (groups_per_row % 2 == 0);
+    constexpr uint32_t pump_groups  = can_double_pump ? 2 : 1;
+    constexpr uint32_t loop_iters   = groups_per_row / pump_groups;
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    const uint4 *weights_packed = reinterpret_cast<const uint4 *>(a_in);
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(a_in + m * DK / 2);
+
+    for (uint32_t row = 0; row < m; row++) {
+        const uint4 *w_row = weights_packed + row * DK / 2;
+        const bfloat16 *s_row = scales + row * groups_per_row;
+        const bfloat16 *b_ptr = b_in;
+
+        aie::accum<accfloat, block_size> acc = aie::zeros<accfloat, block_size>();
+        aie::vector<bfloat16, block_size> offset =
+            aie::broadcast<bfloat16, block_size>(8.0f);
+
+        if constexpr (can_double_pump) {
+            AIE_LOOP_MIN_ITERATION_COUNT(loop_iters)
+            for (uint32_t g = 0; g < groups_per_row; g += 2)
+                AIE_PREPARE_FOR_PIPELINING
+                {
+                    bfloat16 sf_a = s_row[g];
+                    aie::vector<bfloat16, block_size> sf_a_bc =
+                        aie::broadcast<bfloat16, block_size>(sf_a);
+                    aie::vector<uint4, block_size> I0_a =
+                        aie::load_v<block_size>(w_row);
+                    w_row += block_size / 2;
+
+                    bfloat16 sf_b = s_row[g + 1];
+                    aie::vector<bfloat16, block_size> sf_b_bc =
+                        aie::broadcast<bfloat16, block_size>(sf_b);
+                    aie::vector<uint4, block_size> I0_b =
+                        aie::load_v<block_size>(w_row);
+                    w_row += block_size / 2;
+
+                    aie::vector<uint8,  block_size> a8_a  = aie::unpack(I0_a);
+                    aie::vector<uint16, block_size> a16_a = aie::unpack(a8_a);
+                    aie::vector<bfloat16, block_size> abf_a =
+                        aie::to_float<bfloat16>(a16_a, 0);
+                    aie::vector<bfloat16, block_size> asgn_a =
+                        aie::sub(abf_a, offset);
+                    aie::vector<bfloat16, block_size> w_a =
+                        aie::mul(asgn_a, sf_a_bc).template to_vector<bfloat16>();
+
+                    aie::vector<uint8,  block_size> a8_b  = aie::unpack(I0_b);
+                    aie::vector<uint16, block_size> a16_b = aie::unpack(a8_b);
+                    aie::vector<bfloat16, block_size> abf_b =
+                        aie::to_float<bfloat16>(a16_b, 0);
+                    aie::vector<bfloat16, block_size> asgn_b =
+                        aie::sub(abf_b, offset);
+                    aie::vector<bfloat16, block_size> w_b =
+                        aie::mul(asgn_b, sf_b_bc).template to_vector<bfloat16>();
+
+                    aie::vector<bfloat16, block_size> b_a = aie::load_v<block_size>(b_ptr);
+                    b_ptr += block_size;
+                    acc = aie::mac(acc, w_a, b_a);
+
+                    aie::vector<bfloat16, block_size> b_b = aie::load_v<block_size>(b_ptr);
+                    b_ptr += block_size;
+                    acc = aie::mac(acc, w_b, b_b);
+                }
+        } else {
+            AIE_LOOP_MIN_ITERATION_COUNT(loop_iters)
+            for (uint32_t g = 0; g < groups_per_row; g++)
+                AIE_PREPARE_FOR_PIPELINING
+                {
+                    bfloat16 sf = s_row[g];
+                    aie::vector<bfloat16, block_size> sf_bc =
+                        aie::broadcast<bfloat16, block_size>(sf);
+                    aie::vector<uint4, block_size> I0 =
+                        aie::load_v<block_size>(w_row);
+                    w_row += block_size / 2;
+
+                    aie::vector<uint8,  block_size> a8  = aie::unpack(I0);
+                    aie::vector<uint16, block_size> a16 = aie::unpack(a8);
+                    aie::vector<bfloat16, block_size> abf =
+                        aie::to_float<bfloat16>(a16, 0);
+                    aie::vector<bfloat16, block_size> asgn =
+                        aie::sub(abf, offset);
+                    aie::vector<bfloat16, block_size> w =
+                        aie::mul(asgn, sf_bc).template to_vector<bfloat16>();
+
+                    aie::vector<bfloat16, block_size> bv = aie::load_v<block_size>(b_ptr);
+                    b_ptr += block_size;
+                    acc = aie::mac(acc, w, bv);
+                }
+        }
+        c_out[row] = static_cast<bfloat16>(
+            aie::reduce_add(acc.template to_vector<float>()));
+    }
+}
+
+extern "C" void swiglu_gemv_bf16(
+        uint32_t m, const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
+    _gemv_swiglu<32, GROUP_SIZE, DIM_K>(m, a, b, c);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 5c. Split-worker SiLU * Mul: takes gate and up as L1 buffers, no statics.
+// ────────────────────────────────────────────────────────────────────────────
+
+extern "C" void silu_mul_v_bf16(
+        const bfloat16 *gate, const bfloat16 *up, bfloat16 *out, int32_t n) {
+    constexpr int VEC = 8;
+    int chunks = n / VEC;
+    aie::vector<bfloat16, VEC> reg_0_5 = aie::broadcast<bfloat16, VEC>(0.5f);
+    aie::vector<bfloat16, VEC> reg_1   = aie::broadcast<bfloat16, VEC>(1.0f);
+    AIE_PREPARE_FOR_PIPELINING
+    for (int i = 0; i < chunks; i++) {
+        aie::vector<bfloat16, VEC> g = aie::load_v<VEC>(gate + i * VEC);
+        aie::vector<bfloat16, VEC> u = aie::load_v<VEC>(up   + i * VEC);
+        auto half_g = aie::mul(g, reg_0_5);
+        auto tanh_half_g = aie::tanh<bfloat16>(half_g.template to_vector<float>());
+        auto tanh_plus_1 = aie::add(tanh_half_g, reg_1);
+        aie::vector<bfloat16, VEC> sigmoid =
+            aie::mul(tanh_plus_1, reg_0_5).template to_vector<bfloat16>();
+        auto silu  = aie::mul(g, sigmoid);
+        auto fused = aie::mul(silu.template to_vector<bfloat16>(), u);
+        aie::store_v(out + i * VEC, fused.template to_vector<bfloat16>());
+    }
+    (void)chunks;
+}
+
 extern "C" void dual_fused_dequant_gemv_silu_mul_bf16(
         bfloat16 *c_out, uint32_t m_output) {
     // VEC=8 because m_output_gu = m_input_gu = 8 in the post_attn_fused
