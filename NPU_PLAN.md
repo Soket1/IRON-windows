@@ -1,8 +1,8 @@
 # IRON-windows NPU Optimization Plan
 
-> Last updated: 2026-05-22
+> Last updated: 2026-05-25
 
-## Current Status: **5.7 t/s INT4 / 5.3 t/s bf16 on STX NPU2** (Llama 3.2 1B)
+## Current Status: **6.3 t/s INT4 QKV-fused / 5.3 t/s bf16 on STX NPU2** (Llama 3.2 1B)
 
 After Priority 8 INT4 work (v2 kernel from amd/IRON PR #101 + Q4_K
 support) landed 2026-05-22, INT4 finally beats bf16 on NPU:
@@ -87,7 +87,7 @@ These historical bugs have been resolved. Details of the discovery and fixes are
 | QKV projection | ✅ Working | NPU (8col) | 1.17 ms | 14.0 ms (×12 layers) |
 | SwiGLU (gate+up+silu+down) | ✅ Working | NPU (8col) | 3.62 ms | 43.4 ms |
 | Output projection (decode batch) | ✅ Working | NPU (8col) | 1.06 ms | 12.7 ms |
-| **Attention (FlowKV decode, batched)** | ✅ Working | NPU (4col, num_cols=4) | ~0.56 ms × 2 batches | ~13.4 ms (×16 layers, 32 dispatches total) |
+| **Attention (FlowKV decode, single dispatch)** | ✅ Working | NPU (4col, num_cols=4) | ~0.56 ms × 2 batches | ~8.9 ms (×16 layers, **16 dispatches total**) |
 | RMSNorm (full-row tile, no gain) | ⚠ Conditional NPU (1col) | NPU single-query / CPU chat-mode | ~0.05 ms | ~1.6 ms (when on NPU) |
 | MUL (gain), Residual ADD, RoPE, KV cache | ❌ CPU | CPU | — | ~10-20 ms total |
 
@@ -99,12 +99,15 @@ design lands, chat-mode users should set `XDNA_ENABLE_RMS_NORM=0`.
 
 **Historical FlowKV dispatch counts**: earlier text mentioned "8 dispatches
 × ~2 ms" for FlowKV (per-KV-head, num_cols=1). That predates the batched
-path. Current production path is `num_cols=4` batching → **2 dispatches
-per layer** = **32 per token** for Llama-3.2-1B (16 layers × 2 batches of
-4 KV heads each), each ~0.56 ms NPU exec. The legacy per-head dispatch
-function (`ggml_backend_xdna_flowkv_per_head`) is dead code — kept in
-the source but `xdna_plan_flowkv()` returns empty in the current
-cgraph layout, so it never fires. Scheduled for removal.
+path. As of 2026-05-20 production path was `num_cols=4` batching → **2 dispatches
+per layer** = **32 per token** (16 layers × 2 batches of 4 KV heads each).
+As of **2026-05-25** (single-dispatch ctrlcode step): `num_kv_heads=8` passed to the
+kernel, the IRON design's internal `range(num_batches)` loop handles both batches in
+ONE `xrt::execute()` → **1 dispatch per layer = 16 per token**. Saves ~350 µs × 16
+= ~5.6 ms/token of XRT overhead. The legacy per-head dispatch function
+(`ggml_backend_xdna_flowkv_per_head`) is dead code — kept in the source but
+`xdna_plan_flowkv()` returns empty in the current cgraph layout, so it never fires.
+Scheduled for removal.
 
 ## Dispatch pattern per layer (current production path)
 
@@ -116,8 +119,9 @@ graph_compute n_nodes=N   → Main layer:
   MUL_MAT ×3    → NPU via QKV dispatch (8col, 1.17 ms)
   ROPE ×2       → CPU
   KV cache ops  → CPU
-  CONT + attn   → FlowKV POC dispatch (4col, 2 batches × ~0.56 ms = ~1.12 ms NPU,
-                  + ~16 ms total per-token across 16 layers including host overhead)
+  CONT + attn   → FlowKV POC dispatch (4col, **1 dispatch** covering all 8 KV heads,
+                  IRON internal ctrlcode loops 2 batches × ~0.56 ms = ~0.56 ms NPU exec per layer,
+                  + ~8.9 ms total per-token across 16 layers including host overhead)
   ADD           → CPU (residual)
   RMS_NORM      → as above
   MUL (gain)    → CPU
@@ -132,7 +136,7 @@ graph_compute n_nodes=N   → Main layer:
 | SwiGLU | 3620 µs |
 | QKV | 1165 µs |
 | O_proj (decode_batch) | 1055 µs |
-| **FlowKV (batched, ~0.56ms × 2)** | **~1120 µs per layer = ~13.4 ms/token** |
+| **FlowKV (single dispatch, all 8 KV heads, 2 internal batches)** | **~560 µs per layer = ~8.9 ms/token** |
 | RMSNorm (when on NPU) | ~50 µs |
 
 ## What DOESN'T work (lessons learned)
@@ -166,6 +170,26 @@ graph_compute n_nodes=N   → Main layer:
 - **Root cause**: `num_heads` param to `get_or_load_flowkv_kernel()` was `q_heads_per_kv` (4) instead of `q_heads_per_kv * num_cols` (16). Kernel compiled with `group_size=1`, host prepared data for `group_size=4`.
 - **Fix**: Pass `q_heads_per_kv * num_cols` as `num_heads`. Cache key changes to `flowkv_H16_KV4_...`.
 - Result: **5.3 t/s** (from 4.8 t/s with num_cols=1).
+
+### ✅ FlowKV single dispatch for all 8 KV heads (resolved 2026-05-25)
+- **Problem**: C++ outer loop dispatched the kernel twice (kv_h=0..3, kv_h=4..7) even though
+  the IRON design already has an internal `for batch_idx in range(num_batches)` ctrlcode loop.
+- **Fix**: Pass `num_kv_heads=8` (full count) to `get_or_load_flowkv_kernel`. The IRON design
+  handles both batches in one `xrt::execute()`. Outer C++ loop collapsed to a single block.
+- **Saves**: 16 XRT dispatches × ~350 µs overhead = ~5.6 ms/token.
+
+### ✅ FlowKV POC broken by llama.cpp KV-cache layout changes (fixed 2026-05-25)
+Three bugs that caused FlowKV to silently never fire:
+1. **v_perm detection**: current llama.cpp stores V cache as `[head_dim, seq, kv_heads]`
+   (same as K, transposed). Old condition expected `[seq, head_dim, kv_heads]`. Added third
+   branch: after finding k_perm, accept the next matching `[hd, seq, kv]` permute as v_perm.
+2. **V read strides**: old `v_nb0 == head_dim*2` contiguous check never matched new format
+   (nb0=2 for bf16). Added `v_nb0==2` fast path using K-style `pos*nb1 + h*nb2` access.
+3. **RESHAPE vs CONT**: `kqv_out` is now wrapped in `GGML_OP_RESHAPE` (not `GGML_OP_CONT`)
+   in current llama.cpp. Extended trigger condition to accept either op.
+- Result: FlowKV now fires 16 dispatches/token. bf16 decode still 5.3 t/s (POC overhead
+  unchanged — CPU still computes attention, NPU overwrites result). Real speedup requires
+  skipping CPU attention path (Phase B of ctrlcode plan).
 
 ### ❌ FlowKV host-side optimizations
 - Remove memset of bo_v: no effect (4.8 t/s). Kernel only reads actual_seq_len.
