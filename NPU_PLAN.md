@@ -199,45 +199,65 @@ Three bugs in the FlowKV graph tensor detector that caused it to silently never 
 - num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
 - Host memcpy optimization: **won't help** — profiling shows memcpy+sync = 1.7 ms/token vs NPU exec = 13.4 ms/token. 83% of overhead is NPU execution.
 
-### ❌ Phase B post_attn_fused (single xclbin fusion, 2026-05-25)
+### ✅ Phase B post_attn_fused (single xclbin fusion, 2026-05-25)
 
-**Idea:** Fuse O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU
-into ONE xclbin / ONE `xrt::execute()` per layer. Would drop layer dispatches
+**Goal:** Fuse O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU
+into ONE xclbin / ONE `xrt::execute()` per layer. Drops layer dispatches
 from 3 (Phase A target) → 1.
 
-**Scaffolding committed:** IRON-windows@b6fe940 (`devel`) — kernel
-`aie_kernels/aie2p/post_attn_fused.cc`, IRON op
-`iron/operators/post_attn_fused/`, and `compile.py post-attn-fused` subcmd.
+**Status:** IRON design compiles end-to-end at cols=2 (commit
+IRON-windows@00144f7 on `devel`). 11 AIE cores, single
+`combined.xclbin` (41 KB), single `insts.bin`. Host-side
+integration into `ggml-xdna.cpp` and correctness testing still
+needed before this can be enabled on the runtime path.
 
-**Blockers resolved during the attempt:**
-1. ✅ Kernel C++ — RMSNorm scalar Pass 2, canonical INT4 dequant pattern
-   (unpack uint4→uint8→uint16→bf16, mul+`.to_vector<bfloat16>()`, `mac`),
-   tanh-approx SiLU from `silu_mul.cc`.
-2. ✅ AIE2P compute-tile input-DMA limit (= 2): anm_worker originally had
-   3 input FIFOs (anm_s/anm_l/anm_g) → consolidated into a single
-   `anm_in_fifo` with depth=3; worker does `acquire(3)` and indexes
-   `sub[0..2]` for o_proj_out / inpL / gain.
-3. ✅ L1 .bss overflow: `M_OUTPUT_MAX=32` instead of `hidden/cols=4096` —
-   kernel only uses `m_input_gu=8` slots in left/right static buffers.
-4. ✅ All 7 cores now compile, MLIR placer succeeds, L1 fits.
+**Layered blockers resolved during the work:**
+1. Kernel C++ compile — RMSNorm scalar Pass 2, canonical INT4
+   dequant pattern (unpack uint4→uint8→uint16→bf16,
+   `mul + .to_vector<bfloat16>()`, `mac`), tanh-approx SiLU.
+2. AIE2P compute-tile 2-input-DMA limit — anm_worker collapsed
+   from 3 input FIFOs (anm_s/anm_l/anm_g) to a single
+   `anm_in_fifo` (depth=3, `acquire(3)` indexes
+   `sub[0..2]`).
+3. L1 .bss overflow — `M_OUTPUT_MAX=32` instead of `hidden/cols`,
+   then dropped entirely once split workers removed the static
+   `left_buf`/`right_buf`.
+4. Shim BD outer-dim > 1023 — split monolithic gate_up_worker
+   into 3 separate workers (gate, up, silu_mul) so the per-fill
+   outer dim is `tiles_per_col_gu = 512`, not
+   `2 * tiles_per_col_gu = 1024`.
+5. Shim BD inner-dim > 1023 — switched all weight TAPs from
+   multi-dim `sizes=[1,m_input,tiles,per_row]` to fully linear
+   `sizes=[1,1,1,bytes_col]`. The production v2 GEMV layout
+   collapses to the same single-linear-chunk descriptor and is
+   accepted by the BD validator (inner up to ~4.7 MB works).
+   Multi-dim TAPs trigger a partial-merge in MLIR-AIE that
+   leaves inner > 1023, which the BD validator then rejects
+   ("Size 0 exceeds [0:1023]").
 
-**Final blocker (NPU lowering):** shim DMA BD outer dim limit = 1023.
-Agu_taps outer dim = `2 * tiles_per_col_gu` (gate phase + up phase fills
-on one Agu fifo). For cols=2, rows_per_col_gu=4096:
-  - `m_input_gu=8`  → 2×tiles = **1024** (over by 1)
-  - `m_input_gu=16` → packed_tile = **18432** > 16384 L1 bank size
-  - No integer divisor of 4096 between 8 and 16 exists.
+**Worker / channel budget (cols=2):**
+- Workers: 2 o_proj + 1 anm + 2×(gate + up + silu_mul) + 2 down
+  = **11 workers** (NPU2 has 16 compute tiles for cols=2 — fits).
+- Shim S2MM: 4 (o_proj) + 1 (anm) + 6 (SwiGLU: Agu_gate, Agu_up,
+  Bgu per col × 2) + 4 (down) = **15 ≤ 16**. Bgu broadcast
+  counts as 1 input (single shim channel feeds two consumer
+  tiles via on-chip routing).
 
-4D TAP with outer dim=2 (phase) puts a 4.7 MB stride into the BD which
-the shim BD stride field can't encode. Two sequential fills break the
-gate↔up per-tile pairing that silu_mul needs. Splitting gate_up worker
-into per-phase workers exceeds the 2-input-DMA tile limit.
+**Key SwiGLU split-worker structure:**
+```
+shim --w_gu(gate)--> Agu_gate -> gate_worker --gate_out--+
+shim --w_gu(up)----> Agu_up   -> up_worker   --up_out---+--> silu_mul_worker --Cgu--> shim
+shim --scratch-----> Bgu(broadcast)--{gate,up}_worker   |
+```
 
-**Verdict:** Resolving the last 1024 vs 1023 gap requires either MemTile
-routing for Agu (no IRON Python API — would need raw MLIR) or a
-structural redesign with split workers + L2 staging. Phase A
-(3 dispatches/layer via deferred O_proj) remains the conservative target.
-See memory `project_phase_b_hw_blocker.md` for full constraint analysis.
+**Next steps (post-compile):**
+- Pack weights in the new linear layout (per col: bytes_col_gu of
+  gate tiles then bytes_col_gu of up tiles).
+- Wire the dispatch into `ggml-xdna.cpp` (deferred O_proj +
+  ANM + SwiGLU pattern detection from the Phase A plan).
+- Verify correctness via `correctness_test.py` harness.
+- Bench end-to-end token rate vs Phase A (expected: 1 dispatch
+  vs 3 per layer → savings ~700 µs/layer × 16 = ~11 ms/token).
 
 ## Priorities
 
