@@ -178,14 +178,15 @@ graph_compute n_nodes=N   → Main layer:
   handles both batches in one `xrt::execute()`. Outer C++ loop collapsed to a single block.
 - **Saves**: 16 XRT dispatches × ~350 µs overhead = ~5.6 ms/token.
 
-### ✅ FlowKV POC broken by llama.cpp KV-cache layout changes (fixed 2026-05-25)
-Three bugs that caused FlowKV to silently never fire:
-1. **v_perm detection**: current llama.cpp stores V cache as `[head_dim, seq, kv_heads]`
-   (same as K, transposed). Old condition expected `[seq, head_dim, kv_heads]`. Added third
-   branch: after finding k_perm, accept the next matching `[hd, seq, kv]` permute as v_perm.
-2. **V read strides**: old `v_nb0 == head_dim*2` contiguous check never matched new format
-   (nb0=2 for bf16). Added `v_nb0==2` fast path using K-style `pos*nb1 + h*nb2` access.
-3. **RESHAPE vs CONT**: `kqv_out` is now wrapped in `GGML_OP_RESHAPE` (not `GGML_OP_CONT`)
+### ✅ FlowKV POC detection bugs fixed (2026-05-25)
+Three bugs in the FlowKV graph tensor detector that caused it to silently never fire:
+1. **v_perm detection**: the dynamic scan (introduced 2026-05-23 in `38eb301a7`) assumed
+   V cache shape `[seq, head_dim, kv_heads]` with condition `nd->ne[0] > hd && nd->ne[1] == hd`.
+   Actual V cache shape is `[head_dim, seq, kv_heads]` (same as K). Added third branch:
+   after finding k_perm, accept the next `[hd, seq, kv]` permute as v_perm.
+2. **V read strides**: old `v_nb0 == head_dim*2` contiguous check never matched (nb0=2 for bf16).
+   Added `v_nb0==2` fast path using K-style `pos*nb1 + h*nb2` access.
+3. **RESHAPE vs CONT**: `kqv_out` is wrapped in `GGML_OP_RESHAPE` (not `GGML_OP_CONT`)
    in current llama.cpp. Extended trigger condition to accept either op.
 - Result: FlowKV now fires 16 dispatches/token. bf16 decode still 5.3 t/s (POC overhead
   unchanged — CPU still computes attention, NPU overwrites result). Real speedup requires
