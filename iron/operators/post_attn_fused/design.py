@@ -153,13 +153,16 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
                          [L1_anm_ty, L1_anm_ty, L1_anm_ty, np.int32])
     norm_mul_fn = Kernel("post_attn_rms_norm_bf16", kobj,
                          [L1_anm_ty, L1_anm_ty, L1_anm_ty, np.int32])
-    # Split-worker SwiGLU: gate_worker and up_worker each call swiglu_gemv_bf16
-    # (no phase, no statics, output to a passed L1 buffer); silu_mul_worker
-    # then takes (gate, up) -> out.
-    swiglu_gemv_fn = Kernel("swiglu_gemv_bf16", kobj,
-                            [np.int32, L1_Agu_ty, L1_Bgu_ty, L1_inter_ty])
-    silu_mul_fn    = Kernel("silu_mul_v_bf16", kobj,
-                            [L1_inter_ty, L1_inter_ty, L1_Cgu_ty, np.int32])
+    # Monolithic SwiGLU gate_up_worker (v7 revert): single worker per col
+    # processes both gate and up phases (writing to static left_buf and
+    # right_buf in the kernel), then runs silu_mul. Used in conjunction
+    # with cols=4 where 2 * tiles_per_col_gu = 512 fits the shim BD
+    # outer-dim cap (it overflowed at cols=2 with this pattern, which is
+    # why the previous versions split into gate/up/silu_mul workers).
+    gate_up_fn  = Kernel("dual_fused_dequant_gemv_bf16", kobj,
+                         [np.int32, np.int32, L1_Agu_ty, L1_Bgu_ty, np.int32])
+    silu_mul_fn = Kernel("dual_fused_dequant_gemv_silu_mul_bf16", kobj,
+                         [L1_Cgu_ty, np.int32])
     down_fn     = Kernel("fused_dequant_matvec_down_bf16", kobj,
                          [np.int32, np.int32, L1_Ad_ty, L1_Bd_ty, L1_Cd_ty])
 
@@ -194,17 +197,16 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
         name="ffi_mem", depth=1, placement=Tile(col=0, row=1))
 
     # SwiGLU gate/up phase FIFOs (per column).
-    # Split-worker layout: gate_worker and up_worker each have their own
-    # weight FIFO (Agu_gate, Agu_up) so the shim BD outer dim per fill
-    # is tiles_per_col_gu = 512 (instead of 2*512 = 1024 in the monolithic
-    # design). Bgu now comes from the broadcast ffi_mem_fifo (one MemTile
-    # source feeds gate + up across all cols).
-    Agu_gate_fifos = [ObjectFifo(L1_Agu_ty, name=f"Agu_gate_{i}", depth=1) for i in range(cols)]
-    Agu_up_fifos   = [ObjectFifo(L1_Agu_ty, name=f"Agu_up_{i}",   depth=1) for i in range(cols)]
-    # Tile-to-tile FIFOs: gate_worker -> silu_mul_worker, up_worker -> silu_mul_worker
-    gate_out_fifos = [ObjectFifo(L1_inter_ty, name=f"gate_out_{i}", depth=2) for i in range(cols)]
-    up_out_fifos   = [ObjectFifo(L1_inter_ty, name=f"up_out_{i}",   depth=2) for i in range(cols)]
-    Cgu_fifos      = [ObjectFifo(L1_Cgu_ty, name=f"Cgu_{i}", depth=2) for i in range(cols)]
+    # Monolithic layout: ONE Agu fifo per col carries gate+up tiles
+    # interleaved (gate_t0, up_t0, gate_t1, up_t1, ...). The worker
+    # acquires twice per inner iteration (gate, then up), writing to
+    # static left_buf / right_buf inside the kernel, then runs silu_mul.
+    # Total Agu fills = 2 * tiles_per_col_gu (outer dim). For cols=4 with
+    # m_input_gu=8 that's 2 * 256 = 512, within the shim BD outer cap of
+    # 1023. (Falls back to split workers at cols=2 where 2*512=1024
+    # overflows -- but the MemTile redesign targets cols=4 anyway.)
+    Agu_fifos = [ObjectFifo(L1_Agu_ty, name=f"Agu_{i}", depth=1) for i in range(cols)]
+    Cgu_fifos = [ObjectFifo(L1_Cgu_ty, name=f"Cgu_{i}", depth=2) for i in range(cols)]
 
     # SwiGLU down phase FIFOs (per column).
     # Ad depth=1 for the same L1-budget reason (packed_tile_d ~9 KB).
@@ -248,42 +250,24 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
             inpff_out.release(1)
             ffi_out.release(1)
 
-    # Gate worker: dequant-GEMV of gate weights, streams m_input_gu bf16 per
-    # tile to silu_mul via a tile-to-tile FIFO. Bgu is shared (broadcast).
-    def gate_body(Agu_g, Bgu, gate_out, gemv_fn):
+    # Monolithic gate_up worker: per tile, acquires gate weights (phase 0,
+    # writes to kernel's static left_buf), then acquires up weights (phase 1,
+    # writes to right_buf), then silu_mul(left, right) -> Cgu.
+    # Bgu (ffn_input) comes from MemTile broadcast (ffi_mem_fifo).
+    def gate_up_body(Agu, Bgu, Cgu, gu_fn, sm_fn):
         for _ in range_(0xFFFFFFFF):
             b = Bgu.acquire(1)
             for _ in range_(tiles_per_col_gu):
-                a = Agu_g.acquire(1)
-                g = gate_out.acquire(1)
-                gemv_fn(m_input_gu, a, b, g)
-                Agu_g.release(1)
-                gate_out.release(1)
-            Bgu.release(1)
-
-    def up_body(Agu_u, Bgu, up_out, gemv_fn):
-        for _ in range_(0xFFFFFFFF):
-            b = Bgu.acquire(1)
-            for _ in range_(tiles_per_col_gu):
-                a = Agu_u.acquire(1)
-                u = up_out.acquire(1)
-                gemv_fn(m_input_gu, a, b, u)
-                Agu_u.release(1)
-                up_out.release(1)
-            Bgu.release(1)
-
-    # Silu-mul worker: receives gate+up tile slices from upstream workers,
-    # writes silu(gate)*up to Cgu output FIFO.
-    def silu_mul_body(gate_in, up_in, Cgu, sm_fn):
-        for _ in range_(0xFFFFFFFF):
-            for _ in range_(tiles_per_col_gu):
-                g = gate_in.acquire(1)
-                u = up_in.acquire(1)
+                a_g = Agu.acquire(1)
+                gu_fn(m_input_gu, 0, a_g, b, 0)   # gate -> left_buf
+                Agu.release(1)
+                a_u = Agu.acquire(1)
+                gu_fn(m_input_gu, 0, a_u, b, 1)   # up   -> right_buf
+                Agu.release(1)
                 c = Cgu.acquire(1)
-                sm_fn(g, u, c, m_output_gu)
-                gate_in.release(1)
-                up_in.release(1)
+                sm_fn(c, m_output_gu)              # silu(left)*right -> Cgu
                 Cgu.release(1)
+            Bgu.release(1)
 
     def down_body(Ad, Bd, Cd, fn):
         for _ in range_(0xFFFFFFFF):
@@ -310,25 +294,12 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
                          anm_ffi_l1l2_fifo.prod(),
                          add_fn, norm_mul_fn])
 
-    # SwiGLU split workers (3 per col: gate, up, silu_mul).
-    # Bgu now comes from the broadcast ffi_mem_fifo (one MemTile fan-out to
-    # all gate+up consumers across all cols, no per-col shim).
-    gate_workers = [
-        Worker(gate_body,
-               [Agu_gate_fifos[i].cons(), ffi_mem_fifo.cons(),
-                gate_out_fifos[i].prod(), swiglu_gemv_fn])
-        for i in range(cols)
-    ]
-    up_workers = [
-        Worker(up_body,
-               [Agu_up_fifos[i].cons(), ffi_mem_fifo.cons(),
-                up_out_fifos[i].prod(), swiglu_gemv_fn])
-        for i in range(cols)
-    ]
-    silu_mul_workers = [
-        Worker(silu_mul_body,
-               [gate_out_fifos[i].cons(), up_out_fifos[i].cons(),
-                Cgu_fifos[i].prod(), silu_mul_fn])
+    # Monolithic SwiGLU workers (1 per col): each consumes its own Agu
+    # interleaved gate+up fifo + the ffi broadcast, produces Cgu.
+    gate_up_workers = [
+        Worker(gate_up_body,
+               [Agu_fifos[i].cons(), ffi_mem_fifo.cons(),
+                Cgu_fifos[i].prod(), gate_up_fn, silu_mul_fn])
         for i in range(cols)
     ]
 
@@ -385,22 +356,19 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
         for i in range(cols)
     ]
 
-    # SwiGLU gate+up weights — linear DMA per fill (matches production v2 layout).
-    # Each fill reads bytes_col_gu contiguous bytes from DDR; the compiler
-    # collapses sizes=[1,1,1,N] directly without partial-merge, avoiding the
-    # MLIR-AIE BD validator's per-dim 1023 limit (the validator rejects when
-    # the compiler does a partial merge to inner > 1023).
-    Agu_gate_taps = [
+    # SwiGLU gate+up weights — monolithic interleaved DDR layout per col:
+    # [gate_t0 | up_t0 | gate_t1 | up_t1 | ... | gate_tN-1 | up_tN-1].
+    # Use the same single-linear-chunk pattern as production v2 GEMV
+    # (sizes=[1,1,1,N]) so the BD generator emits a fully-linear
+    # descriptor and skips the partial-merge bug that would leave
+    # inner=packed_tile_gu > 1023 and fail the BD validator. The L1
+    # ObjectFifo serves the linear read up tile-by-tile (one acquire =
+    # packed_tile_gu bytes), and the worker alternates gate/up phases via
+    # the kernel's phase parameter.
+    Agu_taps = [
         TensorAccessPattern(tensor_dims=(1, total_gu_bytes),
             offset=i * 2 * bytes_col_gu,
-            sizes=[1, 1, 1, bytes_col_gu],
-            strides=[0, 0, 0, 1])
-        for i in range(cols)
-    ]
-    Agu_up_taps = [
-        TensorAccessPattern(tensor_dims=(1, total_gu_bytes),
-            offset=i * 2 * bytes_col_gu + bytes_col_gu,
-            sizes=[1, 1, 1, bytes_col_gu],
+            sizes=[1, 1, 1, 2 * bytes_col_gu],
             strides=[0, 0, 0, 1])
         for i in range(cols)
     ]
@@ -447,8 +415,7 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     ) as (w_o, w_gu, w_d, inputs, io):
 
         rt.start(*o_proj_workers, anm_worker,
-                 *gate_workers, *up_workers, *silu_mul_workers,
-                 *down_workers)
+                 *gate_up_workers, *down_workers)
 
         # ── Phase 1: O_proj ───────────────────────────────────────────────────
         # Reads kqv from input_bundle[0..E] via broadcast MemTile fifo (one
@@ -482,13 +449,13 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
         # ffi flows tile->MemTile->all SwiGLU workers via ffi_mem_fifo (no
         # shim drain). io[inpff_save] is host-visible.
 
-        # ── Phase 3: SwiGLU gate+up+silu_mul (split workers) ──────────────────
-        # Bgu input is fed directly from ANM via ffi_mem_fifo (MemTile broadcast);
-        # no shim fill needed for it.
+        # ── Phase 3: SwiGLU gate+up+silu_mul (monolithic per-col worker) ──────
+        # Bgu input flows from ANM via ffi_mem_fifo (MemTile broadcast); no
+        # shim fill for it. Per col, one Agu fill carries the interleaved
+        # gate+up tile sequence.
         tg_gu = rt.task_group()
         for i in range(cols):
-            rt.fill(Agu_gate_fifos[i].prod(), w_gu, Agu_gate_taps[i], task_group=tg_gu)
-            rt.fill(Agu_up_fifos[i].prod(),   w_gu, Agu_up_taps[i],   task_group=tg_gu)
+            rt.fill(Agu_fifos[i].prod(), w_gu, Agu_taps[i], task_group=tg_gu)
         for i in range(cols):
             rt.drain(Cgu_fifos[i].cons(), io, Cgu_taps[i],
                      task_group=tg_gu, wait=True)
