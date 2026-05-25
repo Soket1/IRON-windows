@@ -47,10 +47,11 @@ class PostAttnFused(AIEOperatorBase):
     def get_artifacts(self):
         operator_dir = Path(__file__).parent
         e, h, c, g = self.embed_dim, self.hidden_dim, self.num_aie_columns, self.group_size
-        # v4 = v3 PLUS MemTile broadcast for kqv (one shim S2MM into
-        # MemTile, fanned out to all per-col o_proj workers). Foundation
-        # for cols=4+ designs that fit within the 16-shim-S2MM cap.
-        name = f"post_attn_fused_v4_e{e}_h{h}_c{c}_g{g}"
+        # v5 = v4 PLUS MemTile broadcast for ffn_input (ANM output ->
+        # MemTile -> all SwiGLU workers across all cols). Removes per-col
+        # Bgu shim fills; cuts shim S2MM count by cols (e.g. 2 channels
+        # freed at cols=2, 4 freed at cols=4).
+        name = f"post_attn_fused_v5_e{e}_h{h}_c{c}_g{g}"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{name}.mlir",

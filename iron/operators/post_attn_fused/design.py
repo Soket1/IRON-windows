@@ -184,20 +184,23 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     # runtime fills 3 entries in order [o_proj_out, inpL, gain_weight];
     # worker acquires(3) and indexes sub[0], sub[1], sub[2].
     anm_in_fifo = ObjectFifo(L1_anm_ty, name="anm_in", depth=3)
-    # ANM outputs TWO entries per layer: first the residual inpFF
-    # (= O_proj_out + inpL) so the host can do the post-FFN ADD,
-    # then ffn_input (= RMSNorm(inpFF) * gain) which feeds SwiGLU.
-    anm_o_fifo  = ObjectFifo(L1_anm_ty, name="anm_o",  depth=2)
+    # ANM outputs TWO separate fifos now (was a depth=2 single fifo):
+    #   anm_inpff_fifo  : drains to L3 io[inpff_save] -- host post-FFN ADD
+    #   anm_ffi_l1l2_fifo: routes via MemTile to all SwiGLU workers
+    #                      (gate + up across all cols) -- no shim involved
+    anm_inpff_fifo    = ObjectFifo(L1_anm_ty, name="anm_inpff",     depth=1)
+    anm_ffi_l1l2_fifo = ObjectFifo(L1_anm_ty, name="anm_ffi_l1l2",  depth=1)
+    ffi_mem_fifo      = anm_ffi_l1l2_fifo.cons().forward(
+        name="ffi_mem", depth=1, placement=Tile(col=0, row=1))
 
     # SwiGLU gate/up phase FIFOs (per column).
     # Split-worker layout: gate_worker and up_worker each have their own
     # weight FIFO (Agu_gate, Agu_up) so the shim BD outer dim per fill
     # is tiles_per_col_gu = 512 (instead of 2*512 = 1024 in the monolithic
-    # design). Bgu is shared via broadcast — one ObjectFifo with two
-    # consumer endpoints.
+    # design). Bgu now comes from the broadcast ffi_mem_fifo (one MemTile
+    # source feeds gate + up across all cols).
     Agu_gate_fifos = [ObjectFifo(L1_Agu_ty, name=f"Agu_gate_{i}", depth=1) for i in range(cols)]
     Agu_up_fifos   = [ObjectFifo(L1_Agu_ty, name=f"Agu_up_{i}",   depth=1) for i in range(cols)]
-    Bgu_fifos      = [ObjectFifo(L1_Bgu_ty, name=f"Bgu_{i}",      depth=1) for i in range(cols)]
     # Tile-to-tile FIFOs: gate_worker -> silu_mul_worker, up_worker -> silu_mul_worker
     gate_out_fifos = [ObjectFifo(L1_inter_ty, name=f"gate_out_{i}", depth=2) for i in range(cols)]
     up_out_fifos   = [ObjectFifo(L1_inter_ty, name=f"up_out_{i}",   depth=2) for i in range(cols)]
@@ -221,25 +224,23 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
                 Co.release(1)
             Bo.release(1)
 
-    def anm_body(in_fifo, o_out, af, nf):
+    def anm_body(in_fifo, inpff_out, ffi_out, af, nf):
         for _ in range_(0xFFFFFFFF):
             # Acquire 3 input slots at once: [o_proj_out, inpL, gain_weight].
             sub = in_fifo.acquire(3)
             s = sub[0]
             l = sub[1]
             g = sub[2]
-            # Acquire 2 output slots: out[0] = inpFF (saved for post-FFN ADD),
-            # out[1] = ffn_input (consumed by SwiGLU). Runtime drains in this
-            # order: drain #1 -> inpff_save region, drain #2 -> scratch region.
-            out_sub = o_out.acquire(2)
-            inpff_o = out_sub[0]
-            ffi_o   = out_sub[1]
-            # ADD: inpff_o = s + l
-            af(s, l, inpff_o, embed_i32)
-            # RMSNorm+gain MUL: ffi_o = rms_norm(inpff_o) * g
-            nf(inpff_o, g, ffi_o, embed_i32)
+            # Acquire one slot in each of the two output fifos:
+            # inpff_out drains to L3 io[inpff_save] (host post-FFN ADD);
+            # ffi_out is forwarded via MemTile to all SwiGLU workers.
+            inpff = inpff_out.acquire(1)
+            ffi   = ffi_out.acquire(1)
+            af(s, l, inpff, embed_i32)
+            nf(inpff, g, ffi, embed_i32)
             in_fifo.release(3)
-            o_out.release(2)
+            inpff_out.release(1)
+            ffi_out.release(1)
 
     # Gate worker: dequant-GEMV of gate weights, streams m_input_gu bf16 per
     # tile to silu_mul via a tile-to-tile FIFO. Bgu is shared (broadcast).
@@ -298,22 +299,23 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     ]
 
     anm_worker = Worker(anm_body,
-                        [anm_in_fifo.cons(), anm_o_fifo.prod(),
+                        [anm_in_fifo.cons(),
+                         anm_inpff_fifo.prod(),
+                         anm_ffi_l1l2_fifo.prod(),
                          add_fn, norm_mul_fn])
 
     # SwiGLU split workers (3 per col: gate, up, silu_mul).
-    # Bgu_fifos[i].cons() is called TWICE — once for gate_worker, once for
-    # up_worker — which IRON ObjectFifo treats as a broadcast: a single shim
-    # S2MM channel feeds both consumer tiles via on-chip routing.
+    # Bgu now comes from the broadcast ffi_mem_fifo (one MemTile fan-out to
+    # all gate+up consumers across all cols, no per-col shim).
     gate_workers = [
         Worker(gate_body,
-               [Agu_gate_fifos[i].cons(), Bgu_fifos[i].cons(),
+               [Agu_gate_fifos[i].cons(), ffi_mem_fifo.cons(),
                 gate_out_fifos[i].prod(), swiglu_gemv_fn])
         for i in range(cols)
     ]
     up_workers = [
         Worker(up_body,
-               [Agu_up_fifos[i].cons(), Bgu_fifos[i].cons(),
+               [Agu_up_fifos[i].cons(), ffi_mem_fifo.cons(),
                 up_out_fifos[i].prod(), swiglu_gemv_fn])
         for i in range(cols)
     ]
@@ -458,30 +460,28 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
         # io[0..E] now holds assembled o_proj_out
 
         # ── Phase 2: ADD + RMSNorm + MUL (ANM worker, 1 tile) ─────────────────
-        # Three sequential fills into anm_in_fifo (depth=3): o_proj_out from
-        # io, inpL/gain from input_bundle. Worker indexes sub[0..2] and
-        # produces two outputs:
-        #   drain #1 = inpFF (residual)  -> io[inpff_save_offset..]
-        #   drain #2 = ffn_input         -> io[scratch_offset..]
-        # SwiGLU reads scratch as the gated FFN input; host reads inpff_save
-        # after the dispatch for the post-FFN residual ADD.
+        # ANM consumes 3 inputs via anm_in_fifo (depth=3) and produces 2
+        # outputs:
+        #   anm_inpff_fifo  -> shim drain to io[inpff_save_offset] (host post-FFN ADD)
+        #   anm_ffi_l1l2_fifo -> MemTile -> ffi_mem_fifo (SwiGLU workers consume,
+        #                                                  no shim)
         tg_anm = rt.task_group()
         rt.fill(anm_in_fifo.prod(), io,     scratch_in_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), inputs, inpL_tap,       task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), inputs, gain_tap,       task_group=tg_anm)
-        rt.drain(anm_o_fifo.cons(), io, inpff_save_tap, task_group=tg_anm)
-        rt.drain(anm_o_fifo.cons(), io, scratch_out_tap,
+        rt.drain(anm_inpff_fifo.cons(), io, inpff_save_tap,
                  task_group=tg_anm, wait=True)
         rt.finish_task_group(tg_anm)
-        # io[scratch]    now holds ffn_input  (consumed by SwiGLU)
-        # io[inpff_save] now holds inpFF      (read by host after dispatch)
+        # ffi flows tile->MemTile->all SwiGLU workers via ffi_mem_fifo (no
+        # shim drain). io[inpff_save] is host-visible.
 
         # ── Phase 3: SwiGLU gate+up+silu_mul (split workers) ──────────────────
+        # Bgu input is fed directly from ANM via ffi_mem_fifo (MemTile broadcast);
+        # no shim fill needed for it.
         tg_gu = rt.task_group()
         for i in range(cols):
             rt.fill(Agu_gate_fifos[i].prod(), w_gu, Agu_gate_taps[i], task_group=tg_gu)
             rt.fill(Agu_up_fifos[i].prod(),   w_gu, Agu_up_taps[i],   task_group=tg_gu)
-            rt.fill(Bgu_fifos[i].prod(),      io,   scratch_in_tap,   task_group=tg_gu)
         for i in range(cols):
             rt.drain(Cgu_fifos[i].cons(), io, Cgu_taps[i],
                      task_group=tg_gu, wait=True)
