@@ -54,44 +54,61 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     dtype_vec    = np.dtype[bfloat16]
 
     # ── Tiling parameters ─────────────────────────────────────────────────────
-    # O_proj: K=embed, N=embed, m_input=1 row per tile
-    m_input_o   = 1
-    rows_per_col_o = embed_dim // cols              # e.g. 256
-    tiles_per_col_o = rows_per_col_o // m_input_o  # e.g. 256
+    # m_input_* MUST be chosen so tiles_per_col_* <= 1023 (NPU shim dma_bd
+    # outer-dim limit on AIE2P). For cols=2, embed=2048, hidden=8192:
+    #   rows_per_col_o  = 1024 -> m_input_o  >= 2 (tiles = 512)
+    #   rows_per_col_d  = 1024 -> m_input_d  >= 2 (tiles = 512)
+    #   rows_per_col_gu = 4096 -> m_input_gu >= 5 (use 16 = VEC so silu_mul
+    #                             vectorizes cleanly with chunks=1).
+    # O_proj: K=embed, N=embed
+    m_input_o   = 2
+    rows_per_col_o = embed_dim // cols
+    tiles_per_col_o = rows_per_col_o // m_input_o
     groups_o    = embed_dim // group_size
     packed_tile_o = m_input_o * embed_dim // 2 + m_input_o * groups_o * 2
     bytes_col_o = tiles_per_col_o * packed_tile_o
 
-    # SwiGLU gate/up: K=embed, N=hidden, m_input=4 rows per tile (keeps packed tile same as O_proj!)
-    m_input_gu  = m_input_o           # same so A_fifo types match if needed
-    rows_per_col_gu = hidden_dim // cols  # e.g. 1024
+    # SwiGLU gate/up: K=embed, N=hidden
+    m_input_gu  = 8                        # packed_tile = 9216 B fits one L1 bank
+    rows_per_col_gu = hidden_dim // cols
     tiles_per_col_gu = rows_per_col_gu // m_input_gu
     m_output_gu = m_input_gu
     packed_tile_gu = m_input_gu * embed_dim // 2 + m_input_gu * groups_o * 2
     bytes_col_gu   = tiles_per_col_gu * packed_tile_gu  # per gate OR up weight
 
-    # SwiGLU down: K=hidden, N=embed, m_input=1
-    m_input_d   = 1
-    rows_per_col_d = embed_dim // cols  # e.g. 256
+    # SwiGLU down: K=hidden, N=embed
+    m_input_d   = 2
+    rows_per_col_d = embed_dim // cols
     tiles_per_col_d = rows_per_col_d // m_input_d
     groups_d    = hidden_dim // group_size
     packed_tile_d = m_input_d * hidden_dim // 2 + m_input_d * groups_d * 2
     bytes_col_d = tiles_per_col_d * packed_tile_d
 
-    # ── L1 buffer types (used by individual tile kernels) ─────────────────────
-    L1_Ao_ty  = np.ndarray[(packed_tile_o,),   dtype_packed]   # O_proj weight tile
-    L1_Bo_ty  = np.ndarray[(embed_dim,),        dtype_vec]      # activation for O_proj
-    L1_Co_ty  = np.ndarray[(rows_per_col_o,),  dtype_vec]      # O_proj output slice
+    # Divisibility sanity (must be exact to avoid edge-case DMA)
+    assert rows_per_col_o  % m_input_o  == 0, "rows_per_col_o must be divisible by m_input_o"
+    assert rows_per_col_gu % m_input_gu == 0, "rows_per_col_gu must be divisible by m_input_gu"
+    assert rows_per_col_d  % m_input_d  == 0, "rows_per_col_d must be divisible by m_input_d"
+    assert tiles_per_col_o  <= 1023, f"tiles_per_col_o={tiles_per_col_o} exceeds DMA BD dim limit"
+    assert tiles_per_col_gu <= 1023, f"tiles_per_col_gu={tiles_per_col_gu} exceeds DMA BD dim limit"
+    assert tiles_per_col_d  <= 1023, f"tiles_per_col_d={tiles_per_col_d} exceeds DMA BD dim limit"
 
-    L1_anm_ty = np.ndarray[(embed_dim,),        dtype_vec]      # ADD/NORM/MUL I/O
+    # ── L1 buffer types (used by individual tile kernels) ─────────────────────
+    # Output L1 types are per-tile slices (m_input_*), NOT full rows_per_col:
+    # the kernel writes c_out[0..m_input-1] each iteration, drain advances
+    # the DDR offset by m_input per tile.
+    L1_Ao_ty  = np.ndarray[(packed_tile_o,),   dtype_packed]   # O_proj weight tile
+    L1_Bo_ty  = np.ndarray[(embed_dim,),       dtype_vec]      # activation for O_proj
+    L1_Co_ty  = np.ndarray[(m_input_o,),       dtype_vec]      # O_proj output slice
+
+    L1_anm_ty = np.ndarray[(embed_dim,),       dtype_vec]      # ADD/NORM/MUL I/O
 
     L1_Agu_ty = np.ndarray[(packed_tile_gu,),  dtype_packed]   # gate/up weight tile
-    L1_Bgu_ty = np.ndarray[(embed_dim,),        dtype_vec]      # ffn_input for SwiGLU
-    L1_Cgu_ty = np.ndarray[(rows_per_col_gu,), dtype_vec]      # silu_out slice
+    L1_Bgu_ty = np.ndarray[(embed_dim,),       dtype_vec]      # ffn_input for SwiGLU
+    L1_Cgu_ty = np.ndarray[(m_output_gu,),     dtype_vec]      # silu_out slice
 
     L1_Ad_ty  = np.ndarray[(packed_tile_d,),   dtype_packed]   # down weight tile
-    L1_Bd_ty  = np.ndarray[(hidden_dim,),       dtype_vec]      # full silu_out (broadcast)
-    L1_Cd_ty  = np.ndarray[(rows_per_col_d,),  dtype_vec]      # ffn_out slice
+    L1_Bd_ty  = np.ndarray[(hidden_dim,),      dtype_vec]      # full silu_out (broadcast)
+    L1_Cd_ty  = np.ndarray[(m_input_d,),       dtype_vec]      # ffn_out slice
 
     # ── L3 (DDR) buffer types ─────────────────────────────────────────────────
     total_o_bytes  = cols * bytes_col_o
@@ -136,13 +153,16 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     anm_in_fifo = ObjectFifo(L1_anm_ty, name="anm_in", depth=3)
     anm_o_fifo  = ObjectFifo(L1_anm_ty, name="anm_o",  depth=1)
 
-    # SwiGLU gate/up phase FIFOs (per column)
-    Agu_fifos  = [ObjectFifo(L1_Agu_ty, name=f"Agu_{i}", depth=2) for i in range(cols)]
+    # SwiGLU gate/up phase FIFOs (per column).
+    # Agu depth=1: with m_input_gu=16 the packed tile is ~18 KB, so depth=2
+    # would consume ~36 KB of L1 per worker tile and risk .bss overflow.
+    Agu_fifos  = [ObjectFifo(L1_Agu_ty, name=f"Agu_{i}", depth=1) for i in range(cols)]
     Bgu_fifos  = [ObjectFifo(L1_Bgu_ty, name=f"Bgu_{i}", depth=1) for i in range(cols)]
     Cgu_fifos  = [ObjectFifo(L1_Cgu_ty, name=f"Cgu_{i}", depth=2) for i in range(cols)]
 
-    # SwiGLU down phase FIFOs (per column)
-    Ad_fifos  = [ObjectFifo(L1_Ad_ty,  name=f"Ad_{i}",  depth=2) for i in range(cols)]
+    # SwiGLU down phase FIFOs (per column).
+    # Ad depth=1 for the same L1-budget reason (packed_tile_d ~9 KB).
+    Ad_fifos  = [ObjectFifo(L1_Ad_ty,  name=f"Ad_{i}",  depth=1) for i in range(cols)]
     Bd_fifos  = [ObjectFifo(L1_Bd_ty,  name=f"Bd_{i}",  depth=1) for i in range(cols)]
     Cd_fifos  = [ObjectFifo(L1_Cd_ty,  name=f"Cd_{i}",  depth=2) for i in range(cols)]
 
@@ -242,7 +262,19 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
         for i in range(cols)
     ]
 
-    # SwiGLU gate+up weights: interleaved [gate_col0][up_col0][gate_col1]...
+    # SwiGLU gate+up weights — interleaved DDR layout [gate_t0, up_t0, gate_t1, up_t1, ...].
+    # NOTE: this is the natural single-fill layout from the production
+    # dual_fused_dequant_gemv_silu_mul op. Outer dim = tiles_per_col_gu * 2,
+    # which for cols=2 and rows_per_col_gu=4096 equals 1024 — exactly ONE
+    # over the AIE2P shim dma_bd outer-dim limit of 1023. There is no
+    # m_input_gu that fixes this:
+    #   m_input_gu=8  -> 2*tiles = 1024 > 1023
+    #   m_input_gu=16 -> packed_tile = 18432 > 16384 (L1 bank limit)
+    #   m_input_gu=4  -> 2*tiles = 2048 > 1023
+    # Resolving this requires either MemTile routing (not exposed by IRON
+    # Python) or splitting the gate_up worker into two separate per-phase
+    # workers, which exceeds the AIE2P compute-tile input-DMA limit of 2.
+    # This is the last remaining blocker for cols=2 Phase B fusion.
     Agu_taps = [
         TensorAccessPattern(tensor_dims=(1, total_gu_bytes),
             offset=i * 2 * bytes_col_gu,
@@ -313,7 +345,7 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
         rt.finish_task_group(tg_anm)
         # scratch now holds ffn_input (embed_dim bf16)
 
-        # ── Phase 3: SwiGLU gate+up+silu_mul (all 8 cols) ─────────────────────
+        # ── Phase 3: SwiGLU gate+up+silu_mul (all cols) ───────────────────────
         tg_gu = rt.task_group()
         for i in range(cols):
             rt.fill(Agu_fifos[i].prod(), w_gu,    Agu_taps[i], task_group=tg_gu)

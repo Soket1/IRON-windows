@@ -358,7 +358,10 @@ extern "C" void dual_fused_dequant_gemv_bf16(
 
 extern "C" void dual_fused_dequant_gemv_silu_mul_bf16(
         bfloat16 *c_out, uint32_t m_output) {
-    constexpr int VEC = 16;
+    // VEC=8 because m_output_gu = m_input_gu = 8 in the post_attn_fused
+    // design.py (constrained by the per-tile L1 bank size = 16 KB:
+    // m_input_gu*K/2 + m_input_gu*groups*2 must stay <= ~16 KB).
+    constexpr int VEC = 8;
     int chunks = (int)m_output / VEC;
     aie::vector<bfloat16, VEC> register_0_5 = aie::broadcast<bfloat16, VEC>(0.5f);
     aie::vector<bfloat16, VEC> register_1   = aie::broadcast<bfloat16, VEC>(1.0f);
@@ -376,6 +379,6 @@ extern "C" void dual_fused_dequant_gemv_silu_mul_bf16(
         auto fused    = aie::mul(silu_out.template to_vector<bfloat16>(), r);
         aie::store_v(c_out + i * VEC, fused.template to_vector<bfloat16>());
     }
-    // m_output = hidden_dim / cols is always a multiple of 16 — no scalar tail needed.
+    // m_output = m_input_gu = 8 = VEC -> exactly one chunk, no tail.
     (void)chunks;
 }
