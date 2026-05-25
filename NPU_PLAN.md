@@ -199,17 +199,29 @@ Three bugs in the FlowKV graph tensor detector that caused it to silently never 
 - num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
 - Host memcpy optimization: **won't help** — profiling shows memcpy+sync = 1.7 ms/token vs NPU exec = 13.4 ms/token. 83% of overhead is NPU execution.
 
-### ✅ Phase B post_attn_fused (single xclbin fusion, 2026-05-25)
+### ✅ Phase B post_attn_fused (single xclbin fusion, SHIPPED 2026-05-25)
 
 **Goal:** Fuse O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU
-into ONE xclbin / ONE `xrt::execute()` per layer. Drops layer dispatches
-from 3 (Phase A target) → 1.
+into ONE xclbin / ONE `xrt::execute()` per layer.
 
-**Status:** IRON design compiles end-to-end at cols=2 (commit
-IRON-windows@00144f7 on `devel`). 11 AIE cores, single
-`combined.xclbin` (41 KB), single `insts.bin`. Host-side
-integration into `ggml-xdna.cpp` and correctness testing still
-needed before this can be enabled on the runtime path.
+**Status:** End-to-end working. Byte-exact vs `cpu_baseline` on
+Llama-3.2-1B Q4_0 (`paris_short_q4_0_phase_b` PASS), drift test
+matches 25 chars before bf16 noise (`paris_drift_64_q4_0_phase_b`
+PASS, prefix req was 12). **Fastest NPU preset at 6.40 t/s decode.**
+
+**Bench (median across 2 runs, single mode):**
+
+| Config                | decode t/s | prompt t/s |
+|-----------------------|-----------:|-----------:|
+| CPU Q4_0              |      11.00 |     211.00 |
+| NPU bf16              |       4.80 |     127.10 |
+| NPU INT4 v1           |       3.30 |     126.30 |
+| NPU INT4 v2 (default) |       5.60 |     128.20 |
+| NPU INT4 +SwiGLU      |       5.10 |     126.90 |
+| NPU INT4 QKV fused    |       6.30 |     128.30 |
+| **NPU Phase B fused** |   **6.40** | **132.30** |
+
++1.6% decode and +3.1% prompt over the prior best (QKV fused).
 
 **Layered blockers resolved during the work:**
 1. Kernel C++ compile — RMSNorm scalar Pass 2, canonical INT4
