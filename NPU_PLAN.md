@@ -199,7 +199,7 @@ Three bugs in the FlowKV graph tensor detector that caused it to silently never 
 - num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
 - Host memcpy optimization: **won't help** — profiling shows memcpy+sync = 1.7 ms/token vs NPU exec = 13.4 ms/token. 83% of overhead is NPU execution.
 
-### ⚠️ Phase B post_attn_fused (single xclbin fusion, blocked on XRT arg count 2026-05-26)
+### ⚠️ Phase B post_attn_fused (correctness-clean, cols=2 perf regression 2026-05-26)
 
 **Goal:** Fuse O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU
 into ONE xclbin / ONE `xrt::execute()` per layer.
@@ -218,48 +218,52 @@ into ONE xclbin / ONE `xrt::execute()` per layer.
   dispatch site re-runs the matcher, gets `m.fused_layer=true`, calls
   `ggml_backend_xdna_fused_layer_dispatch`. The xclbin loads (`loaded
   post_attn_fused kernel post_attn_fused_e2048_h8192_c2_g32`).
-- 2026-05-26 (current blocker): per-layer BO allocation fails:
-  ```
-  failed to allocate post_attn_fused w_d (group_id=8 size=9437184): invalid vector subscript
-  ... same for scratch (gid=9), silu_buf (gid=10), ffn_out (gid=11)
-  ```
-  XRT MLIR_AIE exposes only 8 group_ids per kernel (indices 0..7).
-  Our runtime_sequence has 9 buffer args; with 3 internal args
-  (opcode, insts_bo, insts_size) the total is 12 args -- 4 over the
-  XRT limit. The "GEMM kernel group_ids [0..7]=val [8]=ERR" log line
-  on other kernels confirms the cap. Dispatch falls back to the
-  legacy chained INT4 SwiGLU (which is why correctness tests still
-  PASS byte-exact).
+- 2026-05-26 (BO alloc): runtime_sequence had 9 buffer args; XRT
+  MLIR_AIE caps kernels at 8 group_ids. Bundled args (kqv+inpL+gain →
+  input_bundle, scratch+silu_buf+ffn_out → io_bundle) down to 5
+  sequence args = 8 total = within the cap. Allocation now succeeds
+  on all 5 BOs.
+- 2026-05-26 (correctness): first activations produced garbage
+  ("HelloHelloHello..."). Root cause: the ANM worker writes
+  `ffn_input` into the scratch region (since SwiGLU then reads it
+  back as Bgu input), but the host needed `inpFF` (= O_proj_out + inpL)
+  for the post-FFN residual ADD. So outL ended up being
+  `ffn_out + ffn_input` instead of `ffn_out + inpFF`, making every
+  layer a near-identity transform and stuck-token output. Fix
+  (op name bumped to v3): io_bundle gains an `inpff_save` region;
+  anm_o_fifo depth = 2; ANM worker stages two outputs; runtime drains
+  twice (inpff_save first, scratch second). Phase B now produces
+  coherent text ("Hello! How are you doing today?"). Correctness:
+    paris_short_q4_0_phase_b   PASS  (prefix 1 char exact)
+    paris_drift_64_q4_0_phase_b PASS  (25 chars exact, prefix req=12)
 
-**Fix path (3-5 hours of work):**
-Bundle host buffers in the IRON design to bring sequence args from 9 to 5
-(total kernel args = 8, within the XRT limit):
-- kqv + inpL + gain → one `3 * embed_dim bf16` input bundle.
-- scratch + silu_buf + ffn_out → one `(embed + hidden + embed) bf16`
-  workspace bundle.
-- New sequence: `w_o, w_gu, w_d, input_bundle, io_bundle` = 5 args.
+**Current bench (median 2 runs, Llama-3.2-1B Q4_0):**
 
-Coordinated changes required:
-1. `design.py`: change rt.sequence to 5 args; update worker bodies to
-   index sub-slices of the bundles.
-2. `post_attn_fused.cc`: helper functions to compute offsets.
-3. `pack_weights.py` + C++ `xdna_pack_post_attn_fused_weights`: pack
-   into the bundled layout instead of three separate buffers.
-4. `ggml_backend_xdna_fused_layer_dispatch`: allocate 5 BOs instead of
-   9; copy kqv/inpL/gain to bundle offsets; read inpFF/ffn_out from
-   workspace offsets.
-5. Regenerate the xclbin cache; bump cache key in both Python and C++.
+| Config                | decode t/s | prompt t/s |
+|-----------------------|-----------:|-----------:|
+| CPU Q4_0              |      11.20 |     209.90 |
+| NPU bf16              |       5.30 |     126.60 |
+| NPU INT4 v2 (default) |       5.70 |     131.20 |
+| NPU INT4 QKV fused    |   **6.30** |     129.20 |
+| **NPU Phase B fused** |   **4.60** |     133.40 |
 
-After the redesign, the existing pre-scan + dispatch logic should fire
-end-to-end without further changes. Bench expectation: ~1 dispatch per
-layer × 16 layers = 16 dispatches/token (vs the current 64 with QKV +
-O_proj + SwiGLU + ADD_ffn paths). Savings: ~5.6 ms/token at the
-documented 350 us overhead per dispatch, lifting Llama-3.2-1B Q4_0
-decode from 6.30 → ~6.7 t/s.
+Phase B is a **−27% decode regression** vs the legacy QKV-fused preset
+on Llama-3.2-1B Q4_0. Why: the cols=2 ShimDMA-channel constraint
+splits the GEMV work over only 2 compute columns; per-core throughput
+drops ~4× vs the cols=8 production GEMV. Dispatch-overhead savings
+(~16 × 350 µs = 5.6 ms/token from 64→16 dispatches) do not cover the
+kernel-time penalty.
+
+**When Phase B would be a win:**
+- Larger models where dispatch overhead is a bigger fraction.
+- A future cols=4+ design that resolves the AIE2P ShimDMA channel cap.
+  Today's split-worker SwiGLU + linear-chunk TAPs design fits only at
+  cols=2 (15 of 16 S2MM channels used).
 
 **Reference commits:**
-- IRON-windows@829b978 (kernel + pack_weights.py).
-- llama.cpp-xdna@950ba76a7 (pre-scan + dispatch + BO alloc diag).
+- IRON-windows@5ced9d6 (v3 inpff_save fix).
+- llama.cpp-xdna@53d2f8760 (C++ v3 dispatch reading inpff_save).
+- llama.cpp-xdna@950ba76a7 (pre-scan).
 - llama.cpp-xdna@3583d3ae8 (XDNA_DEBUG_FUSED matcher trace).
 
 **Layered blockers resolved during the work:**
