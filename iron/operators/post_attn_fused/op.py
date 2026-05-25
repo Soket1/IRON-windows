@@ -75,7 +75,9 @@ class PostAttnFused(AIEOperatorBase):
                     extra_flags=[
                         f"-DDIM_K={e}",
                         f"-DGROUP_SIZE={g}",
-                        f"-DM_OUTPUT_MAX={h // c}",
+                        # m_input_gu = 1 per iteration; left/right bufs in L1
+                        # only need that many slots, not full hidden/col.
+                        f"-DM_OUTPUT_MAX=64",
                         f"-DEMBED_DIM={e}",
                     ],
                 ),
