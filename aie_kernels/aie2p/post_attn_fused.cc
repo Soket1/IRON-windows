@@ -35,6 +35,12 @@
 #define DIM_K 2048
 #endif
 
+// Down projection has K = hidden_dim != embed_dim. Pass a separate constant
+// so the down GEMV's template instantiation reads the correct row stride.
+#ifndef DIM_K_DOWN
+#define DIM_K_DOWN 8192
+#endif
+
 #ifndef M_OUTPUT_MAX
 #define M_OUTPUT_MAX 4096
 #endif
@@ -49,6 +55,18 @@
 
 static bfloat16 left_buf[M_OUTPUT_MAX]  __attribute__((aligned(64)));
 static bfloat16 right_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
+
+// Forward declaration: _gemv_swiglu is defined further below (section 5b).
+// It is the single INT4 dequant + GEMV implementation used by ALL three
+// matvec entry points in this file (o_proj, down, gate/up). The bias-8
+// subtraction happens inside the kernel — on-chip results stay correct
+// without any host-side bias compensation, which is required for the
+// fused dispatch where intermediates never leave the NPU.
+template <uint32_t block_size, uint32_t G, uint32_t DK>
+static void _gemv_swiglu(uint32_t m,
+                         const uint8_t *__restrict a_in,
+                         const bfloat16 *__restrict b_in,
+                         bfloat16 *__restrict c_out);
 
 // ────────────────────────────────────────────────────────────────────────────
 // 1. INT4 GEMV (O_proj and Down): fused dequant + matvec, V2 double-pump.
@@ -157,16 +175,20 @@ static void _gemv_v2(uint32_t m,
 extern "C" void fused_dequant_matvec_v2_bf16(
         uint32_t m, uint32_t row_offset,
         const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
-    _gemv_v2<32, GROUP_SIZE, DIM_K>(m, a + row_offset * (DIM_K/2 + DIM_K/GROUP_SIZE*2),
-                                    b, c);
+    // Reuse the sub(8) GEMV (same as gate/up). In the fused dispatch the
+    // o_proj output is consumed on-chip by the ANM worker, so we cannot
+    // apply a host-side bias correction — the -8 must happen in the kernel.
+    _gemv_swiglu<32, GROUP_SIZE, DIM_K>(m, a + row_offset * (DIM_K/2 + DIM_K/GROUP_SIZE*2),
+                                       b, c);
 }
 
-// Down projection entry (same kernel, different B type: hidden_dim elements)
+// Down projection entry (different K: hidden_dim, larger than embed)
 extern "C" void fused_dequant_matvec_down_bf16(
         uint32_t m, uint32_t row_offset,
         const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
-    _gemv_v2<32, GROUP_SIZE, DIM_K>(m, a + row_offset * (DIM_K/2 + DIM_K/GROUP_SIZE*2),
-                                    b, c);
+    _gemv_swiglu<32, GROUP_SIZE, DIM_K_DOWN>(
+        m, a + row_offset * (DIM_K_DOWN/2 + DIM_K_DOWN/GROUP_SIZE*2),
+        b, c);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
