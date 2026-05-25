@@ -115,11 +115,25 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     total_gu_bytes = cols * 2 * bytes_col_gu   # gate + up per col, interleaved
     total_d_bytes  = cols * bytes_col_d
 
-    L3_w_o   = np.ndarray[(total_o_bytes,),   dtype_packed]
-    L3_embed = np.ndarray[(embed_dim,),        dtype_vec]
-    L3_w_gu  = np.ndarray[(total_gu_bytes,),  dtype_packed]
-    L3_w_d   = np.ndarray[(total_d_bytes,),   dtype_packed]
-    L3_hidden= np.ndarray[(hidden_dim,),       dtype_vec]
+    # Bundled L3 buffers (5 sequence args, fits XRT MLIR_AIE 8-group_id cap):
+    #   input_bundle = [kqv (embed) | inpL (embed) | gain (embed)]
+    #   io_bundle    = [scratch (embed) | silu_buf (hidden) | ffn_out (embed)]
+    # Each TAP reads/writes the appropriate sub-range via `offset`; kernel-side
+    # L1 ObjectFifos still see embed_dim or hidden_dim slices, unchanged.
+    input_bundle_elems = 3 * embed_dim
+    io_bundle_elems    = 2 * embed_dim + hidden_dim
+    scratch_offset_in_io  = 0
+    silu_offset_in_io     = embed_dim
+    ffn_out_offset_in_io  = embed_dim + hidden_dim
+    kqv_offset_in_input   = 0
+    inpL_offset_in_input  = embed_dim
+    gain_offset_in_input  = 2 * embed_dim
+
+    L3_w_o     = np.ndarray[(total_o_bytes,),       dtype_packed]
+    L3_w_gu    = np.ndarray[(total_gu_bytes,),      dtype_packed]
+    L3_w_d     = np.ndarray[(total_d_bytes,),       dtype_packed]
+    L3_inputs  = np.ndarray[(input_bundle_elems,),  dtype_vec]
+    L3_io      = np.ndarray[(io_bundle_elems,),     dtype_vec]
 
     # ── L1 tile-to-tile intermediate type (split SwiGLU workers) ──────────────
     # gate_worker -> silu_mul_worker  and  up_worker -> silu_mul_worker
@@ -308,13 +322,32 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
             strides=[0, 0, 0, 1])
         for i in range(cols)
     ]
-    # Single-vector tap (embed_dim)
-    vec_tap = TensorAccessPattern(tensor_dims=(1, embed_dim),
-                offset=0, sizes=[1, 1, 1, embed_dim], strides=[0, 0, 0, 1])
-    # O_proj output: each col drains its rows_per_col_o slice
+    # Per-buffer TAPs into the two bundled DDR arrays. Each TAP carries
+    # tensor_dims = full bundle size, offset = where the buffer lives.
+    # Layout reminder:
+    #   input_bundle: [kqv (E) | inpL (E) | gain (E)]
+    #   io_bundle:    [scratch (E) | silu_buf (H) | ffn_out (E)]
+    kqv_tap = TensorAccessPattern(tensor_dims=(1, input_bundle_elems),
+                offset=kqv_offset_in_input,
+                sizes=[1, 1, 1, embed_dim],  strides=[0, 0, 0, 1])
+    inpL_tap = TensorAccessPattern(tensor_dims=(1, input_bundle_elems),
+                offset=inpL_offset_in_input,
+                sizes=[1, 1, 1, embed_dim],  strides=[0, 0, 0, 1])
+    gain_tap = TensorAccessPattern(tensor_dims=(1, input_bundle_elems),
+                offset=gain_offset_in_input,
+                sizes=[1, 1, 1, embed_dim],  strides=[0, 0, 0, 1])
+    scratch_in_tap = TensorAccessPattern(tensor_dims=(1, io_bundle_elems),
+                offset=scratch_offset_in_io,
+                sizes=[1, 1, 1, embed_dim],  strides=[0, 0, 0, 1])
+    scratch_out_tap = scratch_in_tap   # same offset/size, drain side
+    silu_full_tap = TensorAccessPattern(tensor_dims=(1, io_bundle_elems),
+                offset=silu_offset_in_io,
+                sizes=[1, 1, 1, hidden_dim], strides=[0, 0, 0, 1])
+    # O_proj output: each col drains its rows_per_col_o slice into the
+    # scratch region of io_bundle (offset 0).
     Co_taps = [
-        TensorAccessPattern(tensor_dims=(1, embed_dim),
-            offset=i * rows_per_col_o,
+        TensorAccessPattern(tensor_dims=(1, io_bundle_elems),
+            offset=scratch_offset_in_io + i * rows_per_col_o,
             sizes=[1, 1, tiles_per_col_o, rows_per_col_o // tiles_per_col_o],
             strides=[0, 0, rows_per_col_o // tiles_per_col_o, 1])
         for i in range(cols)
@@ -339,10 +372,10 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
             strides=[0, 0, 0, 1])
         for i in range(cols)
     ]
-    # SwiGLU output: silu_out slices, m_output_gu bf16 per tile.
+    # SwiGLU output: silu_out slices, drain into io_bundle silu region.
     Cgu_taps = [
-        TensorAccessPattern(tensor_dims=(1, hidden_dim),
-            offset=i * rows_per_col_gu,
+        TensorAccessPattern(tensor_dims=(1, io_bundle_elems),
+            offset=silu_offset_in_io + i * rows_per_col_gu,
             sizes=[1, 1, tiles_per_col_gu, rows_per_col_gu // tiles_per_col_gu],
             strides=[0, 0, rows_per_col_gu // tiles_per_col_gu, 1])
         for i in range(cols)
@@ -356,78 +389,84 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
             strides=[0, 0, 0, 1])
         for i in range(cols)
     ]
-    # Down input: FULL hidden_dim broadcast to each tile
-    Bd_tap = TensorAccessPattern(tensor_dims=(1, hidden_dim),
-                offset=0, sizes=[1, 1, 1, hidden_dim], strides=[0, 0, 0, 1])
-    # Down output: embed_dim slices
+    # Down input: FULL hidden_dim broadcast to each tile, reads from
+    # io_bundle silu region.
+    Bd_tap = TensorAccessPattern(tensor_dims=(1, io_bundle_elems),
+                offset=silu_offset_in_io,
+                sizes=[1, 1, 1, hidden_dim], strides=[0, 0, 0, 1])
+    # Down output: embed_dim slices into io_bundle ffn_out region.
     Cd_taps = [
-        TensorAccessPattern(tensor_dims=(1, embed_dim),
-            offset=i * rows_per_col_d,
+        TensorAccessPattern(tensor_dims=(1, io_bundle_elems),
+            offset=ffn_out_offset_in_io + i * rows_per_col_d,
             sizes=[1, 1, tiles_per_col_d, rows_per_col_d // tiles_per_col_d],
             strides=[0, 0, rows_per_col_d // tiles_per_col_d, 1])
         for i in range(cols)
     ]
 
     # ── Runtime sequence ───────────────────────────────────────────────────────
+    # Five sequence args (fits XRT MLIR_AIE 8-group_id kernel cap = 3 internal
+    # + 5 buffer args). The kqv/inpL/gain trio is read from input_bundle at
+    # contiguous offsets; the scratch/silu_buf/ffn_out trio reads/writes the
+    # io_bundle at contiguous offsets. Host pre-packs input_bundle and reads
+    # ffn_out + scratch (inpFF) from io_bundle after the dispatch.
     rt = Runtime()
     with rt.sequence(
-        L3_w_o, L3_embed, L3_embed, L3_embed,
-        L3_w_gu, L3_w_d,
-        L3_embed,   # scratch (o_proj_out → then ffn_input)
-        L3_hidden,  # silu_buf
-        L3_embed,   # ffn_out
-    ) as (w_o, kqv, inpL, gain, w_gu, w_d, scratch, silu_buf, ffn_out):
+        L3_w_o, L3_w_gu, L3_w_d, L3_inputs, L3_io,
+    ) as (w_o, w_gu, w_d, inputs, io):
 
         rt.start(*o_proj_workers, anm_worker,
                  *gate_workers, *up_workers, *silu_mul_workers,
                  *down_workers)
 
-        # ── Phase 1: O_proj (all 8 cols) ──────────────────────────────────────
+        # ── Phase 1: O_proj ───────────────────────────────────────────────────
+        # Reads kqv from input_bundle[0..E], writes scratch to io_bundle[0..E].
         tg_o = rt.task_group()
         for i in range(cols):
-            rt.fill(Ao_fifos[i].prod(), w_o,  Ao_taps[i], task_group=tg_o)
-            rt.fill(Bo_fifos[i].prod(), kqv,  vec_tap,    task_group=tg_o)
+            rt.fill(Ao_fifos[i].prod(), w_o,    Ao_taps[i], task_group=tg_o)
+            rt.fill(Bo_fifos[i].prod(), inputs, kqv_tap,    task_group=tg_o)
         for i in range(cols):
-            rt.drain(Co_fifos[i].cons(), scratch, Co_taps[i],
+            rt.drain(Co_fifos[i].cons(), io, Co_taps[i],
                      task_group=tg_o, wait=True)
         rt.finish_task_group(tg_o)
-        # scratch now holds assembled o_proj_out (embed_dim bf16)
+        # io[0..E] now holds assembled o_proj_out
 
         # ── Phase 2: ADD + RMSNorm + MUL (ANM worker, 1 tile) ─────────────────
-        # All 3 inputs go through a single ObjectFifo (depth=3); the worker
-        # uses acquire(3) to index sub[0]=o_proj_out, sub[1]=inpL, sub[2]=gain.
+        # Three sequential fills into anm_in_fifo (depth=3): o_proj_out from
+        # io, inpL/gain from input_bundle. Worker indexes sub[0..2]. ANM output
+        # drains back into io[0..E] (overwriting o_proj_out with ffn_input).
         tg_anm = rt.task_group()
-        rt.fill(anm_in_fifo.prod(), scratch, vec_tap, task_group=tg_anm)  # o_proj_out
-        rt.fill(anm_in_fifo.prod(), inpL,    vec_tap, task_group=tg_anm)  # residual
-        rt.fill(anm_in_fifo.prod(), gain,    vec_tap, task_group=tg_anm)  # gain
-        rt.drain(anm_o_fifo.cons(), scratch, vec_tap, task_group=tg_anm, wait=True)
+        rt.fill(anm_in_fifo.prod(), io,     scratch_in_tap, task_group=tg_anm)
+        rt.fill(anm_in_fifo.prod(), inputs, inpL_tap,       task_group=tg_anm)
+        rt.fill(anm_in_fifo.prod(), inputs, gain_tap,       task_group=tg_anm)
+        rt.drain(anm_o_fifo.cons(), io, scratch_out_tap,
+                 task_group=tg_anm, wait=True)
         rt.finish_task_group(tg_anm)
-        # scratch now holds ffn_input (embed_dim bf16)
+        # io[0..E] now holds ffn_input
 
-        # ── Phase 3: SwiGLU gate+up+silu_mul (split workers, all cols) ─────────
-        # Three workers per col chained tile-to-tile (gate -> silu_mul,
-        # up -> silu_mul). Each shim fill has outer dim tiles_per_col_gu
-        # (no doubling for phases — gate and up have separate Agu fifos).
+        # ── Phase 3: SwiGLU gate+up+silu_mul (split workers) ──────────────────
         tg_gu = rt.task_group()
         for i in range(cols):
-            rt.fill(Agu_gate_fifos[i].prod(), w_gu,    Agu_gate_taps[i], task_group=tg_gu)
-            rt.fill(Agu_up_fifos[i].prod(),   w_gu,    Agu_up_taps[i],   task_group=tg_gu)
-            rt.fill(Bgu_fifos[i].prod(),      scratch, vec_tap,          task_group=tg_gu)
+            rt.fill(Agu_gate_fifos[i].prod(), w_gu, Agu_gate_taps[i], task_group=tg_gu)
+            rt.fill(Agu_up_fifos[i].prod(),   w_gu, Agu_up_taps[i],   task_group=tg_gu)
+            rt.fill(Bgu_fifos[i].prod(),      io,   scratch_in_tap,   task_group=tg_gu)
         for i in range(cols):
-            rt.drain(Cgu_fifos[i].cons(), silu_buf, Cgu_taps[i],
+            rt.drain(Cgu_fifos[i].cons(), io, Cgu_taps[i],
                      task_group=tg_gu, wait=True)
         rt.finish_task_group(tg_gu)
-        # silu_buf holds assembled silu_out (hidden_dim bf16)
+        # io[E..E+H] now holds silu_out (silu region of bundle)
 
-        # ── Phase 4: SwiGLU down (all 8 cols) ─────────────────────────────────
+        # ── Phase 4: SwiGLU down ──────────────────────────────────────────────
         tg_d = rt.task_group()
         for i in range(cols):
-            rt.fill(Ad_fifos[i].prod(), w_d,      Ad_taps[i], task_group=tg_d)
-            rt.fill(Bd_fifos[i].prod(), silu_buf, Bd_tap,     task_group=tg_d)
+            rt.fill(Ad_fifos[i].prod(), w_d, Ad_taps[i], task_group=tg_d)
+            rt.fill(Bd_fifos[i].prod(), io,  Bd_tap,     task_group=tg_d)
         for i in range(cols):
-            rt.drain(Cd_fifos[i].cons(), ffn_out, Cd_taps[i],
+            rt.drain(Cd_fifos[i].cons(), io, Cd_taps[i],
                      task_group=tg_d, wait=True)
         rt.finish_task_group(tg_d)
+        # io[E+H..2E+H] now holds ffn_out; io[0..E] still holds inpFF
+        # (untouched by SwiGLU input read); host reads both for the post-FFN
+        # residual ADD.
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 

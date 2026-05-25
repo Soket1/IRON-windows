@@ -47,7 +47,10 @@ class PostAttnFused(AIEOperatorBase):
     def get_artifacts(self):
         operator_dir = Path(__file__).parent
         e, h, c, g = self.embed_dim, self.hidden_dim, self.num_aie_columns, self.group_size
-        name = f"post_attn_fused_e{e}_h{h}_c{c}_g{g}"
+        # v2 = bundled 5-arg layout (kqv/inpL/gain → input_bundle,
+        # scratch/silu_buf/ffn_out → io_bundle). v1 had 9 args, exceeded
+        # XRT MLIR_AIE 8-group_id cap.
+        name = f"post_attn_fused_v2_e{e}_h{h}_c{c}_g{g}"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{name}.mlir",
