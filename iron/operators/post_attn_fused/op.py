@@ -47,10 +47,10 @@ class PostAttnFused(AIEOperatorBase):
     def get_artifacts(self):
         operator_dir = Path(__file__).parent
         e, h, c, g = self.embed_dim, self.hidden_dim, self.num_aie_columns, self.group_size
-        # v3 = bundled 5-arg layout PLUS dedicated inpff_save region in
-        # io_bundle so the host gets the pre-FFN residual back for the
-        # post-FFN ADD (v2 returned ffn_input by mistake).
-        name = f"post_attn_fused_v3_e{e}_h{h}_c{c}_g{g}"
+        # v4 = v3 PLUS MemTile broadcast for kqv (one shim S2MM into
+        # MemTile, fanned out to all per-col o_proj workers). Foundation
+        # for cols=4+ designs that fit within the 16-shim-S2MM cap.
+        name = f"post_attn_fused_v4_e{e}_h{h}_c{c}_g{g}"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{name}.mlir",

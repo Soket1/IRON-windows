@@ -38,7 +38,7 @@ from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1, NPU2
+from aie.iron.device import NPU1, NPU2, Tile
 
 
 def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
@@ -166,10 +166,17 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     embed_i32  = embed_dim
     hidden_i32 = hidden_dim
 
-    # ── ObjectFIFOs — exactly 3 per main worker ────────────────────────────────
-    # O_proj phase FIFOs (per column)
+    # ── ObjectFIFOs ────────────────────────────────────────────────────────────
+    # O_proj phase FIFOs (per column).
     Ao_fifos  = [ObjectFifo(L1_Ao_ty,  name=f"Ao_{i}",  depth=2) for i in range(cols)]
-    Bo_fifos  = [ObjectFifo(L1_Bo_ty,  name=f"Bo_{i}",  depth=1) for i in range(cols)]
+    # kqv (O_proj activation) is the SAME embed-dim bf16 for every column,
+    # so we broadcast: one shim S2MM into a MemTile fifo, then every
+    # o_proj_worker .cons() subscribes (the compiler routes via
+    # stream switch from MemTile to N L1 tiles). This drops the per-col
+    # Bo shim channel count from N to 1 -- frees room for cols=4+ designs.
+    kqv_l3l2_fifo = ObjectFifo(L1_Bo_ty, name="kqv_L3L2", depth=1)
+    kqv_mem_fifo  = kqv_l3l2_fifo.cons().forward(
+        name="kqv_mem", depth=1, placement=Tile(col=0, row=1))
     Co_fifos  = [ObjectFifo(L1_Co_ty,  name=f"Co_{i}",  depth=2) for i in range(cols)]
 
     # ANM phase FIFOs (leader, 1 worker).
@@ -285,7 +292,8 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     # ── Workers ────────────────────────────────────────────────────────────────
     o_proj_workers = [
         Worker(o_proj_body,
-               [Ao_fifos[i].cons(), Bo_fifos[i].cons(), Co_fifos[i].prod(), o_proj_fn])
+               [Ao_fifos[i].cons(), kqv_mem_fifo.cons(),
+                Co_fifos[i].prod(), o_proj_fn])
         for i in range(cols)
     ]
 
@@ -434,11 +442,15 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
                  *down_workers)
 
         # ── Phase 1: O_proj ───────────────────────────────────────────────────
-        # Reads kqv from input_bundle[0..E], writes scratch to io_bundle[0..E].
+        # Reads kqv from input_bundle[0..E] via broadcast MemTile fifo (one
+        # shim S2MM, fanned out to all cols' workers). Writes per-col scratch
+        # slices into io_bundle[0..E].
         tg_o = rt.task_group()
+        # Per-col weights still need their own shim — each col has a unique slice.
         for i in range(cols):
-            rt.fill(Ao_fifos[i].prod(), w_o,    Ao_taps[i], task_group=tg_o)
-            rt.fill(Bo_fifos[i].prod(), inputs, kqv_tap,    task_group=tg_o)
+            rt.fill(Ao_fifos[i].prod(), w_o, Ao_taps[i], task_group=tg_o)
+        # Single broadcast fill for kqv — all cols' o_proj workers consume.
+        rt.fill(kqv_l3l2_fifo.prod(), inputs, kqv_tap, task_group=tg_o)
         for i in range(cols):
             rt.drain(Co_fifos[i].cons(), io, Co_taps[i],
                      task_group=tg_o, wait=True)
