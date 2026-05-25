@@ -199,48 +199,68 @@ Three bugs in the FlowKV graph tensor detector that caused it to silently never 
 - num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
 - Host memcpy optimization: **won't help** — profiling shows memcpy+sync = 1.7 ms/token vs NPU exec = 13.4 ms/token. 83% of overhead is NPU execution.
 
-### ⚠️ Phase B post_attn_fused (single xclbin fusion, runtime dormant 2026-05-25)
+### ⚠️ Phase B post_attn_fused (single xclbin fusion, blocked on XRT arg count 2026-05-26)
 
 **Goal:** Fuse O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU
 into ONE xclbin / ONE `xrt::execute()` per layer.
 
-**Status:** Code-complete (kernel/design/packer/dispatch/preset all
-land), but the runtime dispatch is DORMANT. The matcher extension
-inside `xdna_try_match_swiglu` is reactive (per-SwiGLU-node), so by
-the time it runs the O_proj has ALREADY dispatched via the legacy
-INT4 GEMV path. With `XDNA_DEBUG_FUSED=1` the gate
-`if (fused_layer && out->is_int4)` never enters during a real Q4_0 run
-— the diagnostic `fused_layer: scan ENTER` line is absent.
+**Status timeline:**
+- 2026-05-25 (initial): IRON design + kernel compile; dispatch wire-up
+  written but runtime DORMANT because the reactive matcher fires after
+  legacy O_proj has already dispatched. (Earlier "6.40 t/s" bench was
+  measurement noise; Phase B never executed.)
+- 2026-05-25 (pre-scan): `xdna_plan_fused_layer` added at the start of
+  graph_compute. It walks the cgraph once, detects the full pattern
+  (`O_proj → ADD → RMS_NORM → MUL → SwiGLU → ADD_ffn`), and inserts the
+  6 preceding/trailing node indices into `qkv_plan.skip_indices`. On
+  the 32-node post-attention cgraph (dominant Llama-3.2-1B shape) the
+  matcher now succeeds with `fused_layer=1, o_proj=1, add_ffn=9`. The
+  dispatch site re-runs the matcher, gets `m.fused_layer=true`, calls
+  `ggml_backend_xdna_fused_layer_dispatch`. The xclbin loads (`loaded
+  post_attn_fused kernel post_attn_fused_e2048_h8192_c2_g32`).
+- 2026-05-26 (current blocker): per-layer BO allocation fails:
+  ```
+  failed to allocate post_attn_fused w_d (group_id=8 size=9437184): invalid vector subscript
+  ... same for scratch (gid=9), silu_buf (gid=10), ffn_out (gid=11)
+  ```
+  XRT MLIR_AIE exposes only 8 group_ids per kernel (indices 0..7).
+  Our runtime_sequence has 9 buffer args; with 3 internal args
+  (opcode, insts_bo, insts_size) the total is 12 args -- 4 over the
+  XRT limit. The "GEMM kernel group_ids [0..7]=val [8]=ERR" log line
+  on other kernels confirms the cap. Dispatch falls back to the
+  legacy chained INT4 SwiGLU (which is why correctness tests still
+  PASS byte-exact).
 
-Correctness tests PASS because the legacy chained INT4 SwiGLU produces
-byte-exact output, so the wire-up's `!fused_layer_done` fallback runs
-the legacy path. The earlier "6.40 t/s, +1.6% over QKV-fused" bench
-result was measurement noise — Phase B never dispatched.
+**Fix path (3-5 hours of work):**
+Bundle host buffers in the IRON design to bring sequence args from 9 to 5
+(total kernel args = 8, within the XRT limit):
+- kqv + inpL + gain → one `3 * embed_dim bf16` input bundle.
+- scratch + silu_buf + ffn_out → one `(embed + hidden + embed) bf16`
+  workspace bundle.
+- New sequence: `w_o, w_gu, w_d, input_bundle, io_bundle` = 5 args.
 
-**What is built and works:**
-- IRON xclbin (`combined.xclbin` 41 KB + `insts.bin` 3 KB) compiles
-  for cols=2 at `IRON-windows@829b978`.
-- Python `pack_weights.py` round-trips Q4_0 layout correctly.
-- C++ `xdna_pack_post_attn_fused_weights` builds in ggml-xdna.dll.
-- `ensure_post_attn_fused_compiled` calls compile.py with the right
-  args (verified EXIT 0 on cache clear).
-- Runtime preset `npu_phase_b` exists in correctness_test.py.
+Coordinated changes required:
+1. `design.py`: change rt.sequence to 5 args; update worker bodies to
+   index sub-slices of the bundles.
+2. `post_attn_fused.cc`: helper functions to compute offsets.
+3. `pack_weights.py` + C++ `xdna_pack_post_attn_fused_weights`: pack
+   into the bundled layout instead of three separate buffers.
+4. `ggml_backend_xdna_fused_layer_dispatch`: allocate 5 BOs instead of
+   9; copy kqv/inpL/gain to bundle offsets; read inpFF/ffn_out from
+   workspace offsets.
+5. Regenerate the xclbin cache; bump cache key in both Python and C++.
 
-**What is missing — the runtime activation:**
-Need a cgraph pre-scan that runs BEFORE the per-node dispatch loop:
+After the redesign, the existing pre-scan + dispatch logic should fire
+end-to-end without further changes. Bench expectation: ~1 dispatch per
+layer × 16 layers = 16 dispatches/token (vs the current 64 with QKV +
+O_proj + SwiGLU + ADD_ffn paths). Savings: ~5.6 ms/token at the
+documented 350 us overhead per dispatch, lifting Llama-3.2-1B Q4_0
+decode from 6.30 → ~6.7 t/s.
 
-1. Walks the cgraph once and detects the full Phase B pattern:
-   `O_proj_MUL_MAT → ADD(o_proj_out, inpL) → RMS_NORM → MUL(gain) →
-    SwiGLU 4-tuple → ADD_ffn`.
-2. Populates `ctx->fused_layer_skip` with the 6 node indices to skip.
-3. Stores per-layer dispatch metadata in `ctx->fused_layer_pending`
-   (already declared in ctx struct from Phase A scaffolding).
-4. Per-node loop checks the skip set early — BEFORE the legacy O_proj
-   dispatch fires.
-5. SwiGLU dispatch site reads pending and calls
-   `ggml_backend_xdna_fused_layer_dispatch` for the layer.
-
-Until this lands, the Phase B code path is unreachable.
+**Reference commits:**
+- IRON-windows@829b978 (kernel + pack_weights.py).
+- llama.cpp-xdna@950ba76a7 (pre-scan + dispatch + BO alloc diag).
+- llama.cpp-xdna@3583d3ae8 (XDNA_DEBUG_FUSED matcher trace).
 
 **Layered blockers resolved during the work:**
 1. Kernel C++ compile — RMSNorm scalar Pass 2, canonical INT4
