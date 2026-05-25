@@ -199,29 +199,48 @@ Three bugs in the FlowKV graph tensor detector that caused it to silently never 
 - num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
 - Host memcpy optimization: **won't help** — profiling shows memcpy+sync = 1.7 ms/token vs NPU exec = 13.4 ms/token. 83% of overhead is NPU execution.
 
-### ✅ Phase B post_attn_fused (single xclbin fusion, SHIPPED 2026-05-25)
+### ⚠️ Phase B post_attn_fused (single xclbin fusion, runtime dormant 2026-05-25)
 
 **Goal:** Fuse O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU
 into ONE xclbin / ONE `xrt::execute()` per layer.
 
-**Status:** End-to-end working. Byte-exact vs `cpu_baseline` on
-Llama-3.2-1B Q4_0 (`paris_short_q4_0_phase_b` PASS), drift test
-matches 25 chars before bf16 noise (`paris_drift_64_q4_0_phase_b`
-PASS, prefix req was 12). **Fastest NPU preset at 6.40 t/s decode.**
+**Status:** Code-complete (kernel/design/packer/dispatch/preset all
+land), but the runtime dispatch is DORMANT. The matcher extension
+inside `xdna_try_match_swiglu` is reactive (per-SwiGLU-node), so by
+the time it runs the O_proj has ALREADY dispatched via the legacy
+INT4 GEMV path. With `XDNA_DEBUG_FUSED=1` the gate
+`if (fused_layer && out->is_int4)` never enters during a real Q4_0 run
+— the diagnostic `fused_layer: scan ENTER` line is absent.
 
-**Bench (median across 2 runs, single mode):**
+Correctness tests PASS because the legacy chained INT4 SwiGLU produces
+byte-exact output, so the wire-up's `!fused_layer_done` fallback runs
+the legacy path. The earlier "6.40 t/s, +1.6% over QKV-fused" bench
+result was measurement noise — Phase B never dispatched.
 
-| Config                | decode t/s | prompt t/s |
-|-----------------------|-----------:|-----------:|
-| CPU Q4_0              |      11.00 |     211.00 |
-| NPU bf16              |       4.80 |     127.10 |
-| NPU INT4 v1           |       3.30 |     126.30 |
-| NPU INT4 v2 (default) |       5.60 |     128.20 |
-| NPU INT4 +SwiGLU      |       5.10 |     126.90 |
-| NPU INT4 QKV fused    |       6.30 |     128.30 |
-| **NPU Phase B fused** |   **6.40** | **132.30** |
+**What is built and works:**
+- IRON xclbin (`combined.xclbin` 41 KB + `insts.bin` 3 KB) compiles
+  for cols=2 at `IRON-windows@829b978`.
+- Python `pack_weights.py` round-trips Q4_0 layout correctly.
+- C++ `xdna_pack_post_attn_fused_weights` builds in ggml-xdna.dll.
+- `ensure_post_attn_fused_compiled` calls compile.py with the right
+  args (verified EXIT 0 on cache clear).
+- Runtime preset `npu_phase_b` exists in correctness_test.py.
 
-+1.6% decode and +3.1% prompt over the prior best (QKV fused).
+**What is missing — the runtime activation:**
+Need a cgraph pre-scan that runs BEFORE the per-node dispatch loop:
+
+1. Walks the cgraph once and detects the full Phase B pattern:
+   `O_proj_MUL_MAT → ADD(o_proj_out, inpL) → RMS_NORM → MUL(gain) →
+    SwiGLU 4-tuple → ADD_ffn`.
+2. Populates `ctx->fused_layer_skip` with the 6 node indices to skip.
+3. Stores per-layer dispatch metadata in `ctx->fused_layer_pending`
+   (already declared in ctx struct from Phase A scaffolding).
+4. Per-node loop checks the skip set early — BEFORE the legacy O_proj
+   dispatch fires.
+5. SwiGLU dispatch site reads pending and calls
+   `ggml_backend_xdna_fused_layer_dispatch` for the layer.
+
+Until this lands, the Phase B code path is unreachable.
 
 **Layered blockers resolved during the work:**
 1. Kernel C++ compile — RMSNorm scalar Pass 2, canonical INT4
