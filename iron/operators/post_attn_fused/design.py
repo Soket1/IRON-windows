@@ -117,14 +117,18 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
 
     # Bundled L3 buffers (5 sequence args, fits XRT MLIR_AIE 8-group_id cap):
     #   input_bundle = [kqv (embed) | inpL (embed) | gain (embed)]
-    #   io_bundle    = [scratch (embed) | silu_buf (hidden) | ffn_out (embed)]
+    #   io_bundle    = [scratch (embed) | silu_buf (hidden) | ffn_out (embed)
+    #                   | inpff_save (embed)]
     # Each TAP reads/writes the appropriate sub-range via `offset`; kernel-side
     # L1 ObjectFifos still see embed_dim or hidden_dim slices, unchanged.
+    # inpff_save holds the residual (= O_proj_out + inpL) before ANM overwrites
+    # it with the gated FFN input; host needs it for the post-FFN ADD.
     input_bundle_elems = 3 * embed_dim
-    io_bundle_elems    = 2 * embed_dim + hidden_dim
-    scratch_offset_in_io  = 0
-    silu_offset_in_io     = embed_dim
-    ffn_out_offset_in_io  = embed_dim + hidden_dim
+    io_bundle_elems    = 3 * embed_dim + hidden_dim
+    scratch_offset_in_io     = 0
+    silu_offset_in_io        = embed_dim
+    ffn_out_offset_in_io     = embed_dim + hidden_dim
+    inpff_save_offset_in_io  = 2 * embed_dim + hidden_dim
     kqv_offset_in_input   = 0
     inpL_offset_in_input  = embed_dim
     gain_offset_in_input  = 2 * embed_dim
@@ -173,7 +177,10 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     # runtime fills 3 entries in order [o_proj_out, inpL, gain_weight];
     # worker acquires(3) and indexes sub[0], sub[1], sub[2].
     anm_in_fifo = ObjectFifo(L1_anm_ty, name="anm_in", depth=3)
-    anm_o_fifo  = ObjectFifo(L1_anm_ty, name="anm_o",  depth=1)
+    # ANM outputs TWO entries per layer: first the residual inpFF
+    # (= O_proj_out + inpL) so the host can do the post-FFN ADD,
+    # then ffn_input (= RMSNorm(inpFF) * gain) which feeds SwiGLU.
+    anm_o_fifo  = ObjectFifo(L1_anm_ty, name="anm_o",  depth=2)
 
     # SwiGLU gate/up phase FIFOs (per column).
     # Split-worker layout: gate_worker and up_worker each have their own
@@ -214,13 +221,18 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
             s = sub[0]
             l = sub[1]
             g = sub[2]
-            o = o_out.acquire(1)
-            # ADD: o = s + l
-            af(s, l, o, embed_i32)
-            # RMSNorm+gain MUL: o = rms_norm(o) * g  (in-place via 3rd arg)
-            nf(o, g, o, embed_i32)
+            # Acquire 2 output slots: out[0] = inpFF (saved for post-FFN ADD),
+            # out[1] = ffn_input (consumed by SwiGLU). Runtime drains in this
+            # order: drain #1 -> inpff_save region, drain #2 -> scratch region.
+            out_sub = o_out.acquire(2)
+            inpff_o = out_sub[0]
+            ffi_o   = out_sub[1]
+            # ADD: inpff_o = s + l
+            af(s, l, inpff_o, embed_i32)
+            # RMSNorm+gain MUL: ffi_o = rms_norm(inpff_o) * g
+            nf(inpff_o, g, ffi_o, embed_i32)
             in_fifo.release(3)
-            o_out.release(1)
+            o_out.release(2)
 
     # Gate worker: dequant-GEMV of gate weights, streams m_input_gu bf16 per
     # tile to silu_mul via a tile-to-tile FIFO. Bgu is shared (broadcast).
@@ -340,6 +352,9 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
                 offset=scratch_offset_in_io,
                 sizes=[1, 1, 1, embed_dim],  strides=[0, 0, 0, 1])
     scratch_out_tap = scratch_in_tap   # same offset/size, drain side
+    inpff_save_tap = TensorAccessPattern(tensor_dims=(1, io_bundle_elems),
+                offset=inpff_save_offset_in_io,
+                sizes=[1, 1, 1, embed_dim],  strides=[0, 0, 0, 1])
     silu_full_tap = TensorAccessPattern(tensor_dims=(1, io_bundle_elems),
                 offset=silu_offset_in_io,
                 sizes=[1, 1, 1, hidden_dim], strides=[0, 0, 0, 1])
@@ -432,16 +447,22 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
 
         # ── Phase 2: ADD + RMSNorm + MUL (ANM worker, 1 tile) ─────────────────
         # Three sequential fills into anm_in_fifo (depth=3): o_proj_out from
-        # io, inpL/gain from input_bundle. Worker indexes sub[0..2]. ANM output
-        # drains back into io[0..E] (overwriting o_proj_out with ffn_input).
+        # io, inpL/gain from input_bundle. Worker indexes sub[0..2] and
+        # produces two outputs:
+        #   drain #1 = inpFF (residual)  -> io[inpff_save_offset..]
+        #   drain #2 = ffn_input         -> io[scratch_offset..]
+        # SwiGLU reads scratch as the gated FFN input; host reads inpff_save
+        # after the dispatch for the post-FFN residual ADD.
         tg_anm = rt.task_group()
         rt.fill(anm_in_fifo.prod(), io,     scratch_in_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), inputs, inpL_tap,       task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), inputs, gain_tap,       task_group=tg_anm)
+        rt.drain(anm_o_fifo.cons(), io, inpff_save_tap, task_group=tg_anm)
         rt.drain(anm_o_fifo.cons(), io, scratch_out_tap,
                  task_group=tg_anm, wait=True)
         rt.finish_task_group(tg_anm)
-        # io[0..E] now holds ffn_input
+        # io[scratch]    now holds ffn_input  (consumed by SwiGLU)
+        # io[inpff_save] now holds inpFF      (read by host after dispatch)
 
         # ── Phase 3: SwiGLU gate+up+silu_mul (split workers) ──────────────────
         tg_gu = rt.task_group()
