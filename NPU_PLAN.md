@@ -199,7 +199,7 @@ Three bugs in the FlowKV graph tensor detector that caused it to silently never 
 - num_cols=8: IRON SequentialPlacer fails — XRT runtime limits context to 4 columns (other 4 reserved for Windows Studio Effects).
 - Host memcpy optimization: **won't help** — profiling shows memcpy+sync = 1.7 ms/token vs NPU exec = 13.4 ms/token. 83% of overhead is NPU execution.
 
-### ⚠️ Phase B post_attn_fused (correctness-clean, cols=2 perf regression 2026-05-26)
+### ⚠️ Phase B post_attn_fused (v7 cols=4 MemTile redesign — fastest prompt, −11% decode 2026-05-26)
 
 **Goal:** Fuse O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU
 into ONE xclbin / ONE `xrt::execute()` per layer.
@@ -228,43 +228,64 @@ into ONE xclbin / ONE `xrt::execute()` per layer.
   `ffn_input` into the scratch region (since SwiGLU then reads it
   back as Bgu input), but the host needed `inpFF` (= O_proj_out + inpL)
   for the post-FFN residual ADD. So outL ended up being
-  `ffn_out + ffn_input` instead of `ffn_out + inpFF`, making every
-  layer a near-identity transform and stuck-token output. Fix
-  (op name bumped to v3): io_bundle gains an `inpff_save` region;
-  anm_o_fifo depth = 2; ANM worker stages two outputs; runtime drains
-  twice (inpff_save first, scratch second). Phase B now produces
-  coherent text ("Hello! How are you doing today?"). Correctness:
-    paris_short_q4_0_phase_b   PASS  (prefix 1 char exact)
-    paris_drift_64_q4_0_phase_b PASS  (25 chars exact, prefix req=12)
+  `ffn_out + ffn_input` instead of `ffn_out + inpFF`. Fix (v3):
+  io_bundle gains an `inpff_save` region; anm_o_fifo depth = 2; ANM
+  worker stages two outputs; runtime drains twice (inpff_save first,
+  scratch second). Phase B produces coherent text.
+- 2026-05-26 (v4-v6, MemTile broadcasts): IRON Python DOES expose
+  MemTile via `ObjectFifo.cons().forward(placement=Tile(col, 1))` —
+  pattern lifted from `iron_repo/iron/operators/mha/design.py`. Three
+  successive shim-saving broadcasts landed:
+    v4: kqv (O_proj activation) — 1 shim feeds N o_proj_workers
+    v5: ffi (ANM output) — ANM writes to MemTile fifo, all SwiGLU
+        workers consume via fan-out
+    v6: silu_buf (SwiGLU output reloaded) — 1 shim S2MM loads it
+        into MemTile, all Down workers consume
+  After v6 the cols=2 shim S2MM count fell from 15 to 11; each PASS
+  byte-exact.
+- 2026-05-26 (v7 cols=4 + monolithic): final two-in-one step. Reverted
+  the split gate/up/silu_mul workers back to a single monolithic
+  gate_up_worker per col (uses the dual_fused_dequant_gemv +
+  static left_buf/right_buf + silu_mul flow). Single Agu fifo per col
+  carries gate+up tiles interleaved in DDR. Combined with cols=2 →
+  cols=4 bump and the 3 MemTile broadcasts from v4..v6:
+    Workers: 4 o_proj + 1 anm + 4 gate_up + 4 down = 13 (fits 16 tiles)
+    Shim S2MM: 4*Ao + 4*Agu + 4*Ad + kqv + ffi(0) + silu + anm = 15 ≤ 16
+  Outer dim 2 * tiles_per_col_gu = 2 * 256 = 512 fits the BD cap
+  (overflowed at cols=2 with 2*512=1024 — why split was needed earlier).
+  PASS byte-exact ("The capital of France is Paris."). C++ host packer
+  switched to tile-interleaved gate+up DDR layout to match.
 
-**Current bench (median 2 runs, Llama-3.2-1B Q4_0):**
+**Final bench (median 2 runs, Llama-3.2-1B Q4_0):**
 
-| Config                | decode t/s | prompt t/s |
-|-----------------------|-----------:|-----------:|
-| CPU Q4_0              |      11.20 |     209.90 |
-| NPU bf16              |       5.30 |     126.60 |
-| NPU INT4 v2 (default) |       5.70 |     131.20 |
-| NPU INT4 QKV fused    |   **6.30** |     129.20 |
-| **NPU Phase B fused** |   **4.60** |     133.40 |
+| Config                  | decode t/s | prompt t/s |
+|-------------------------|-----------:|-----------:|
+| CPU Q4_0                |      11.20 |     209.90 |
+| NPU bf16                |       5.30 |     126.60 |
+| NPU INT4 v2 (default)   |       5.70 |     130.70 |
+| NPU INT4 QKV fused      |   **6.20** |     129.30 |
+| **NPU Phase B v7 cols=4** | **5.50** | **139.20** ← **fastest prompt** |
 
-Phase B is a **−27% decode regression** vs the legacy QKV-fused preset
-on Llama-3.2-1B Q4_0. Why: the cols=2 ShimDMA-channel constraint
-splits the GEMV work over only 2 compute columns; per-core throughput
-drops ~4× vs the cols=8 production GEMV. Dispatch-overhead savings
-(~16 × 350 µs = 5.6 ms/token from 64→16 dispatches) do not cover the
-kernel-time penalty.
+Phase B v7 is the **fastest prompt preset** (+7.7% over QKV fused) and
++19.6% better decode than the v6 cols=2 version (5.50 vs 4.60). It
+still trails the QKV-fused preset by 11% on decode -- cols=4 GEMV
+per-core throughput is ~2x lower than cols=8 of the production v2 GEMV
+(used by QKV fused / standalone O_proj / SwiGLU), and the dispatch
+savings (16 dispatches/token vs 64) don't fully cover that gap on a
+1B model.
 
-**When Phase B would be a win:**
-- Larger models where dispatch overhead is a bigger fraction.
-- A future cols=4+ design that resolves the AIE2P ShimDMA channel cap.
-  Today's split-worker SwiGLU + linear-chunk TAPs design fits only at
-  cols=2 (15 of 16 S2MM channels used).
+**When Phase B v7 is the right pick:**
+- Prompt-heavy workloads (chat with long contexts, RAG, summarization).
+- Larger models where dispatch overhead is a bigger share of step time.
+- Future cols=8 design — would need additional shim-saving tricks
+  (MemTile residency for ALL intermediates, broadcast for ANM's
+  inpL/gain too) to fit 16-S2MM cap; would close the decode gap.
 
-**Reference commits:**
-- IRON-windows@5ced9d6 (v3 inpff_save fix).
-- llama.cpp-xdna@53d2f8760 (C++ v3 dispatch reading inpff_save).
-- llama.cpp-xdna@950ba76a7 (pre-scan).
-- llama.cpp-xdna@3583d3ae8 (XDNA_DEBUG_FUSED matcher trace).
+**Reference commits (final):**
+- IRON-windows@c6d13af (v7 monolithic + cols=4)
+- llama.cpp-xdna@b8b0cac85 (C++ v7 dispatch + tile-interleaved packer)
+- IRON-windows@0964854, 542053b, 92945b2 (v4/v5/v6 MemTile broadcasts)
+- llama.cpp-xdna@950ba76a7 (pre-scan that activates the dispatch)
 
 **Layered blockers resolved during the work:**
 1. Kernel C++ compile — RMSNorm scalar Pass 2, canonical INT4
