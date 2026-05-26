@@ -101,14 +101,10 @@ class PostAttnFusedMLIR(MLIROperator):
         e, h, c, g = (
             self.embed_dim, self.hidden_dim, self.num_aie_columns, self.group_size,
         )
-        # NOTE: FusedMLIROperator HARDCODES bf16 itemsize=2 for the consolidated
-        # buffer (iron/common/compilation/fusion.py:130 "TODO: support for
-        # other data types"). uint8 weight buffers fail size-check because
-        # MLIR runtime sequence expects N uint8 elements but fusion reports
-        # N/2 (treating bytes as bf16). Fixing requires patching fusion.py
-        # to honor each AIERuntimeArgSpec's actual dtype.itemsize.
-        # Until then, this get_arg_spec is correct in intent but won't
-        # actually compile via FusedMLIROperator for INT4 weight buffers.
+        # Weight buffers are byte-packed INT4 but declared as bf16-element
+        # halved-shape on the L3 (runtime sequence) side — see design.py
+        # comment. This is required for FusedMLIROperator's bf16-only
+        # consolidator path. Byte count is unchanged.
         groups_o  = e // g
         packed_o  = 1 * e // 2 + 1 * groups_o * 2
         total_o   = c * (e // c) * packed_o
@@ -120,12 +116,14 @@ class PostAttnFusedMLIR(MLIROperator):
         packed_d  = 1 * h // 2 + 1 * groups_d * 2
         total_d   = c * (e // c) * packed_d
 
+        assert total_o  % 2 == 0
+        assert total_gu % 2 == 0
+        assert total_d  % 2 == 0
         bf = np.dtype(bfloat16)
-        u8 = np.dtype(np.uint8)
         return [
-            AIERuntimeArgSpec("in",    (total_o,),        dtype=u8),  # w_o
-            AIERuntimeArgSpec("in",    (total_gu,),       dtype=u8),  # w_gu
-            AIERuntimeArgSpec("in",    (total_d,),        dtype=u8),  # w_d
+            AIERuntimeArgSpec("in",    (total_o  // 2,),  dtype=bf),  # w_o
+            AIERuntimeArgSpec("in",    (total_gu // 2,),  dtype=bf),  # w_gu
+            AIERuntimeArgSpec("in",    (total_d  // 2,),  dtype=bf),  # w_d
             AIERuntimeArgSpec("inout", (3 * e,),          dtype=bf),  # input_bundle
             AIERuntimeArgSpec("inout", (3 * e + h,),      dtype=bf),  # io_bundle
         ]

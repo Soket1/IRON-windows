@@ -134,9 +134,18 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32,
     inpL_offset_in_input  = embed_dim
     gain_offset_in_input  = 2 * embed_dim
 
-    L3_w_o     = np.ndarray[(total_o_bytes,),       dtype_packed]
-    L3_w_gu    = np.ndarray[(total_gu_bytes,),      dtype_packed]
-    L3_w_d     = np.ndarray[(total_d_bytes,),       dtype_packed]
+    # L3 args are declared as bf16-element shape because FusedMLIROperator
+    # consolidates all child args into a single bf16 buffer. Byte layout is
+    # unchanged (each declared element pair = 2 packed-uint8 bytes); DMA
+    # semantics inside the design are byte-based and unaffected. Standalone
+    # xclbin builds also accept this declaration — the BO byte count is
+    # what XRT/runtime cares about.
+    assert total_o_bytes  % 2 == 0
+    assert total_gu_bytes % 2 == 0
+    assert total_d_bytes  % 2 == 0
+    L3_w_o     = np.ndarray[(total_o_bytes  // 2,), dtype_vec]
+    L3_w_gu    = np.ndarray[(total_gu_bytes // 2,), dtype_vec]
+    L3_w_d     = np.ndarray[(total_d_bytes  // 2,), dtype_vec]
     L3_inputs  = np.ndarray[(input_bundle_elems,),  dtype_vec]
     L3_io      = np.ndarray[(io_bundle_elems,),     dtype_vec]
 
