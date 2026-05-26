@@ -41,7 +41,8 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2, Tile
 
 
-def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
+def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32,
+                       func_prefix=""):
     """Build the fused post-attention layer IRON design."""
 
     assert embed_dim % cols == 0
@@ -145,13 +146,15 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     L1_inter_ty = np.ndarray[(m_input_gu,), dtype_vec]
 
     # ── Kernel objects ─────────────────────────────────────────────────────────
-    kobj = f"post_attn_fused_{embed_dim}k_g{group_size}.o"
+    # func_prefix is set by FusedMLIROperator to disambiguate symbols across
+    # fused ops (default "" for standalone xclbin builds).
+    kobj = f"{func_prefix}post_attn_fused_{embed_dim}k_g{group_size}.o"
 
-    o_proj_fn   = Kernel("fused_dequant_matvec_v2_bf16", kobj,
+    o_proj_fn   = Kernel(f"{func_prefix}fused_dequant_matvec_v2_bf16", kobj,
                          [np.int32, np.int32, L1_Ao_ty, L1_Bo_ty, L1_Co_ty])
-    add_fn      = Kernel("post_attn_add_bf16",      kobj,
+    add_fn      = Kernel(f"{func_prefix}post_attn_add_bf16",      kobj,
                          [L1_anm_ty, L1_anm_ty, L1_anm_ty, np.int32])
-    norm_mul_fn = Kernel("post_attn_rms_norm_bf16", kobj,
+    norm_mul_fn = Kernel(f"{func_prefix}post_attn_rms_norm_bf16", kobj,
                          [L1_anm_ty, L1_anm_ty, L1_anm_ty, np.int32])
     # Monolithic SwiGLU gate_up_worker (v7 revert): single worker per col
     # processes both gate and up phases (writing to static left_buf and
@@ -159,11 +162,11 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32):
     # with cols=4 where 2 * tiles_per_col_gu = 512 fits the shim BD
     # outer-dim cap (it overflowed at cols=2 with this pattern, which is
     # why the previous versions split into gate/up/silu_mul workers).
-    gate_up_fn  = Kernel("dual_fused_dequant_gemv_bf16", kobj,
+    gate_up_fn  = Kernel(f"{func_prefix}dual_fused_dequant_gemv_bf16", kobj,
                          [np.int32, np.int32, L1_Agu_ty, L1_Bgu_ty, np.int32])
-    silu_mul_fn = Kernel("dual_fused_dequant_gemv_silu_mul_bf16", kobj,
+    silu_mul_fn = Kernel(f"{func_prefix}dual_fused_dequant_gemv_silu_mul_bf16", kobj,
                          [L1_Cgu_ty, np.int32])
-    down_fn     = Kernel("fused_dequant_matvec_down_bf16", kobj,
+    down_fn     = Kernel(f"{func_prefix}fused_dequant_matvec_down_bf16", kobj,
                          [np.int32, np.int32, L1_Ad_ty, L1_Bd_ty, L1_Cd_ty])
 
     embed_i32  = embed_dim
