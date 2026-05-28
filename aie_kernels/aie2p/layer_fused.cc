@@ -205,3 +205,47 @@ extern "C" void layer_fused_qkv_gemv_bf16(
         m, a + row_offset * (EMBED_DIM / 2 + EMBED_DIM / GROUP_SIZE * 2),
         b, c);
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// RoPE rotation (apply pre-computed sin/cos LUT from host).
+//
+// Input  qk_in[n_heads_local × HEAD_DIM]  bf16 (post-Q/K GEMV, this col's
+//        slice of either Q or K)
+// Input  cos[HEAD_DIM/2]                  bf16  (LUT for current position)
+// Input  sin[HEAD_DIM/2]                  bf16  (LUT for current position)
+// Output qk_out[n_heads_local × HEAD_DIM] bf16  (rotated)
+//
+// RoPE applies a rotation per head over HEAD_DIM/2 pairs:
+//   for h in range(n_heads_local):
+//     for i in range(HEAD_DIM/2):
+//       a = qk_in[h*HEAD_DIM + i]
+//       b = qk_in[h*HEAD_DIM + HEAD_DIM/2 + i]   (Llama convention: split-half)
+//       qk_out[h*HEAD_DIM + i]              = a*cos[i] - b*sin[i]
+//       qk_out[h*HEAD_DIM + HEAD_DIM/2 + i] = a*sin[i] + b*cos[i]
+//
+// CPU precomputes sin/cos for the current decode position (see U2 decision
+// in dev_notes/layer_fused_design.md). Sin/cos LUT is HEAD_DIM/2 elements
+// each because the rotation pair (i, HEAD_DIM/2+i) shares the same angle.
+//
+// n is the total bf16 element count of qk_in/qk_out (must be a multiple of
+// HEAD_DIM). The kernel iterates n / HEAD_DIM heads internally.
+// ────────────────────────────────────────────────────────────────────────────
+
+extern "C" void layer_fused_rope_apply_bf16(
+        const bfloat16 *qk_in, const bfloat16 *cos_lut,
+        const bfloat16 *sin_lut, bfloat16 *qk_out, int32_t n) {
+    constexpr int HALF = HEAD_DIM / 2;
+    int n_heads_local = n / HEAD_DIM;
+    for (int h = 0; h < n_heads_local; h++) {
+        const bfloat16 *in  = qk_in  + h * HEAD_DIM;
+        bfloat16       *out = qk_out + h * HEAD_DIM;
+        for (int i = 0; i < HALF; i++) {
+            float a = (float)in[i];
+            float b = (float)in[HALF + i];
+            float c = (float)cos_lut[i];
+            float s = (float)sin_lut[i];
+            out[i]        = (bfloat16)(a * c - b * s);
+            out[HALF + i] = (bfloat16)(a * s + b * c);
+        }
+    }
+}
