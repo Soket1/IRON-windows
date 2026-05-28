@@ -196,6 +196,15 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_kv_chunk_ty, L1_kv_chunk_ty, np.int32],
     )
+    # Real attention compute spike — drop-in replacement for noop_kv_fn.
+    # Same (kv_chunk, ctx_out, n) signature, so attn body + rt.sequence
+    # stay unchanged. Internally chains qk_score → softmax → av_ctx via
+    # per-tile L1 static scratch (q_head, scores, ctx_head).
+    attn_compute_fn = Kernel(
+        f"{func_prefix}attn_compute_chunk_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_chunk_ty, L1_kv_chunk_ty, np.int32],
+    )
 
     # ── Pre-RMS input fifo ───────────────────────────────────────────────────
     # Single input fifo of depth=2 fed in two phases from rt.sequence
@@ -365,6 +374,9 @@ def my_layer_fused(
                                    depth=1) for c in attn_cols]
 
     def attn_spike_body(kv_in, drain_out, fn):
+        # Body shape unchanged from the noop spike. fn is now
+        # attn_compute_chunk_bf16, which internally runs qk_score →
+        # softmax → av_ctx on the chunk via per-tile static scratch.
         for _ in range_(0xFFFFFFFF):
             i = kv_in.acquire(1)
             o = drain_out.acquire(1)
@@ -375,7 +387,7 @@ def my_layer_fused(
     attn_workers = [
         Worker(attn_spike_body,
                [kv_mem_fifos[i].cons(), attn_drain_fifos[i].prod(),
-                noop_kv_fn])
+                attn_compute_fn])
         for i in range(n_attn)
     ]
 

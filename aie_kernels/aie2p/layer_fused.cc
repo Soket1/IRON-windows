@@ -453,3 +453,57 @@ extern "C" void attn_av_ctx_chunk_bf16(
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// SPIKE wrapper: real attention compute on a single KV chunk.
+//
+// Drop-in replacement for `layer_fused_noop_kv_bf16` — same fifo signature
+// (chunk_in, ctx_out, n), so the existing attn worker body and runtime
+// sequence don't change. Internally chains all 3 attention kernels with
+// per-tile file-scope static buffers; q_head is initialised from the
+// chunk's first HEAD_DIM bf16 (dummy spike data — real q_rot input lands
+// when the 2nd input fifo is wired in the next step). v_chunk reuses the
+// same chunk pointer (also dummy for spike).
+//
+// Purpose: prove the attention kernels actually execute on AIE2P (PDI
+// density goes up materially) before paying the cost of adding the
+// q_head input fifo and the per-head outer loop.
+// ────────────────────────────────────────────────────────────────────────────
+
+// Per-tile static scratch (each compute tile gets its own L1 instance).
+static bfloat16 attn_q_head_static[HEAD_DIM]    __attribute__((aligned(64)));
+static bfloat16 attn_scores_static[ATTN_K_CHUNK] __attribute__((aligned(64)));
+static bfloat16 attn_ctx_head_static[HEAD_DIM]  __attribute__((aligned(64)));
+
+extern "C" void attn_compute_chunk_bf16(bfloat16 *__restrict kv_chunk,
+                                        bfloat16 *__restrict ctx_out,
+                                        int32_t n) {
+    // 1. Init dummy q_head from the chunk's leading HEAD_DIM bf16 elements.
+    //    Real wiring will supply this from a dedicated q_head fifo.
+    for (int i = 0; i < HEAD_DIM; i++) {
+        attn_q_head_static[i] = kv_chunk[i];
+    }
+
+    // 2. Q · K^T scores into the scratch (bf16 of 1/sqrt(64) = 0x3E00).
+    constexpr int32_t kScaleBitsInvSqrt64 = 0x3E00;
+    attn_qk_score_chunk_bf16(attn_q_head_static, kv_chunk,
+                             attn_scores_static, kScaleBitsInvSqrt64);
+
+    // 3. In-place softmax over the K_CHUNK partial scores.
+    attn_softmax_inplace_bf16(attn_scores_static, ATTN_K_CHUNK);
+
+    // 4. Scores · V_chunk → ctx_head accumulator (treat same chunk as V
+    //    for the spike; real wiring iterates V chunks separately).
+    attn_av_ctx_chunk_bf16(attn_scores_static, kv_chunk,
+                           attn_ctx_head_static, /*zero_first=*/1);
+
+    // 5. Drain: copy ctx_head into the leading HEAD_DIM elements of the
+    //    chunk-shaped output, zero the tail. The fifo-shape match means
+    //    no design.py changes are required for this spike.
+    for (int i = 0; i < HEAD_DIM; i++) {
+        ctx_out[i] = attn_ctx_head_static[i];
+    }
+    for (int i = HEAD_DIM; i < n; i++) {
+        ctx_out[i] = (bfloat16)0.0f;
+    }
+}
