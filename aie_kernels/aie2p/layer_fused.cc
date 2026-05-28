@@ -686,7 +686,7 @@ extern "C" void attn_drain_ctx_bf16(bfloat16 *__restrict ctx_out,
 // ────────────────────────────────────────────────────────────────────────────
 
 #ifndef ATTN_HEADS_PER_TILE
-#define ATTN_HEADS_PER_TILE 4
+#define ATTN_HEADS_PER_TILE 32
 #endif
 
 static bfloat16 attn_q_heads4_static[ATTN_HEADS_PER_TILE * HEAD_DIM]
