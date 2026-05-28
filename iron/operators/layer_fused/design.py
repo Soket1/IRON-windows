@@ -273,6 +273,14 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_kv_chunk_ty, np.int32],
     )
+    # Streaming variant: compute on the static buffer WITHOUT a drain
+    # (ctx state stays in static for the next chunk). Last body chunk
+    # calls attn_compute_from_static_fn (with drain) instead.
+    attn_compute_static_acc_fn = Kernel(
+        f"{func_prefix}attn_compute_from_static_acc_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.int32],
+    )
 
     # ── Pre-RMS input fifo ───────────────────────────────────────────────────
     # Single input fifo of depth=2 fed in two phases from rt.sequence
@@ -433,10 +441,14 @@ def my_layer_fused(
     attn_cols = list(range(1, cols))  # cols 1..7
     n_attn = len(attn_cols)
     n_q_per_attn = num_heads // cols  # 4 q_heads per attn col (GQA)
-    # MemTile gather pattern: shim → kv_l3l2 (sub-chunk type) → MemTile
-    # forwards N_SUBCHUNKS sub-objects to compute tile (kv_mem). Each
-    # sub-chunk fits the shim BD inner-dim cap (≤1023 elem). compute
-    # tile body acquires N_SUBCHUNKS sub-acquires per kv_chunk.
+    # MemTile gather + multi-chunk streaming. Per body iter:
+    #   N_CHUNKS = 2 full kv_chunks (each = ATTN_SUBCHUNKS_PER_CHUNK
+    #   sub-chunks). Total sub acquires per body iter = N_CHUNKS *
+    #   ATTN_SUBCHUNKS_PER_CHUNK = 8.
+    # ctx is overwritten each chunk (last chunk wins) — semantics
+    # spike-only; correctness lands in A1.3.5 with online softmax.
+    ATTN_N_CHUNKS = 16
+    SUBS_PER_BODY = ATTN_N_CHUNKS * ATTN_SUBCHUNKS_PER_CHUNK
     kv_l3l2_fifos = [ObjectFifo(L1_kv_subchunk_ty, name=f"kv_L3L2_{c}",
                                 depth=ATTN_SUBCHUNKS_PER_CHUNK)
                      for c in attn_cols]
@@ -454,24 +466,33 @@ def my_layer_fused(
     # q_rot blocker still needs a Cqkv→MemTile→attn cross-col reroute
     # (separate step).
 
-    def attn_gather_body(kv_in, drain_out, load_fn, compute_fn):
-        # MemTile gather: per outer iter, acquire N sub-chunks (each
-        # SUBCHUNK_ELEMS bf16) and stitch them into the static
-        # attn_kv_full_static via load_fn. Then drain a full ctx via
-        # compute_from_static_fn.
+    def attn_gather_body(kv_in, drain_out, load_fn, compute_fn, acc_fn):
+        # Multi-chunk streaming via MemTile gather:
+        #   for each chunk c in [0, ATTN_N_CHUNKS):
+        #     for each sub s in [0, ATTN_SUBCHUNKS_PER_CHUNK):
+        #       acquire sub, load_fn(sub, s, SUBCHUNK_ELEMS)
+        #     if last chunk: compute_fn drains ctx_out
+        #     else:          acc_fn accumulates into static ctx
         for _ in range_(0xFFFFFFFF):
-            for k in range(ATTN_SUBCHUNKS_PER_CHUNK):
-                sub = kv_in.acquire(1)
-                load_fn(sub, k, SUBCHUNK_ELEMS)
-                kv_in.release(1)
-            o = drain_out.acquire(1)
-            compute_fn(o, kv_chunk_elems)
-            drain_out.release(1)
+            for _c in range(ATTN_N_CHUNKS):
+                for k in range(ATTN_SUBCHUNKS_PER_CHUNK):
+                    sub = kv_in.acquire(1)
+                    load_fn(sub, k, SUBCHUNK_ELEMS)
+                    kv_in.release(1)
+                if _c == ATTN_N_CHUNKS - 1:
+                    o = drain_out.acquire(1)
+                    compute_fn(o, kv_chunk_elems)
+                    drain_out.release(1)
+                else:
+                    # zero_first=1 only on the very first chunk of the iter
+                    zf = 1 if _c == 0 else 0
+                    acc_fn(zf)
 
     attn_workers = [
         Worker(attn_gather_body,
                [kv_mem_fifos[i].cons(), attn_drain_fifos[i].prod(),
-                attn_subchunk_load_fn, attn_compute_from_static_fn])
+                attn_subchunk_load_fn, attn_compute_from_static_fn,
+                attn_compute_static_acc_fn])
         for i in range(n_attn)
     ]
 
@@ -520,16 +541,15 @@ def my_layer_fused(
         strides=[0, 0, 0, 1],
     )
 
-    # Attention spike (MemTile gather): per-col TAP sweeps
-    # ATTN_SUBCHUNKS_PER_CHUNK contiguous sub-chunks (each
-    # SUBCHUNK_ELEMS=512 bf16 ≤ shim cap 1023) starting at the col's
-    # kv_head offset. Net transfer = kv_chunk_elems = 2048 bf16, one
-    # full chunk per dispatch. Outer dim N_SUB feeds the MemTile fan-out.
+    # Attention spike (MemTile gather + multi-chunk streaming): per-col
+    # TAP sweeps ATTN_N_CHUNKS × ATTN_SUBCHUNKS_PER_CHUNK contiguous
+    # sub-chunks (each SUBCHUNK_ELEMS=512 bf16 ≤ shim cap 1023) starting
+    # at the col's kv_head offset. Net transfer = N_CHUNKS * 2048 bf16.
     attn_kv_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo3_bytes // 2),
             offset=c * (mx * hd),
-            sizes=[1, 1, ATTN_SUBCHUNKS_PER_CHUNK, SUBCHUNK_ELEMS],
+            sizes=[1, 1, SUBS_PER_BODY, SUBCHUNK_ELEMS],
             strides=[0, 0, SUBCHUNK_ELEMS, 1],
         )
         for c in attn_cols

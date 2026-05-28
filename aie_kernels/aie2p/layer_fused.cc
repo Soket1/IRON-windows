@@ -790,3 +790,26 @@ extern "C" void attn_compute_from_static_bf16(bfloat16 *__restrict ctx_out,
         ctx_out[i] = (bfloat16)0.0f;
     }
 }
+
+// Streaming variant: compute attention on the static-buffer chunk
+// without the drain. ctx accumulator state stays in attn_ctx4_static
+// for the next chunk to combine with. zero_first=1 on the first
+// chunk of a body iter, 0 on subsequent ones (online accumulation).
+extern "C" void attn_compute_from_static_acc_bf16(int32_t zero_first) {
+    constexpr int32_t kScaleBitsInvSqrt64 = 0x3E00;
+    bfloat16 *kv = attn_kv_full_static;
+
+    if (zero_first) {
+        for (int i = 0; i < ATTN_HEADS_PER_TILE * HEAD_DIM; i++) {
+            attn_q_heads4_static[i] = kv[i];
+        }
+    }
+    for (int h = 0; h < ATTN_HEADS_PER_TILE; h++) {
+        bfloat16 *q_h    = attn_q_heads4_static + h * HEAD_DIM;
+        bfloat16 *scores = attn_scores4_static  + h * ATTN_K_CHUNK;
+        bfloat16 *ctx_h  = attn_ctx4_static     + h * HEAD_DIM;
+        attn_qk_score_chunk_bf16(q_h, kv, scores, kScaleBitsInvSqrt64);
+        attn_softmax_inplace_bf16(scores, ATTN_K_CHUNK);
+        attn_av_ctx_chunk_bf16(scores, kv, ctx_h, zero_first);
+    }
+}
