@@ -207,6 +207,63 @@ extern "C" void layer_fused_qkv_gemv_bf16(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Static L1 buffer variants for col 0's merged worker (Path A from spec).
+//
+// Col 0's compute tile runs pre-RMS first, then QKV GEMVs. To stay within
+// the AIE2P 2-input-DMA cap, col 0 cannot consume bq_mem.cons() (would be
+// a 3rd input channel alongside rms_in and Aqkv). Instead, pre-RMS writes
+// its normed output to BOTH a static L1 buffer (used by col 0's own QKV
+// phases) and to a fifo-routed output buffer (broadcast via MemTile to
+// cols 1-7).
+// ────────────────────────────────────────────────────────────────────────────
+
+static bfloat16 normed_static[EMBED_DIM] __attribute__((aligned(64)));
+
+// Col-0 pre-RMS variant: computes weighted RMSNorm into BOTH the static
+// L1 buffer (for col 0's own QKV phases) AND the fifo-routed `bq_out`
+// (for the MemTile broadcast that feeds cols 1-7).
+extern "C" void layer_fused_pre_rms_col0_bf16(
+        const bfloat16 *input, const bfloat16 *gain,
+        bfloat16 *bq_out, int32_t n) {
+    constexpr float eps = 1e-5f;
+    constexpr int VEC = 16;
+
+    ::aie::vector<float, VEC> acc = ::aie::zeros<float, VEC>();
+    int chunks = n / VEC;
+    for (int i = 0; i < chunks; i++) {
+        ::aie::vector<bfloat16, VEC> v = ::aie::load_v<VEC>(input + i * VEC);
+        ::aie::vector<float, VEC> sq = ::aie::mul_square(v);
+        acc = ::aie::add(acc, sq);
+    }
+    float sum_sq = ::aie::reduce_add(acc);
+    for (int i = chunks * VEC; i < n; i++) {
+        float x = (float)input[i];
+        sum_sq += x * x;
+    }
+
+    float inv_rms = aie::invsqrt(sum_sq / n + eps);
+
+    for (int i = 0; i < n; i++) {
+        bfloat16 r = (bfloat16)((float)input[i] * inv_rms * (float)gain[i]);
+        normed_static[i] = r;
+        bq_out[i] = r;
+    }
+    (void)chunks;
+}
+
+// Col-0 QKV variant: reads activation from the static L1 buffer (filled
+// by `layer_fused_pre_rms_col0_bf16` earlier in the same Worker iter)
+// instead of a fifo-routed bf16 pointer. Same kernel math as the
+// fifo-input variant — only the activation source differs.
+extern "C" void layer_fused_qkv_gemv_static_bf16(
+        uint32_t m, uint32_t row_offset,
+        const uint8_t *a, bfloat16 *c) {
+    _qkv_gemv<32, GROUP_SIZE, EMBED_DIM>(
+        m, a + row_offset * (EMBED_DIM / 2 + EMBED_DIM / GROUP_SIZE * 2),
+        normed_static, c);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // RoPE rotation (apply pre-computed sin/cos LUT from host).
 //
 // Input  qk_in[n_heads_local × HEAD_DIM]  bf16 (post-Q/K GEMV, this col's
