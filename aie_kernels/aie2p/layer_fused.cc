@@ -372,12 +372,28 @@ extern "C" void attn_qk_score_chunk_bf16(
     uint16_t sb = (uint16_t)scale_bits;
     __builtin_memcpy(&scale, &sb, 2);
 
+    // Vectorised dot: HEAD_DIM=64 lanes via 16-lane bf16 SIMD chunks.
+    // Per row j: load q in 16-lane segments, multiply-accumulate across
+    // all HEAD_DIM/16 segments into a float-accumulator vector, then
+    // reduce_add into a scalar score. This is 4 MAC bundles per K row,
+    // dense per-tile AIE instructions vs the prior scalar 64-iter loop.
+    constexpr int VEC = 16;
+    static_assert(HEAD_DIM % VEC == 0, "HEAD_DIM must be multiple of 16");
+    constexpr int N_VEC = HEAD_DIM / VEC;
+
     for (int j = 0; j < ATTN_K_CHUNK; j++) {
         const bfloat16 *k_row = k_chunk + j * HEAD_DIM;
-        float dot = 0.0f;
-        for (int d = 0; d < HEAD_DIM; d++) {
-            dot += (float)q_head[d] * (float)k_row[d];
+        ::aie::accum<accfloat, VEC> acc =
+            ::aie::zeros<accfloat, VEC>();
+        AIE_PREPARE_FOR_PIPELINING
+        for (int s = 0; s < N_VEC; s++) {
+            ::aie::vector<bfloat16, VEC> qv =
+                ::aie::load_v<VEC>(q_head + s * VEC);
+            ::aie::vector<bfloat16, VEC> kv =
+                ::aie::load_v<VEC>(k_row  + s * VEC);
+            acc = ::aie::mac(acc, qv, kv);
         }
+        float dot = ::aie::reduce_add(acc.template to_vector<float>());
         scores_out[j] = (bfloat16)(dot * (float)scale);
     }
 }
@@ -436,21 +452,58 @@ extern "C" void attn_softmax_inplace_bf16(bfloat16 *scores, int32_t n) {
 // HEAD_DIM bf16 accumulator that the caller zeroes before the first chunk
 // and reads after the last. scores_chunk is K_CHUNK weights from the
 // softmax output (chunk-local), v_chunk is K_CHUNK rows of HEAD_DIM bf16.
+//
+// Vectorised over the HEAD_DIM dim: each token row contributes
+// w * v_row to the HEAD_DIM accumulator. Process accumulator in
+// 16-lane bf16 segments (HEAD_DIM/16 = 4 vector slots).
 extern "C" void attn_av_ctx_chunk_bf16(
         const bfloat16 *scores_chunk,  // [K_CHUNK]
         const bfloat16 *v_chunk,       // [K_CHUNK × HEAD_DIM]
         bfloat16       *ctx_head,      // [HEAD_DIM] accumulator
         int32_t         zero_first      // 1 = clear ctx_head before; 0 = accumulate
     ) {
+    constexpr int VEC = 16;
+    static_assert(HEAD_DIM % VEC == 0, "HEAD_DIM must be multiple of 16");
+    constexpr int N_VEC = HEAD_DIM / VEC;
+
+    // Load (or zero) the running ctx accumulator into N_VEC float
+    // accumulators that live in registers across the K_CHUNK loop.
+    ::aie::accum<accfloat, VEC> acc[N_VEC];
     if (zero_first) {
-        for (int d = 0; d < HEAD_DIM; d++) ctx_head[d] = (bfloat16)0.0f;
-    }
-    for (int j = 0; j < ATTN_K_CHUNK; j++) {
-        float w = (float)scores_chunk[j];
-        const bfloat16 *v_row = v_chunk + j * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; d++) {
-            ctx_head[d] = (bfloat16)((float)ctx_head[d] + w * (float)v_row[d]);
+        for (int s = 0; s < N_VEC; s++) {
+            acc[s] = ::aie::zeros<accfloat, VEC>();
         }
+    } else {
+        for (int s = 0; s < N_VEC; s++) {
+            ::aie::vector<bfloat16, VEC> v0 =
+                ::aie::load_v<VEC>(ctx_head + s * VEC);
+            // Cast bf16→float vector via mul-by-1 trick is ugly;
+            // simpler — use scalar promote in a small tail loop.
+            // Here we re-materialise from bf16 by adding 0 via mac.
+            ::aie::vector<bfloat16, VEC> ones =
+                ::aie::broadcast<bfloat16, VEC>(1.0f);
+            acc[s] = ::aie::mul(v0, ones);
+        }
+    }
+
+    for (int j = 0; j < ATTN_K_CHUNK; j++) {
+        bfloat16 w = scores_chunk[j];
+        ::aie::vector<bfloat16, VEC> wv =
+            ::aie::broadcast<bfloat16, VEC>(w);
+        const bfloat16 *v_row = v_chunk + j * HEAD_DIM;
+        AIE_PREPARE_FOR_PIPELINING
+        for (int s = 0; s < N_VEC; s++) {
+            ::aie::vector<bfloat16, VEC> vv =
+                ::aie::load_v<VEC>(v_row + s * VEC);
+            acc[s] = ::aie::mac(acc[s], wv, vv);
+        }
+    }
+
+    // Store accumulators back to bf16 ctx_head.
+    for (int s = 0; s < N_VEC; s++) {
+        ::aie::vector<bfloat16, VEC> out =
+            acc[s].template to_vector<bfloat16>();
+        ::aie::store_v(ctx_head + s * VEC, out);
     }
 }
 
