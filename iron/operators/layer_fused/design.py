@@ -138,6 +138,14 @@ def my_layer_fused(
     L1_Bq_ty = np.ndarray[(e,), dtype_vec]
     L1_Cq_ty = np.ndarray[(m_input_qkv,), dtype_vec]
 
+    # Attention KV chunk type: K_CHUNK tokens × HEAD_DIM bf16 elements.
+    # Matches FFLM's ct_chunk_size=32 (mha.dll RE'd disasm) and our kernel
+    # ATTN_K_CHUNK macro. Per-col attention reads its 1 kv_head slice from
+    # BO3 via this fifo, streaming chunk-by-chunk.
+    K_CHUNK = 32
+    kv_chunk_elems = K_CHUNK * hd
+    L1_kv_chunk_ty = np.ndarray[(kv_chunk_elems,), dtype_vec]
+
     # Skeleton passthrough (kept around to exercise the remaining BOs until
     # real compute lands in 2b..2d). Each touches a tiny chunk to keep the
     # tile-utilisation footprint nonzero.
@@ -184,6 +192,20 @@ def my_layer_fused(
         [rms_in_fifo.cons(), rms_out_fifo.prod(), rms_norm_fn],
     )
 
+    # ── ATTN sub-stage (deferred) ────────────────────────────────────────────
+    # We tried adding a 3rd input DMA channel (K_chunk reads from BO3) to
+    # the per-col qkv_worker as a phase-5 spike. SequentialPlacer rejected
+    # it with "Failed to find a tile matching column 0" — confirming that
+    # AIE2P compute tiles have a hard 2-input-DMA cap. Attention KV
+    # streaming MUST go through MemTile gather (one row-1 tile fans the
+    # K/V chunks out to compute tiles via the stream switch).
+    #
+    # For this checkpoint we keep the qkv_workers at 2 input channels
+    # (Aqkv + Bq), and defer attention wiring to the next step which
+    # adds 4 MemTile-mediated KV-streaming fifos (one per kv_head).
+    # No Kch_fifos, no phase-5 in qkv_body, no Kch_taps in rt.sequence.
+    # Per-col qkv_worker stays at: 2 input + 1 output DMA channels.
+
     # ── Q/K/V GEMV (8 cols, unified worker doing 3 phases per outer iter) ───
     # Per-col output dims:
     #   Q:  rows_per_col_q  = e // cols           (256 for cols=8, e=2048)
@@ -202,12 +224,10 @@ def my_layer_fused(
     )
     assert tiles_per_col_kv <= 1023, f"tiles_per_col_kv={tiles_per_col_kv} exceeds DMA cap"
 
-    # ONE A fifo + ONE C fifo per col, reused across Q/K/V phases.
-    # Tile budget: 1 (pre_rms) + 8 (unified QKV) + 3 (skel) = 12 of 16
-    # compute tiles. Each worker uses 2 input channels (Aqkv + bq broadcast)
-    # and 1 output channel (Cqkv) — well within AIE2P per-tile DMA cap.
-    # Activation (normed) is broadcast via MemTile, same kqv pattern as
-    # post_attn_fused.design.py:192-194.
+    # ── Attention placeholder fifo (DEFERRED — see ATTN sub-stage note) ─────
+    # Per-tile 3rd input DMA channel rejected by SequentialPlacer; we'll
+    # use MemTile-mediated KV streaming in the next step. No Kch fifos
+    # declared at this checkpoint.
     Aqkv_fifos = [ObjectFifo(L1_Aq_ty, name=f"Aqkv_{i}", depth=2) for i in range(cols)]
     bq_l3l2_fifo = ObjectFifo(L1_Bq_ty, name="bq_L3L2", depth=1)
     bq_mem_fifo  = bq_l3l2_fifo.cons().forward(
@@ -216,9 +236,9 @@ def my_layer_fused(
 
     # Unified QKV body: Q phase → K phase → V phase. The runtime sequence
     # fills A with Aq/Ak/Av tap (different weight regions), fills bq with
-    # the same normed activation, and drains C to different BO4 regions
-    # (q_rot / k_rot / v) — same L1 fifos throughout, the source/sink TAPs
-    # carry the phase semantics.
+    # the same normed activation, drains C to different BO4 regions
+    # (q_rot / k_rot / v) — same L1 fifos throughout, the source/sink
+    # TAPs carry the phase semantics.
     def qkv_body(A, B, C, fn):
         for _ in range_(0xFFFFFFFF):
             # Q phase (tiles_per_col_q outer iters)
@@ -258,8 +278,9 @@ def my_layer_fused(
 
     # ── Skeleton passthrough workers (BO1/BO2/BO3 placeholders) ──────────────
     # Three small noop workers keep DDR_PATCH ops alive on the unwired BOs.
-    # Real wiring lands in 2c-end (KV slot to BO3) + stage 3 (BO1 O_proj,
-    # BO2 SwiGLU weights).
+    # Real wiring lands in next step (BO3 KV streaming via MemTile gather)
+    # + stage 3 (BO1 O_proj, BO2 SwiGLU weights).
+    # Tile budget: 1 pre_rms + 8 qkv + 3 skel = 12 of 16.
     skel_in  = [ObjectFifo(L1_chunk, name=f"skel_in_{i}",  depth=2) for i in range(3)]
     skel_out = [ObjectFifo(L1_chunk, name=f"skel_out_{i}", depth=2) for i in range(3)]
 
@@ -396,6 +417,9 @@ def my_layer_fused(
         for i in range(cols)
     ]
 
+    # ATTN Kch_taps removed — BO3 will be wired via MemTile-mediated
+    # streaming in the next step (separate attention worker per col).
+
     rt = Runtime()
     with rt.sequence(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
@@ -444,6 +468,8 @@ def my_layer_fused(
             rt.drain(Cqkv_fifos[i].cons(), act, Cv_taps[i],
                      task_group=tg_v, wait=True)
         rt.finish_task_group(tg_v)
+
+        # ATTN phase deferred — will land in next step with MemTile gather.
 
         # ── Skeleton chunk fills/drains (BO1, BO2, BO3 placeholders) ────────
         tg_skel = rt.task_group()
