@@ -37,6 +37,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+import os
 import os.path
 import shutil
 import zlib
@@ -669,8 +670,30 @@ class AieccCompilationRule(CompilationRule):
         self._wrapper_dir = None
         if sys.platform == "win32":
             self._wrapper_dir = self._create_ld_lld_wrapper(peano_dir)
+            # Augment PATH so aiecc (which spawns subprocesses for tools
+            # it does not bundle, e.g. xclbinutil from XRT SDK and
+            # llvm-objcopy from a standalone LLVM install) can discover
+            # them. Honor XRT_ROOT / XILINX_XRT first, then probe known
+            # local install layouts. Mirrors `_find_tool` fallback.
+            extra_path_dirs = [str(self._wrapper_dir)]
+            xrt_root = os.environ.get("XRT_ROOT") or os.environ.get("XILINX_XRT")
+            xrt_candidates = []
+            if xrt_root:
+                xrt_candidates += [Path(xrt_root), Path(xrt_root) / "xrt"]
+            xrt_candidates += [
+                Path(r"C:\Users") / os.environ.get("USERNAME", "") / "Downloads" / "xrt_windows_sdk" / "xrt_sdk" / "xrt",
+                Path(r"C:\Xilinx\XRT\bin"),
+            ]
+            for d in xrt_candidates:
+                if d.is_dir() and (d / "xclbinutil.exe").is_file():
+                    extra_path_dirs.append(str(d))
+                    break
+            for llvm_dir in (r"C:\Program Files\LLVM\bin", r"C:\Program Files (x86)\LLVM\bin"):
+                if Path(llvm_dir).is_dir() and (Path(llvm_dir) / "llvm-objcopy.exe").is_file():
+                    extra_path_dirs.append(llvm_dir)
+                    break
             self._base_env["PATH"] = (
-                str(self._wrapper_dir) + os.pathsep + self._base_env.get("PATH", "")
+                os.pathsep.join(extra_path_dirs) + os.pathsep + self._base_env.get("PATH", "")
             )
         self.aiecc_path = self._resolve_aiecc(mlir_aie_dir)
         super().__init__(*args, **kwargs)
@@ -994,6 +1017,12 @@ def _find_tool(name, peano_dir, mlir_aie_dir):
     """Locate an LLVM tool by name, trying peano_dir, mlir_aie_dir, then system PATH.
 
     On Windows, automatically appends '.exe' to candidate names.
+
+    Windows fallbacks: also probe well-known install locations for tools
+    that the upstream pip wheels (`llvm-aie`, `mlir_aie`) do not ship —
+    notably `llvm-objcopy.exe` (LLVM standalone install) and
+    `xclbinutil.exe` (XRT SDK). Matches the locations
+    `IRON-windows/INSTALL_WINDOWS.md` documents.
     """
     exe_suffix = ".exe" if sys.platform == "win32" else ""
     candidates = [
@@ -1006,6 +1035,26 @@ def _find_tool(name, peano_dir, mlir_aie_dir):
             Path(peano_dir) / "bin" / name,
             Path(mlir_aie_dir) / "bin" / name,
         ]
+    if sys.platform == "win32":
+        # llvm-aie wheel ships clang, lld, llvm-nm, etc. but not llvm-objcopy.
+        # Standalone "LLVM for Windows" install always provides it.
+        for llvm_dir in (
+            r"C:\Program Files\LLVM\bin",
+            r"C:\Program Files (x86)\LLVM\bin",
+        ):
+            candidates.append(Path(llvm_dir) / (name + exe_suffix))
+        # XRT SDK ships xclbinutil. Honor an env override first, then
+        # probe the standard XRT install locations.
+        xrt_root = os.environ.get("XRT_ROOT") or os.environ.get("XILINX_XRT")
+        xrt_sdk_candidates = []
+        if xrt_root:
+            xrt_sdk_candidates += [Path(xrt_root), Path(xrt_root) / "xrt"]
+        xrt_sdk_candidates += [
+            Path(r"C:\Users") / os.environ.get("USERNAME", "") / "Downloads" / "xrt_windows_sdk" / "xrt_sdk" / "xrt",
+            Path(r"C:\Xilinx\XRT\bin"),
+        ]
+        for xrt_dir in xrt_sdk_candidates:
+            candidates.append(xrt_dir / (name + exe_suffix))
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
