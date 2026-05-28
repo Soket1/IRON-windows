@@ -153,8 +153,21 @@ def my_layer_fused(
     L1_chunk = np.ndarray[(chunk_elems,), dtype_vec]
 
     # ── Kernels ──────────────────────────────────────────────────────────────
+    # Three QKV variants:
+    #   * fifo-input GEMV: cols 1-7 use this (consume bq_mem broadcast).
+    #   * static-input GEMV: col 0 only (reads activation from static L1
+    #     buffer that the col-0 pre-RMS kernel wrote earlier in the same
+    #     worker iteration).
+    #   * pre-RMS col-0: weighted RMSNorm that writes to BOTH the static
+    #     L1 buffer (for col 0's own QKV phases) AND the bq fifo output
+    #     buffer (broadcast via MemTile to cols 1-7).
     rms_norm_fn = Kernel(
         f"{func_prefix}layer_fused_rms_norm_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_E_ty, L1_E_ty, L1_E_ty, np.int32],
+    )
+    pre_rms_col0_fn = Kernel(
+        f"{func_prefix}layer_fused_pre_rms_col0_bf16",
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_E_ty, L1_E_ty, L1_E_ty, np.int32],
     )
@@ -163,34 +176,24 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [np.int32, np.int32, L1_Aq_ty, L1_Bq_ty, L1_Cq_ty],
     )
+    qkv_gemv_static_fn = Kernel(
+        f"{func_prefix}layer_fused_qkv_gemv_static_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.int32, np.int32, L1_Aq_ty, L1_Cq_ty],
+    )
     noop_fn = Kernel(
         f"{func_prefix}layer_fused_noop_bf16",
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_chunk, L1_chunk, np.int32],
     )
 
-    # ── Pre-RMS ObjectFifos ──────────────────────────────────────────────────
-    # ANM-style: one input fifo of depth=2 fed in two phases (x, then gain),
-    # one output fifo of depth=1 drained to BO4 normed slot.
-    # AIE2P limit: per-tile input-DMA channels ≤ 2 → fits comfortably with
-    # one acquire(2) on the input side.
+    # ── Pre-RMS input fifo ───────────────────────────────────────────────────
+    # Single input fifo of depth=2 fed in two phases from rt.sequence
+    # (x first, then W_norm1). col 0's body acquires both via acquire(2).
+    # No separate output fifo — pre_rms_col0 kernel writes to BOTH static
+    # L1 (consumed in same body's QKV phases) AND the bq fifo prod slot
+    # (broadcast via MemTile to cols 1-7).
     rms_in_fifo  = ObjectFifo(L1_E_ty, name="rms_in",  depth=2)
-    rms_out_fifo = ObjectFifo(L1_E_ty, name="rms_out", depth=1)
-
-    def pre_rms_body(in_fifo, out_fifo, fn):
-        for _ in range_(0xFFFFFFFF):
-            sub = in_fifo.acquire(2)
-            x_in = sub[0]
-            gain = sub[1]
-            out  = out_fifo.acquire(1)
-            fn(x_in, gain, out, e)
-            in_fifo.release(2)
-            out_fifo.release(1)
-
-    pre_rms_worker = Worker(
-        pre_rms_body,
-        [rms_in_fifo.cons(), rms_out_fifo.prod(), rms_norm_fn],
-    )
 
     # ── ATTN sub-stage (deferred) ────────────────────────────────────────────
     # We tried adding a 3rd input DMA channel (K_chunk reads from BO3) to
@@ -224,43 +227,74 @@ def my_layer_fused(
     )
     assert tiles_per_col_kv <= 1023, f"tiles_per_col_kv={tiles_per_col_kv} exceeds DMA cap"
 
-    # ── Attention placeholder fifo (DEFERRED — see ATTN sub-stage note) ─────
-    # Per-tile 3rd input DMA channel rejected by SequentialPlacer; we'll
-    # use MemTile-mediated KV streaming in the next step. No Kch fifos
-    # declared at this checkpoint.
+    # ── Unified bq broadcast (col 0 produces, MemTile fans out to all cols) ──
+    # Col 0's pre-RMS kernel writes the normed result into the bq_l3l2_fifo
+    # producer slot directly. MemTile broadcast fanout publishes it to all
+    # 8 cols' .cons() ports. depth=1 — one normed token per outer iteration.
     Aqkv_fifos = [ObjectFifo(L1_Aq_ty, name=f"Aqkv_{i}", depth=2) for i in range(cols)]
     bq_l3l2_fifo = ObjectFifo(L1_Bq_ty, name="bq_L3L2", depth=1)
     bq_mem_fifo  = bq_l3l2_fifo.cons().forward(
         name="bq_mem", depth=1, placement=Tile(col=0, row=1))
     Cqkv_fifos = [ObjectFifo(L1_Cq_ty, name=f"Cqkv_{i}", depth=2) for i in range(cols)]
 
-    # Unified QKV body: Q phase → K phase → V phase. The runtime sequence
-    # fills A with Aq/Ak/Av tap (different weight regions), fills bq with
-    # the same normed activation, drains C to different BO4 regions
-    # (q_rot / k_rot / v) — same L1 fifos throughout, the source/sink
-    # TAPs carry the phase semantics.
-    def qkv_body(A, B, C, fn):
+    # ── Worker bodies ────────────────────────────────────────────────────────
+    # Col 0: 4-phase body (pre-RMS → Q → K → V). Pre-RMS writes to BOTH the
+    # static L1 buffer (consumed by qkv_gemv_static below) AND to the bq
+    # fifo prod slot (broadcast). QKV phases use the static-input variant
+    # so col 0's tile stays at 2 input channels (rms_in + Aqkv).
+    def col0_body(rms_in, bq_prod, Aqkv, Cqkv, pre_rms_fn, qkv_static_fn):
         for _ in range_(0xFFFFFFFF):
-            # Q phase (tiles_per_col_q outer iters)
+            # Pre-RMS phase
+            sub = rms_in.acquire(2)
+            x_in  = sub[0]
+            gain  = sub[1]
+            bq_out = bq_prod.acquire(1)
+            pre_rms_fn(x_in, gain, bq_out, e)
+            rms_in.release(2)
+            bq_prod.release(1)  # publish normed via MemTile to cols 1-7
+            # Q phase (static-input GEMV, no B fifo acquire)
+            for _ in range_(tiles_per_col_q):
+                a = Aqkv.acquire(1)
+                c = Cqkv.acquire(1)
+                qkv_static_fn(m_input_qkv, 0, a, c)
+                Aqkv.release(1)
+                Cqkv.release(1)
+            # K phase
+            for _ in range_(tiles_per_col_kv):
+                a = Aqkv.acquire(1)
+                c = Cqkv.acquire(1)
+                qkv_static_fn(m_input_qkv, 0, a, c)
+                Aqkv.release(1)
+                Cqkv.release(1)
+            # V phase
+            for _ in range_(tiles_per_col_kv):
+                a = Aqkv.acquire(1)
+                c = Cqkv.acquire(1)
+                qkv_static_fn(m_input_qkv, 0, a, c)
+                Aqkv.release(1)
+                Cqkv.release(1)
+
+    # Cols 1-7: 3-phase body. Acquire B (bq_mem broadcast) ONCE per outer
+    # iter, reuse for all three QKV phases. (Was acquire/release per phase,
+    # but with col 0 producing bq once and depth=1, multi-acquire deadlocks.)
+    def colN_body(A, B, C, fn):
+        for _ in range_(0xFFFFFFFF):
             b = B.acquire(1)
+            # Q phase
             for _ in range_(tiles_per_col_q):
                 a = A.acquire(1)
                 c = C.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
                 A.release(1)
                 C.release(1)
-            B.release(1)
             # K phase
-            b = B.acquire(1)
             for _ in range_(tiles_per_col_kv):
                 a = A.acquire(1)
                 c = C.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
                 A.release(1)
                 C.release(1)
-            B.release(1)
             # V phase
-            b = B.acquire(1)
             for _ in range_(tiles_per_col_kv):
                 a = A.acquire(1)
                 c = C.acquire(1)
@@ -269,12 +303,19 @@ def my_layer_fused(
                 C.release(1)
             B.release(1)
 
-    qkv_workers = [
-        Worker(qkv_body,
+    col0_worker = Worker(
+        col0_body,
+        [rms_in_fifo.cons(), bq_l3l2_fifo.prod(),
+         Aqkv_fifos[0].cons(), Cqkv_fifos[0].prod(),
+         pre_rms_col0_fn, qkv_gemv_static_fn],
+    )
+    qkv_workers_rest = [
+        Worker(colN_body,
                [Aqkv_fifos[i].cons(), bq_mem_fifo.cons(),
                 Cqkv_fifos[i].prod(), qkv_gemv_fn])
-        for i in range(cols)
+        for i in range(1, cols)
     ]
+    qkv_workers = [col0_worker] + qkv_workers_rest
 
     # ── Skeleton passthrough workers (BO1/BO2/BO3 placeholders) ──────────────
     # Three small noop workers keep DDR_PATCH ops alive on the unwired BOs.
@@ -424,46 +465,51 @@ def my_layer_fused(
     with rt.sequence(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
-        rt.start(pre_rms_worker, *qkv_workers, *skel_workers)
-        # ── Phase 1: pre-RMS ────────────────────────────────────────────────
+        rt.start(*qkv_workers, *skel_workers)
+        # ── Phase 1: pre-RMS inputs (col 0's worker does the compute) ───────
+        # No drain — pre_rms_col0 kernel writes normed into the bq_l3l2
+        # fifo producer slot (broadcast via MemTile) AND into a static L1
+        # buffer (consumed by col 0's own QKV phases). Synchronization to
+        # subsequent Q/K/V phases happens implicitly via bq_mem.cons() on
+        # cols 1-7's bodies — they block until col 0 publishes.
         tg_rms = rt.task_group()
-        rt.fill (rms_in_fifo.prod(),  act,   x_tap,       task_group=tg_rms)
-        rt.fill (rms_in_fifo.prod(),  w_qkv, w_norm1_tap, task_group=tg_rms)
-        rt.drain(rms_out_fifo.cons(), act,   normed_tap,  task_group=tg_rms,
-                 wait=True)
+        rt.fill(rms_in_fifo.prod(), act,   x_tap,       task_group=tg_rms)
+        rt.fill(rms_in_fifo.prod(), w_qkv, w_norm1_tap, task_group=tg_rms)
         rt.finish_task_group(tg_rms)
 
         # ── Phase 2: Q GEMV ─────────────────────────────────────────────────
+        # Unified qkv body: A=Aq, B=normed broadcast (produced by col 0),
+        # C drained to BO4 q_rot region. No host-side bq fill — col 0
+        # produces it inline.
         # Unified qkv_worker first phase: A = Aq, B = normed broadcast,
         # C drained to BO4 q_rot region.
         tg_q = rt.task_group()
         for i in range(cols):
             rt.fill(Aqkv_fifos[i].prod(), w_qkv, Aq_taps[i], task_group=tg_q)
-        rt.fill(bq_l3l2_fifo.prod(), act, bq_tap, task_group=tg_q)
+        # No bq_l3l2 fill — col 0's body produces it from pre_rms_col0 output.
         for i in range(cols):
             rt.drain(Cqkv_fifos[i].cons(), act, Cq_taps[i],
                      task_group=tg_q, wait=True)
         rt.finish_task_group(tg_q)
 
         # ── Phase 3: K GEMV ─────────────────────────────────────────────────
-        # Same unified worker, second phase: A = Ak, B = normed (re-filled),
-        # C drained to BO4 k_rot region.
+        # Same unified worker, second phase: A = Ak, B reused from col-0's
+        # static buffer (col 0) or held bq_mem acquire (cols 1-7), C drained
+        # to BO4 k_rot region.
         tg_k = rt.task_group()
         for i in range(cols):
             rt.fill(Aqkv_fifos[i].prod(), w_qkv, Ak_taps[i], task_group=tg_k)
-        rt.fill(bq_l3l2_fifo.prod(), act, bq_tap, task_group=tg_k)
         for i in range(cols):
             rt.drain(Cqkv_fifos[i].cons(), act, Ck_taps[i],
                      task_group=tg_k, wait=True)
         rt.finish_task_group(tg_k)
 
         # ── Phase 4: V GEMV ─────────────────────────────────────────────────
-        # Third phase of unified worker: A = Av, B = normed (re-filled),
-        # C drained to BO4 v region.
+        # Third phase of unified worker: A = Av, B reused, C drained to
+        # BO4 v region.
         tg_v = rt.task_group()
         for i in range(cols):
             rt.fill(Aqkv_fifos[i].prod(), w_qkv, Av_taps[i], task_group=tg_v)
-        rt.fill(bq_l3l2_fifo.prod(), act, bq_tap, task_group=tg_v)
         for i in range(cols):
             rt.drain(Cqkv_fifos[i].cons(), act, Cv_taps[i],
                      task_group=tg_v, wait=True)
