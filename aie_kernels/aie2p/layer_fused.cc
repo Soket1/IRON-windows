@@ -507,3 +507,41 @@ extern "C" void attn_compute_chunk_bf16(bfloat16 *__restrict kv_chunk,
         ctx_out[i] = (bfloat16)0.0f;
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Step-2 spike: real q_head from a dedicated input fifo.
+//
+// One call = one head's full attention on one KV chunk. The worker body
+// drives the per-head loop (4 calls per outer iter for 4 q_heads/col).
+// Real q_rot data flows in via the q_head pointer; the kv_chunk is still
+// re-used as both K and V (we wire per-K and per-V chunk fifos in the
+// next step once chunk streaming is in place).
+// ────────────────────────────────────────────────────────────────────────────
+
+extern "C" void attn_compute_with_qhead_bf16(
+        bfloat16 *__restrict q_head,
+        bfloat16 *__restrict kv_chunk,
+        bfloat16 *__restrict ctx_out,
+        int32_t n) {
+    constexpr int32_t kScaleBitsInvSqrt64 = 0x3E00;
+
+    // Q · K^T scores (uses the supplied q_head, not a dummy seed).
+    attn_qk_score_chunk_bf16(q_head, kv_chunk,
+                             attn_scores_static, kScaleBitsInvSqrt64);
+
+    // In-place softmax.
+    attn_softmax_inplace_bf16(attn_scores_static, ATTN_K_CHUNK);
+
+    // Scores · V_chunk (kv_chunk treated as V for the spike).
+    attn_av_ctx_chunk_bf16(attn_scores_static, kv_chunk,
+                           attn_ctx_head_static, /*zero_first=*/1);
+
+    // Drain: ctx_head into the leading HEAD_DIM bf16 of the chunk-shaped
+    // output (kv_chunk_elems = K_CHUNK*HEAD_DIM = 2048). Zero the tail.
+    for (int i = 0; i < HEAD_DIM; i++) {
+        ctx_out[i] = attn_ctx_head_static[i];
+    }
+    for (int i = HEAD_DIM; i < n; i++) {
+        ctx_out[i] = (bfloat16)0.0f;
+    }
+}

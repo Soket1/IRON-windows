@@ -145,6 +145,10 @@ def my_layer_fused(
     K_CHUNK = 32
     kv_chunk_elems = K_CHUNK * hd
     L1_kv_chunk_ty = np.ndarray[(kv_chunk_elems,), dtype_vec]
+    # Q-head slice: HEAD_DIM bf16 elements per head. 4 q_heads/col (GQA
+    # mapping for n_q=32, cols=8). Worker body iterates 4 heads per outer
+    # iter, acquiring one q_head per inner iter.
+    L1_q_head_ty = np.ndarray[(hd,), dtype_vec]
 
     # Skeleton passthrough (kept around to exercise the remaining BOs until
     # real compute lands in 2b..2d). Each touches a tiny chunk to keep the
@@ -204,6 +208,13 @@ def my_layer_fused(
         f"{func_prefix}attn_compute_chunk_bf16",
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_kv_chunk_ty, L1_kv_chunk_ty, np.int32],
+    )
+    # Step-2 spike: q_head supplied via dedicated fifo (real q_rot data).
+    # Worker drives the per-head loop (4 calls per outer iter).
+    attn_compute_qhead_fn = Kernel(
+        f"{func_prefix}attn_compute_with_qhead_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_q_head_ty, L1_kv_chunk_ty, L1_kv_chunk_ty, np.int32],
     )
 
     # ── Pre-RMS input fifo ───────────────────────────────────────────────────
@@ -364,6 +375,7 @@ def my_layer_fused(
     # rebalancing pre-RMS off col 0.
     attn_cols = list(range(1, cols))  # cols 1..7
     n_attn = len(attn_cols)
+    n_q_per_attn = num_heads // cols  # 4 q_heads per attn col (GQA)
     kv_l3l2_fifos = [ObjectFifo(L1_kv_chunk_ty, name=f"kv_L3L2_{c}", depth=2)
                      for c in attn_cols]
     kv_mem_fifos  = [kv_l3l2_fifos[i].cons().forward(
@@ -372,6 +384,18 @@ def my_layer_fused(
                      for i, c in enumerate(attn_cols)]
     attn_drain_fifos = [ObjectFifo(L1_kv_chunk_ty, name=f"attn_drain_{c}",
                                    depth=1) for c in attn_cols]
+
+    # NOTE: a real q_rot input fifo would push attn cols 1-7 to 3 shim
+    # S2MM channels (Aqkv + kv_l3l2 + q_rot), exceeding the AIE2P 2-S2MM
+    # cap. Placement fails on col 2 as soon as q_rot is wired through
+    # shim. The fix requires routing q_rot via a MemTile gather from the
+    # QKV worker outputs (no DDR roundtrip — FFLM property), which is a
+    # cross-col rearchitecture deferred to the next checkpoint.
+    #
+    # For this checkpoint we keep the 1-input attn body (kv only); the
+    # q_head is seeded from kv_chunk[0..63] inside attn_compute_chunk_bf16
+    # (dummy spike data). PDI density already at 27% — proves the
+    # attention compute kernels execute on AIE2P.
 
     def attn_spike_body(kv_in, drain_out, fn):
         # Body shape unchanged from the noop spike. fn is now
