@@ -19,7 +19,10 @@ class FusedMLIROperator(AIEOperatorBase):
     """Operator that fuses multiple MLIROperators into one."""
 
     def __init__(
-        self, name, runlist, input_args, output_args, buffer_sizes=None, *args, **kwargs
+        self, name, runlist, input_args, output_args, buffer_sizes=None,
+        legacy_xclbin=False, xclbin_kernel_name="MLIR_AIE",
+        xclbin_instance_name=None, xclbin_kernel_id=None,
+        *args, **kwargs
     ):
         if not all(
             isinstance(op, MLIROperator) and all(isinstance(buf, str) for buf in bufs)
@@ -37,6 +40,10 @@ class FusedMLIROperator(AIEOperatorBase):
         self.explicit_buffer_sizes = (
             buffer_sizes or {}
         )  # Optional dict: buffer_name -> size_in_bytes
+        self.legacy_xclbin = legacy_xclbin
+        self.xclbin_kernel_name = xclbin_kernel_name
+        self.xclbin_instance_name = xclbin_instance_name
+        self.xclbin_kernel_id = xclbin_kernel_id
 
     def get_kernel_artifacts(self):
         """Collect all kernel artifacts from child operators.
@@ -206,7 +213,8 @@ class FusedMLIROperator(AIEOperatorBase):
         """Set up the artifact dependency graph for this fused operator.
 
         Computes the buffer layout first, then builds the fused MLIR artifact
-        and full-ELF artifact and registers them via ``add_artifacts()``.
+        and either a FullElfArtifact (default) or a XclbinArtifact +
+        InstsBinArtifact pair (legacy mode, opt-in via legacy_xclbin=True).
         """
         # Calculate buffer layout before building mlir artifact (used by get_mlir_artifact)
         self.subbuffer_layout, self.buffer_sizes, self.slice_info = (
@@ -215,12 +223,34 @@ class FusedMLIROperator(AIEOperatorBase):
         operator_name = self.name
         mlir_artifact = self.get_mlir_artifact()
         kernel_objects = self.get_kernel_artifacts()
-        full_elf_artifact = comp.FullElfArtifact(
-            f"{operator_name}.elf",
-            mlir_input=mlir_artifact,
-            dependencies=[mlir_artifact] + kernel_objects,
-        )
-        self.add_artifacts([full_elf_artifact])
+        if self.legacy_xclbin:
+            extra_flags = []
+            if self.xclbin_instance_name is not None:
+                extra_flags.append(f"--xclbin-instance-name={self.xclbin_instance_name}")
+            if self.xclbin_kernel_id is not None:
+                extra_flags.append(f"--xclbin-kernel-id={self.xclbin_kernel_id}")
+            xclbin_artifact = comp.XclbinArtifact(
+                f"{operator_name}.xclbin",
+                mlir_input=mlir_artifact,
+                dependencies=[mlir_artifact] + kernel_objects,
+                kernel_name=self.xclbin_kernel_name,
+                extra_flags=extra_flags,
+            )
+            insts_artifact = comp.InstsBinArtifact(
+                f"{operator_name}.insts",
+                mlir_input=mlir_artifact,
+                dependencies=[mlir_artifact] + kernel_objects,
+            )
+            self.xclbin_artifact = xclbin_artifact
+            self.insts_artifact = insts_artifact
+            self.add_artifacts([xclbin_artifact, insts_artifact])
+        else:
+            full_elf_artifact = comp.FullElfArtifact(
+                f"{operator_name}.elf",
+                mlir_input=mlir_artifact,
+                dependencies=[mlir_artifact] + kernel_objects,
+            )
+            self.add_artifacts([full_elf_artifact])
 
     def get_arg_spec(self):
         raise NotImplementedError(
