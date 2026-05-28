@@ -26,7 +26,7 @@ from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1, NPU2
+from aie.iron.device import NPU1, NPU2, Tile
 
 
 def my_layer_fused(
@@ -62,7 +62,7 @@ def my_layer_fused(
     # ── Bundle byte sizes (must mirror op_mlir.py:_bundle_byte_sizes) ────────
     norm_bytes = e * 2  # bf16 gain weights size
 
-    m_input_qkv = 1
+    m_input_qkv = 2  # AIE2P shim DMA cap: drain len must be ≥ 4 bytes
     packed_q   = m_input_qkv * e // 2 + m_input_qkv * groups_e * 2
     total_q    = cols * (e // cols) * packed_q
     total_kv_one = cols * (kv_e // cols) * packed_q
@@ -95,8 +95,11 @@ def my_layer_fused(
         assert b % 2 == 0
 
     # ── BO offset table (in bf16-element units, since L3 type is bf16) ───────
-    # BO0: W_norm1 lives at offset 0, then Q, K, V weights follow.
+    # BO0: W_norm1 [E elems] | W_q [total_q bytes / 2] | W_k [...] | W_v [...]
     bo0_off_W_norm1 = 0
+    bo0_off_W_q     = bo0_off_W_norm1 + e
+    bo0_off_W_k     = bo0_off_W_q     + total_q // 2
+    bo0_off_W_v     = bo0_off_W_k     + total_kv_one // 2
     # BO2: W_norm2 at offset 0, then gate, up, down.
     bo2_off_W_norm2 = 0
     # BO4 layout (bf16 elements):
@@ -128,6 +131,13 @@ def my_layer_fused(
     # normed.
     L1_E_ty = np.ndarray[(e,), dtype_vec]
 
+    # Q GEMV: weight tile (packed INT4 + scales) per outer iter; activation
+    # is full E bf16 (broadcast); output is m_input_qkv bf16 slice per tile.
+    packed_qkv_tile_bytes = m_input_qkv * e // 2 + m_input_qkv * groups_e * 2
+    L1_Aq_ty = np.ndarray[(packed_qkv_tile_bytes,), dtype_packed]
+    L1_Bq_ty = np.ndarray[(e,), dtype_vec]
+    L1_Cq_ty = np.ndarray[(m_input_qkv,), dtype_vec]
+
     # Skeleton passthrough (kept around to exercise the remaining BOs until
     # real compute lands in 2b..2d). Each touches a tiny chunk to keep the
     # tile-utilisation footprint nonzero.
@@ -139,6 +149,11 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_rms_norm_bf16",
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_E_ty, L1_E_ty, L1_E_ty, np.int32],
+    )
+    qkv_gemv_fn = Kernel(
+        f"{func_prefix}layer_fused_qkv_gemv_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.int32, np.int32, L1_Aq_ty, L1_Bq_ty, L1_Cq_ty],
     )
     noop_fn = Kernel(
         f"{func_prefix}layer_fused_noop_bf16",
@@ -169,12 +184,43 @@ def my_layer_fused(
         [rms_in_fifo.cons(), rms_out_fifo.prod(), rms_norm_fn],
     )
 
+    # ── Q GEMV (8 cols, output dim = E = embed_dim) ──────────────────────────
+    # Per-col weight stream: each col owns rows_per_col_q output rows.
+    rows_per_col_q  = e // cols
+    tiles_per_col_q = rows_per_col_q // m_input_qkv
+    bytes_col_q     = tiles_per_col_q * packed_qkv_tile_bytes
+    assert tiles_per_col_q <= 1023, f"tiles_per_col_q={tiles_per_col_q} exceeds DMA cap"
+
+    # Q activation is normed (E bf16) broadcast to all cols via MemTile —
+    # mirrors post_attn_fused.design.py:192-194 kqv broadcast pattern.
+    Aq_fifos = [ObjectFifo(L1_Aq_ty, name=f"Aq_{i}", depth=2) for i in range(cols)]
+    bq_l3l2_fifo = ObjectFifo(L1_Bq_ty, name="bq_L3L2", depth=1)
+    bq_mem_fifo  = bq_l3l2_fifo.cons().forward(
+        name="bq_mem", depth=1, placement=Tile(col=0, row=1))
+    Cq_fifos = [ObjectFifo(L1_Cq_ty, name=f"Cq_{i}", depth=2) for i in range(cols)]
+
+    def q_gemv_body(Aq, Bq, Cq, fn):
+        for _ in range_(0xFFFFFFFF):
+            b = Bq.acquire(1)
+            for _ in range_(tiles_per_col_q):
+                a = Aq.acquire(1)
+                c = Cq.acquire(1)
+                fn(m_input_qkv, 0, a, b, c)
+                Aq.release(1)
+                Cq.release(1)
+            Bq.release(1)
+
+    q_workers = [
+        Worker(q_gemv_body,
+               [Aq_fifos[i].cons(), bq_mem_fifo.cons(),
+                Cq_fifos[i].prod(), qkv_gemv_fn])
+        for i in range(cols)
+    ]
+
     # ── Skeleton passthrough fifos (BOs not yet wired into real compute) ─────
-    # We only need passthroughs for BO1 (w_o) and BO3 (kv_pair) now — BO0/BO2
-    # are touched by pre-RMS already (W_norm1 in BO0 prefix, W_norm2 in BO2
-    # prefix), and BO4 is touched by both rms_in (x) and rms_out (normed).
-    skel_in  = [ObjectFifo(L1_chunk, name=f"skel_in_{i}",  depth=2) for i in range(2)]
-    skel_out = [ObjectFifo(L1_chunk, name=f"skel_out_{i}", depth=2) for i in range(2)]
+    # BO1 (w_o), BO2 (w_ffn), BO3 (kv_pair) — keep DDR_PATCH ops alive.
+    skel_in  = [ObjectFifo(L1_chunk, name=f"skel_in_{i}",  depth=2) for i in range(3)]
+    skel_out = [ObjectFifo(L1_chunk, name=f"skel_out_{i}", depth=2) for i in range(3)]
 
     def passthrough_body(in_fifo, out_fifo, fn):
         for _ in range_(0xFFFFFFFF):
@@ -186,7 +232,7 @@ def my_layer_fused(
 
     skel_workers = [
         Worker(passthrough_body, [skel_in[i].cons(), skel_out[i].prod(), noop_fn])
-        for i in range(2)
+        for i in range(3)
     ]
 
     # ── TensorAccessPatterns ─────────────────────────────────────────────────
@@ -220,7 +266,18 @@ def my_layer_fused(
             strides=[0, 0, 0, 1],
         )
 
+    # Skeleton chunk TAPs for the still-unwired BOs (BO1 w_o, BO2 w_ffn,
+    # BO3 kv_pair).
+    def chunk_tap(total_elems):
+        return TensorAccessPattern(
+            tensor_dims=(1, total_elems),
+            offset=0,
+            sizes=[1, 1, 1, chunk_elems],
+            strides=[0, 0, 0, 1],
+        )
+
     tap_o    = chunk_tap(bo1_bytes // 2)
+    tap_ffn  = chunk_tap(bo2_bytes // 2)
     tap_kv   = chunk_tap(bo3_bytes // 2)
     # Skeleton drains write back into BO4 outL slot (won't be read by any
     # real consumer at this stage).
@@ -231,22 +288,76 @@ def my_layer_fused(
         strides=[0, 0, 0, 1],
     )
 
+    # ── Q GEMV TAPs ──────────────────────────────────────────────────────────
+    # Each col reads its bytes_col_q slice of W_q from BO0 (declared as
+    # bf16-element halved-shape, so byte offset = element offset × 2).
+    # bytes_col_q is in BYTES; the L3 type is bf16 elements; offsets and
+    # sizes inside the TAP are in *element* units (the design's L3 ndarray
+    # type was declared bf16 — the BD generator multiplies by itemsize for
+    # the actual byte count).
+    # post_attn_fused.design.py:330 also uses sizes=[1,1,1,N] linear chunk
+    # to avoid the partial-merge bug; we follow.
+    Aq_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo0_bytes // 2),
+            offset=bo0_off_W_q + i * (bytes_col_q // 2),
+            sizes=[1, 1, 1, bytes_col_q // 2],
+            strides=[0, 0, 0, 1],
+        )
+        for i in range(cols)
+    ]
+    # Bq is normed (E bf16) in BO4 — broadcast via MemTile.
+    bq_tap = TensorAccessPattern(
+        tensor_dims=(1, bo4_elems),
+        offset=bo4_off_normed,
+        sizes=[1, 1, 1, e],
+        strides=[0, 0, 0, 1],
+    )
+    # Cq drains: each col writes rows_per_col_q bf16 elements into BO4
+    # q_rot region (will be RoPE'd in stage 2d).
+    Cq_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo4_elems),
+            offset=bo4_off_q_rot + i * rows_per_col_q,
+            sizes=[1, 1, tiles_per_col_q, rows_per_col_q // tiles_per_col_q],
+            strides=[0, 0, rows_per_col_q // tiles_per_col_q, 1],
+        )
+        for i in range(cols)
+    ]
+
     rt = Runtime()
     with rt.sequence(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
-        rt.start(pre_rms_worker, *skel_workers)
-        tg = rt.task_group()
-        # Pre-RMS phase
-        rt.fill(rms_in_fifo.prod(),  act,   x_tap,       task_group=tg)
-        rt.fill(rms_in_fifo.prod(),  w_qkv, w_norm1_tap, task_group=tg)
-        rt.drain(rms_out_fifo.cons(), act,  normed_tap,  task_group=tg)
-        # Skeleton (BO1 w_o + BO3 kv_pair touch — keeps DDR_PATCH ops alive)
-        rt.fill (skel_in [0].prod(), w_o, tap_o,         task_group=tg)
-        rt.fill (skel_in [1].prod(), kv,  tap_kv,        task_group=tg)
-        rt.drain(skel_out[0].cons(), act, skel_drain_tap, task_group=tg)
-        rt.drain(skel_out[1].cons(), act, skel_drain_tap, task_group=tg, wait=True)
-        rt.finish_task_group(tg)
+        rt.start(pre_rms_worker, *q_workers, *skel_workers)
+        # ── Phase 1: pre-RMS ────────────────────────────────────────────────
+        tg_rms = rt.task_group()
+        rt.fill (rms_in_fifo.prod(),  act,   x_tap,       task_group=tg_rms)
+        rt.fill (rms_in_fifo.prod(),  w_qkv, w_norm1_tap, task_group=tg_rms)
+        rt.drain(rms_out_fifo.cons(), act,   normed_tap,  task_group=tg_rms,
+                 wait=True)
+        rt.finish_task_group(tg_rms)
+
+        # ── Phase 2: Q GEMV ─────────────────────────────────────────────────
+        tg_q = rt.task_group()
+        for i in range(cols):
+            rt.fill(Aq_fifos[i].prod(), w_qkv, Aq_taps[i], task_group=tg_q)
+        rt.fill(bq_l3l2_fifo.prod(), act, bq_tap, task_group=tg_q)
+        for i in range(cols):
+            rt.drain(Cq_fifos[i].cons(), act, Cq_taps[i],
+                     task_group=tg_q, wait=True)
+        rt.finish_task_group(tg_q)
+
+        # ── Skeleton chunk fills/drains (BO1, BO2, BO3 placeholders) ────────
+        tg_skel = rt.task_group()
+        rt.fill (skel_in [0].prod(), w_o,   tap_o,         task_group=tg_skel)
+        rt.fill (skel_in [1].prod(), w_ffn, tap_ffn,       task_group=tg_skel)
+        rt.fill (skel_in [2].prod(), kv,    tap_kv,        task_group=tg_skel)
+        rt.drain(skel_out[0].cons(), act,   skel_drain_tap, task_group=tg_skel)
+        rt.drain(skel_out[1].cons(), act,   skel_drain_tap, task_group=tg_skel)
+        rt.drain(skel_out[2].cons(), act,   skel_drain_tap, task_group=tg_skel,
+                 wait=True)
+        rt.finish_task_group(tg_skel)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 

@@ -160,7 +160,10 @@ class LayerFusedMLIR(MLIROperator):
         # Per-weight packed-tile byte budgets (mirror post_attn_fused
         # design.py:65-86 layout: m_input rows of E packed INT4 nibbles
         # plus m_input scales per group_size group, two bytes each).
-        m_input_qkv = 1
+        # m_input_qkv=2 because the AIE2P shim DMA requires transfer
+        # lengths that are multiples of 4 bytes — m_input=1 gives a
+        # 2-byte output drain (1 bf16) which fails resource allocation.
+        m_input_qkv = 2
         packed_q = m_input_qkv * e // 2 + m_input_qkv * groups_e * 2
         total_q = c * (e // c) * packed_q
         # K/V output dims are kv_e (= n_kv * head_dim), not e
