@@ -39,6 +39,8 @@ fused = FusedMLIROperator(
     output_args=["io_bundle"],
     legacy_xclbin=True,
     xclbin_kernel_name="MLIR_AIE",
+    xclbin_instance_name="MLIRAIE",
+    xclbin_kernel_id="0x901",
     context=ctx,
 )
 

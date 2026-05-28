@@ -225,6 +225,32 @@ class FusedMLIROperator(AIEOperatorBase):
         kernel_objects = self.get_kernel_artifacts()
         if self.legacy_xclbin:
             extra_flags = []
+            # FusedMLIROperator emits a multi-device MLIR: one device per
+            # child operator (named `op{idx}_{ClassName}`) plus a
+            # top-level `main` dispatcher device. aiecc, given the whole
+            # MLIR, would emit one xclbin per device — and since they all
+            # share `--xclbin-name`, the later one overwrites the earlier.
+            # Filter to a single cores-device via `--device-name`. The
+            # main dispatcher is not needed because consumers of the
+            # legacy xclbin handle dispatch through their own runtime
+            # (DDR_PATCH on the insts.bin), not via aiex.configure.
+            # Single-op fusions: target the only `op0_*` device.
+            # Multi-op fusions are not yet supported in legacy mode (TODO:
+            # split per-cores-device into chained xclbins via
+            # `--xclbin-input`, as in `swiglu_decode/op.py`).
+            unique_ops = []
+            seen = set()
+            for op, *_ in self.runlist:
+                if id(op) not in seen:
+                    seen.add(id(op))
+                    unique_ops.append(op)
+            if len(unique_ops) > 1:
+                raise NotImplementedError(
+                    "legacy_xclbin mode currently supports single-operator fusions only; "
+                    f"got {len(unique_ops)} unique operators in runlist"
+                )
+            cores_device_name = f"op0_{unique_ops[0].__class__.__name__}"
+            extra_flags.append(f"--device-name={cores_device_name}")
             if self.xclbin_instance_name is not None:
                 extra_flags.append(f"--xclbin-instance-name={self.xclbin_instance_name}")
             if self.xclbin_kernel_id is not None:
@@ -236,10 +262,14 @@ class FusedMLIROperator(AIEOperatorBase):
                 kernel_name=self.xclbin_kernel_name,
                 extra_flags=extra_flags,
             )
+            # The insts also need --device-name so aiecc generates the
+            # cores-device's runtime sequence (which has the BD/DDR_PATCH
+            # ops the consumer needs), not the dispatcher's.
             insts_artifact = comp.InstsBinArtifact(
                 f"{operator_name}.insts",
                 mlir_input=mlir_artifact,
                 dependencies=[mlir_artifact] + kernel_objects,
+                extra_flags=[f"--device-name={cores_device_name}"],
             )
             self.xclbin_artifact = xclbin_artifact
             self.insts_artifact = insts_artifact
