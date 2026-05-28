@@ -145,6 +145,15 @@ def my_layer_fused(
     K_CHUNK = 32
     kv_chunk_elems = K_CHUNK * hd
     L1_kv_chunk_ty = np.ndarray[(kv_chunk_elems,), dtype_vec]
+    # Sub-chunk type for MemTile gather: split each kv_chunk into
+    # ATTN_SUBCHUNKS_PER_CHUNK sub-transfers under the AIE2P shim BD
+    # inner-dim cap (1023). 2048 / 4 = 512 elements per sub-chunk.
+    ATTN_SUBCHUNKS_PER_CHUNK = 4
+    SUBCHUNK_ELEMS = kv_chunk_elems // ATTN_SUBCHUNKS_PER_CHUNK
+    assert SUBCHUNK_ELEMS <= 1023, (
+        f"sub-chunk {SUBCHUNK_ELEMS} must fit shim BD inner-dim cap"
+    )
+    L1_kv_subchunk_ty = np.ndarray[(SUBCHUNK_ELEMS,), dtype_vec]
     # Q-head slice: HEAD_DIM bf16 elements per head. 4 q_heads/col (GQA
     # mapping for n_q=32, cols=8). Worker body iterates 4 heads per outer
     # iter, acquiring one q_head per inner iter.
@@ -247,6 +256,22 @@ def my_layer_fused(
         f"{func_prefix}attn_compute_4heads_bf16",
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_kv_chunk_ty, L1_kv_chunk_ty, np.int32],
+    )
+    # Step-5 spike: MemTile sub-chunk gather. Shim sends sub-chunks
+    # (≤1023 elem each) → MemTile relays into compute tile L1. Compute
+    # tile body acquires N_SUBCHUNKS subs (loaded into static via
+    # attn_subchunk_load_bf16), then runs the full 4-head attention
+    # (attn_compute_from_static_bf16). Same shape per kernel — kernel
+    # arg type is the SUB type, not the full chunk.
+    attn_subchunk_load_fn = Kernel(
+        f"{func_prefix}attn_subchunk_load_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_subchunk_ty, np.int32, np.int32],
+    )
+    attn_compute_from_static_fn = Kernel(
+        f"{func_prefix}attn_compute_from_static_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_chunk_ty, np.int32],
     )
 
     # ── Pre-RMS input fifo ───────────────────────────────────────────────────
@@ -408,43 +433,45 @@ def my_layer_fused(
     attn_cols = list(range(1, cols))  # cols 1..7
     n_attn = len(attn_cols)
     n_q_per_attn = num_heads // cols  # 4 q_heads per attn col (GQA)
-    kv_l3l2_fifos = [ObjectFifo(L1_kv_chunk_ty, name=f"kv_L3L2_{c}", depth=2)
+    # MemTile gather pattern: shim → kv_l3l2 (sub-chunk type) → MemTile
+    # forwards N_SUBCHUNKS sub-objects to compute tile (kv_mem). Each
+    # sub-chunk fits the shim BD inner-dim cap (≤1023 elem). compute
+    # tile body acquires N_SUBCHUNKS sub-acquires per kv_chunk.
+    kv_l3l2_fifos = [ObjectFifo(L1_kv_subchunk_ty, name=f"kv_L3L2_{c}",
+                                depth=ATTN_SUBCHUNKS_PER_CHUNK)
                      for c in attn_cols]
     kv_mem_fifos  = [kv_l3l2_fifos[i].cons().forward(
-                        name=f"kv_mem_{c}", depth=2,
+                        name=f"kv_mem_{c}",
+                        depth=ATTN_SUBCHUNKS_PER_CHUNK,
                         placement=Tile(col=c, row=1))
                      for i, c in enumerate(attn_cols)]
     attn_drain_fifos = [ObjectFifo(L1_kv_chunk_ty, name=f"attn_drain_{c}",
                                    depth=1) for c in attn_cols]
 
-    # NOTE: streaming attention over multiple chunks (the next step
-    # toward FFLM's ct_chunk_size=32 design) hits a shim BD inner-dim
-    # cap of 1023. kv_chunk_elems=2048 lands one transfer at a time
-    # only because mlir-aie auto-splits the innermost dim when outer
-    # dims are size-1. As soon as we add an outer dim (multiple chunks
-    # per body iter), the auto-splitter doesn't fire and aiecc errors
-    # with "Size 0 exceeds [0:1023]". Same blocker as the q_rot input
-    # fifo: requires MemTile gather to relay sub-1024 transfers.
-    # `attn_qk_score_at_bf16`, `attn_softmax_full_bf16`,
-    # `attn_av_ctx_at_bf16`, `attn_drain_ctx_bf16` left in the .cc
-    # ready to wire once the gather pattern lands.
+    # NOTE: a real q_rot input fifo would push attn cols 1-7 to 3 shim
+    # S2MM channels (Aqkv + kv_l3l2 + q_rot), exceeding the AIE2P 2-S2MM
+    # cap. The MemTile gather here only solves the inner-dim cap; the
+    # q_rot blocker still needs a Cqkv→MemTile→attn cross-col reroute
+    # (separate step).
 
-    def attn_spike_body(kv_in, drain_out, fn):
-        # Body shape unchanged from the noop spike. fn is now
-        # attn_compute_4heads_bf16, which runs 4 q-heads sequentially
-        # through qk_score → softmax → av_ctx in a single kernel
-        # invocation per body iter (per-tile L1 static scratch).
+    def attn_gather_body(kv_in, drain_out, load_fn, compute_fn):
+        # MemTile gather: per outer iter, acquire N sub-chunks (each
+        # SUBCHUNK_ELEMS bf16) and stitch them into the static
+        # attn_kv_full_static via load_fn. Then drain a full ctx via
+        # compute_from_static_fn.
         for _ in range_(0xFFFFFFFF):
-            i = kv_in.acquire(1)
+            for k in range(ATTN_SUBCHUNKS_PER_CHUNK):
+                sub = kv_in.acquire(1)
+                load_fn(sub, k, SUBCHUNK_ELEMS)
+                kv_in.release(1)
             o = drain_out.acquire(1)
-            fn(i, o, kv_chunk_elems)
-            kv_in.release(1)
+            compute_fn(o, kv_chunk_elems)
             drain_out.release(1)
 
     attn_workers = [
-        Worker(attn_spike_body,
+        Worker(attn_gather_body,
                [kv_mem_fifos[i].cons(), attn_drain_fifos[i].prod(),
-                attn_compute_4heads_fn])
+                attn_subchunk_load_fn, attn_compute_from_static_fn])
         for i in range(n_attn)
     ]
 
@@ -493,16 +520,17 @@ def my_layer_fused(
         strides=[0, 0, 0, 1],
     )
 
-    # Attention spike (single-chunk): per-col read of 1 chunk (32 tokens
-    # × HEAD_DIM bf16) from BO3 K_cache region. Col c reads its kv_head
-    # c slice (offset c * MAX * HEAD_DIM in bf16 element units within
-    # BO3). Cols 1..7 only.
+    # Attention spike (MemTile gather): per-col TAP sweeps
+    # ATTN_SUBCHUNKS_PER_CHUNK contiguous sub-chunks (each
+    # SUBCHUNK_ELEMS=512 bf16 ≤ shim cap 1023) starting at the col's
+    # kv_head offset. Net transfer = kv_chunk_elems = 2048 bf16, one
+    # full chunk per dispatch. Outer dim N_SUB feeds the MemTile fan-out.
     attn_kv_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo3_bytes // 2),
             offset=c * (mx * hd),
-            sizes=[1, 1, 1, kv_chunk_elems],
-            strides=[0, 0, 0, 1],
+            sizes=[1, 1, ATTN_SUBCHUNKS_PER_CHUNK, SUBCHUNK_ELEMS],
+            strides=[0, 0, SUBCHUNK_ELEMS, 1],
         )
         for c in attn_cols
     ]

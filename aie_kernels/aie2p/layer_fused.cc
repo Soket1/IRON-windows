@@ -731,3 +731,62 @@ extern "C" void attn_compute_4heads_bf16(bfloat16 *__restrict kv_chunk,
         ctx_out[i] = (bfloat16)0.0f;
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Step-5 spike: MemTile sub-chunk gather.
+//
+// shim → MemTile relays the kv_chunk in N=4 sub-chunks of 512 bf16 each
+// (sub-chunks fit under the AIE2P shim BD inner-dim cap of 1023). The
+// compute tile reassembles them in L1 static via attn_subchunk_load_bf16,
+// then runs the full 4-head attention via attn_compute_from_static_bf16.
+// Same per-chunk math; just lifts the shim 2048-elem inner-dim blocker.
+// ────────────────────────────────────────────────────────────────────────────
+
+#ifndef ATTN_SUBCHUNK_ELEMS
+#define ATTN_SUBCHUNK_ELEMS 512
+#endif
+
+#ifndef ATTN_SUBCHUNKS_PER_CHUNK
+#define ATTN_SUBCHUNKS_PER_CHUNK 4
+#endif
+
+static_assert(ATTN_SUBCHUNK_ELEMS * ATTN_SUBCHUNKS_PER_CHUNK ==
+                  ATTN_K_CHUNK * HEAD_DIM,
+              "sub-chunk × sub-chunks must equal full kv_chunk_elems");
+
+static bfloat16 attn_kv_full_static[ATTN_K_CHUNK * HEAD_DIM]
+    __attribute__((aligned(64)));
+
+extern "C" void attn_subchunk_load_bf16(bfloat16 *__restrict sub,
+                                        int32_t sub_idx,
+                                        int32_t n) {
+    (void)n;
+    bfloat16 *dst = attn_kv_full_static + sub_idx * ATTN_SUBCHUNK_ELEMS;
+    for (int i = 0; i < ATTN_SUBCHUNK_ELEMS; i++) {
+        dst[i] = sub[i];
+    }
+}
+
+extern "C" void attn_compute_from_static_bf16(bfloat16 *__restrict ctx_out,
+                                              int32_t n) {
+    constexpr int32_t kScaleBitsInvSqrt64 = 0x3E00;
+    bfloat16 *kv = attn_kv_full_static;
+
+    for (int i = 0; i < ATTN_HEADS_PER_TILE * HEAD_DIM; i++) {
+        attn_q_heads4_static[i] = kv[i];
+    }
+    for (int h = 0; h < ATTN_HEADS_PER_TILE; h++) {
+        bfloat16 *q_h    = attn_q_heads4_static + h * HEAD_DIM;
+        bfloat16 *scores = attn_scores4_static  + h * ATTN_K_CHUNK;
+        bfloat16 *ctx_h  = attn_ctx4_static     + h * HEAD_DIM;
+        attn_qk_score_chunk_bf16(q_h, kv, scores, kScaleBitsInvSqrt64);
+        attn_softmax_inplace_bf16(scores, ATTN_K_CHUNK);
+        attn_av_ctx_chunk_bf16(scores, kv, ctx_h, /*zero_first=*/1);
+    }
+    for (int i = 0; i < ATTN_HEADS_PER_TILE * HEAD_DIM; i++) {
+        ctx_out[i] = attn_ctx4_static[i];
+    }
+    for (int i = ATTN_HEADS_PER_TILE * HEAD_DIM; i < n; i++) {
+        ctx_out[i] = (bfloat16)0.0f;
+    }
+}
