@@ -53,6 +53,19 @@ void layer_fused_noop_bf16(bfloat16 *__restrict__ in,
     }
 }
 
+// Thin alias used by the attention-spike worker, which binds a Kernel
+// with the larger kv_chunk L1 type. IRON Kernel objects are looked up
+// by C symbol, so a same-symbol second binding fails verification with
+// "redefinition of symbol named ...". This separate symbol resolves
+// the collision while keeping the implementation identical.
+void layer_fused_noop_kv_bf16(bfloat16 *__restrict__ in,
+                              bfloat16 *__restrict__ out,
+                              int32_t n) {
+    for (int32_t i = 0; i < n; ++i) {
+        out[i] = in[i];
+    }
+}
+
 // Weighted RMSNorm: output[i] = (input[i] / rms(input)) * gain[i]
 // epsilon = 1e-5 (matches existing rms_norm.cc + post_attn_rms_norm_bf16)
 // Used by both pre-RMS (W_norm1) and post-RMS (W_norm2) stages.

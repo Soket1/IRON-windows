@@ -186,6 +186,16 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_chunk, L1_chunk, np.int32],
     )
+    # Same kernel symbol but bound for the larger KV chunk shape; needed
+    # because Kernel parameter types are the L1 type signature, and the
+    # attention spike worker passes kv_chunk_elems-sized buffers. Uses a
+    # distinct C symbol (`_kv_bf16`) to avoid IRON's "redefinition of
+    # symbol" verifier error on same-symbol re-binding.
+    noop_kv_fn = Kernel(
+        f"{func_prefix}layer_fused_noop_kv_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_chunk_ty, L1_kv_chunk_ty, np.int32],
+    )
 
     # ── Pre-RMS input fifo ───────────────────────────────────────────────────
     # Single input fifo of depth=2 fed in two phases from rt.sequence
@@ -317,13 +327,15 @@ def my_layer_fused(
     ]
     qkv_workers = [col0_worker] + qkv_workers_rest
 
-    # ── Skeleton passthrough workers (BO1/BO2/BO3 placeholders) ──────────────
-    # Three small noop workers keep DDR_PATCH ops alive on the unwired BOs.
-    # Real wiring lands in next step (BO3 KV streaming via MemTile gather)
-    # + stage 3 (BO1 O_proj, BO2 SwiGLU weights).
-    # Tile budget: 1 pre_rms + 8 qkv + 3 skel = 12 of 16.
-    skel_in  = [ObjectFifo(L1_chunk, name=f"skel_in_{i}",  depth=2) for i in range(3)]
-    skel_out = [ObjectFifo(L1_chunk, name=f"skel_out_{i}", depth=2) for i in range(3)]
+    # ── Skeleton passthrough workers (BO1/BO2 placeholders only) ─────────────
+    # Two small noop workers keep DDR_PATCH ops alive on BO1 (w_o) and
+    # BO2 (w_ffn). BO3 (kv_pair) is wired via the attention path below
+    # (no skel needed). Real wiring for BO1/BO2 lands in stage 3
+    # (O_proj, SwiGLU). Tile budget: 0 pre_rms + 8 qkv + 2 skel + N attn
+    # = 10 + N of 16. Plan: N = 8 attention workers if MemTile gather
+    # design fits, else N < 8 with degradation to host-CPU fallback.
+    skel_in  = [ObjectFifo(L1_chunk, name=f"skel_in_{i}",  depth=2) for i in range(2)]
+    skel_out = [ObjectFifo(L1_chunk, name=f"skel_out_{i}", depth=2) for i in range(2)]
 
     def passthrough_body(in_fifo, out_fifo, fn):
         for _ in range_(0xFFFFFFFF):
@@ -335,8 +347,40 @@ def my_layer_fused(
 
     skel_workers = [
         Worker(passthrough_body, [skel_in[i].cons(), skel_out[i].prod(), noop_fn])
-        for i in range(3)
+        for i in range(2)
     ]
+
+    # ── Attention worker spike (col 0 only, 1-tile probe) ────────────────────
+    # Probes whether IRON's SequentialPlacer can place a Worker on row 3 of
+    # col 0 (since col 0's qkv_worker already occupies row 2). Body: simple
+    # passthrough that acquires a chunk from a MemTile-mediated KV stream
+    # (no compute, just exercises the placement). If placement succeeds,
+    # we have proof-of-concept that the row-3 placement works and can
+    # scale to 8 attention workers.
+    #
+    # MemTile gather pattern: shim DMA fills `kv_l3l2_fifo` from BO3
+    # (one chunk total — col 0's own kv_head slice). The fifo's MemTile-
+    # placed forward fans out to col 0's attention worker on row 3.
+    kv_l3l2_fifo = ObjectFifo(L1_kv_chunk_ty, name="kv_L3L2", depth=2)
+    kv_mem_fifo  = kv_l3l2_fifo.cons().forward(
+        name="kv_mem", depth=2, placement=Tile(col=0, row=1))
+    # noop entry takes (in, out, n) — we re-use it just to consume the
+    # KV chunk. The "out" goes to a small drain fifo we'll route to the
+    # BO4 outL slot for shape validation only.
+    attn_drain_fifo = ObjectFifo(L1_kv_chunk_ty, name="attn_drain", depth=1)
+
+    def attn_spike_body(kv_in, drain_out, fn):
+        for _ in range_(0xFFFFFFFF):
+            i = kv_in.acquire(1)
+            o = drain_out.acquire(1)
+            fn(i, o, kv_chunk_elems)
+            kv_in.release(1)
+            drain_out.release(1)
+
+    attn_spike_worker = Worker(
+        attn_spike_body,
+        [kv_mem_fifo.cons(), attn_drain_fifo.prod(), noop_kv_fn],
+    )
 
     # ── TensorAccessPatterns ─────────────────────────────────────────────────
     # Pre-RMS: read x from BO4[0..E], read W_norm1 from BO0[0..E], write
@@ -372,13 +416,30 @@ def my_layer_fused(
 
     tap_o    = chunk_tap(bo1_bytes // 2)
     tap_ffn  = chunk_tap(bo2_bytes // 2)
-    tap_kv   = chunk_tap(bo3_bytes // 2)
+    # tap_kv removed — BO3 wired via attn_kv_tap (col 0 spike).
     # Skeleton drains write back into BO4 outL slot (won't be read by any
     # real consumer at this stage).
     skel_drain_tap = TensorAccessPattern(
         tensor_dims=(1, bo4_elems),
         offset=bo4_off_outL,
         sizes=[1, 1, 1, chunk_elems],
+        strides=[0, 0, 0, 1],
+    )
+
+    # Attention spike: read 1 chunk (32 tokens × HEAD_DIM) from BO3
+    # K_cache region for col 0's kv_head (= kv_head 0, offset 0 in BO3).
+    attn_kv_tap = TensorAccessPattern(
+        tensor_dims=(1, bo3_bytes // 2),
+        offset=0,  # col 0 → kv_head 0 → start of K_cache
+        sizes=[1, 1, 1, kv_chunk_elems],
+        strides=[0, 0, 0, 1],
+    )
+    # Drain attn worker output into BO4 attn_out (just for the spike, no
+    # real consumer downstream until stage 3 wiring).
+    attn_drain_tap = TensorAccessPattern(
+        tensor_dims=(1, bo4_elems),
+        offset=bo4_off_attn_out,
+        sizes=[1, 1, 1, kv_chunk_elems],
         strides=[0, 0, 0, 1],
     )
 
@@ -465,7 +526,7 @@ def my_layer_fused(
     with rt.sequence(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
-        rt.start(*qkv_workers, *skel_workers)
+        rt.start(*qkv_workers, *skel_workers, attn_spike_worker)
         # ── Phase 1: pre-RMS inputs (col 0's worker does the compute) ───────
         # No drain — pre_rms_col0 kernel writes normed into the bq_l3l2
         # fifo producer slot (broadcast via MemTile) AND into a static L1
@@ -517,16 +578,25 @@ def my_layer_fused(
 
         # ATTN phase deferred — will land in next step with MemTile gather.
 
-        # ── Skeleton chunk fills/drains (BO1, BO2, BO3 placeholders) ────────
+        # ── Skeleton chunk fills/drains (BO1, BO2 placeholders) ─────────────
         tg_skel = rt.task_group()
         rt.fill (skel_in [0].prod(), w_o,   tap_o,         task_group=tg_skel)
         rt.fill (skel_in [1].prod(), w_ffn, tap_ffn,       task_group=tg_skel)
-        rt.fill (skel_in [2].prod(), kv,    tap_kv,        task_group=tg_skel)
         rt.drain(skel_out[0].cons(), act,   skel_drain_tap, task_group=tg_skel)
-        rt.drain(skel_out[1].cons(), act,   skel_drain_tap, task_group=tg_skel)
-        rt.drain(skel_out[2].cons(), act,   skel_drain_tap, task_group=tg_skel,
+        rt.drain(skel_out[1].cons(), act,   skel_drain_tap, task_group=tg_skel,
                  wait=True)
         rt.finish_task_group(tg_skel)
+
+        # ── Attention spike (1-tile probe on col 0 row 3) ───────────────────
+        # Fills 1 KV chunk (32 tokens × HEAD_DIM bf16) from BO3 K_cache
+        # via the MemTile-mediated gather path; drains the noop output to
+        # BO4 attn_out region. Validates that an attention worker can be
+        # placed on a separate compute row from the qkv worker.
+        tg_attn = rt.task_group()
+        rt.fill (kv_l3l2_fifo.prod(),  kv,  attn_kv_tap,    task_group=tg_attn)
+        rt.drain(attn_drain_fifo.cons(), act, attn_drain_tap, task_group=tg_attn,
+                 wait=True)
+        rt.finish_task_group(tg_attn)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
