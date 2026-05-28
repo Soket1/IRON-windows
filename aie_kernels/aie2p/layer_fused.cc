@@ -249,3 +249,137 @@ extern "C" void layer_fused_rope_apply_bf16(
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// GQA attention compute (U1a per-head sequential, with streaming KV).
+//
+// Per-column work for Llama-3.2-1B:
+//   * 32 Q heads / 8 cols = 4 Q heads per col
+//   * 8 KV heads / 8 cols = 1 KV head per col
+//   * GQA factor = 4 (each col's 1 KV head serves its 4 Q heads — no
+//     cross-col KV gather required; col is self-contained for attention)
+//
+// L1 budget reality (~32-64 KB per tile on AIE2P): 1k context KV head
+// = 1024 × 64 × 2 = 128 KB does NOT fit. KV streams from BO3 K_cache /
+// V_cache via the per-col attention worker's input channel; we process
+// in `K_CHUNK = 32` token chunks (matches FFLM's ct_chunk_size from
+// mha.dll RE'd disasm).
+//
+// Three kernels comprise the per-col attention pipeline:
+//   1. attn_qk_score_chunk_bf16 — per-head Q · K_chunk^T, partial scores
+//      written to a per-col scores buffer (max ctx_len bf16 per head).
+//      Caller iterates ctx_len / K_CHUNK chunks.
+//   2. attn_softmax_inplace_bf16 — in-place softmax over ctx_len, with
+//      pre-scaled inputs (scores already divided by sqrt(head_dim)).
+//   3. attn_av_ctx_chunk_bf16 — per-head scores · V_chunk, accumulating
+//      into a head_dim context vector. Caller iterates same chunking.
+//
+// `scale` parameter passed in pre-computed as 1.0f / sqrt(HEAD_DIM) and
+// folded into the score calc (saves a per-element divide).
+// ────────────────────────────────────────────────────────────────────────────
+
+#ifndef ATTN_K_CHUNK
+#define ATTN_K_CHUNK 32
+#endif
+
+// Per-head Q · K_chunk^T, producing K_CHUNK partial scores. Q is one
+// head's HEAD_DIM bf16 vector; K_chunk is K_CHUNK rows of HEAD_DIM bf16
+// each. Output is appended to scores at offset chunk_idx*K_CHUNK.
+//
+// This computes a (1, HEAD_DIM) @ (HEAD_DIM, K_CHUNK) → (K_CHUNK,)
+// scalar-product-per-key matmul, equivalent to K_CHUNK dot products
+// of length HEAD_DIM.
+extern "C" void attn_qk_score_chunk_bf16(
+        const bfloat16 *q_head,      // [HEAD_DIM]
+        const bfloat16 *k_chunk,     // [K_CHUNK × HEAD_DIM]
+        bfloat16       *scores_out,  // [K_CHUNK] (chunk-local)
+        int32_t         scale_bits   // bits-of-bf16 scale factor 1/sqrt(HEAD_DIM)
+    ) {
+    // Reinterpret int bits → bfloat16 scale (avoids passing bf16 by value
+    // since the AIE2P calling convention promotes bf16 → int).
+    bfloat16 scale;
+    static_assert(sizeof(bfloat16) == 2, "bf16 size assumption");
+    uint16_t sb = (uint16_t)scale_bits;
+    __builtin_memcpy(&scale, &sb, 2);
+
+    for (int j = 0; j < ATTN_K_CHUNK; j++) {
+        const bfloat16 *k_row = k_chunk + j * HEAD_DIM;
+        float dot = 0.0f;
+        for (int d = 0; d < HEAD_DIM; d++) {
+            dot += (float)q_head[d] * (float)k_row[d];
+        }
+        scores_out[j] = (bfloat16)(dot * (float)scale);
+    }
+}
+
+// In-place softmax over `n` bf16 values (n = ctx_len). Numerically stable
+// (subtract max before exp). Operates entirely in bf16 on AIE2P; this is
+// the per-col leader path so the loop fits the tile budget.
+extern "C" void attn_softmax_inplace_bf16(bfloat16 *scores, int32_t n) {
+    // Pass 1: find max
+    float max_val = -1e30f;
+    for (int i = 0; i < n; i++) {
+        float v = (float)scores[i];
+        if (v > max_val) max_val = v;
+    }
+    // Pass 2: exp(x - max), accumulate sum.
+    // Use polynomial expf via the AIE math library: aie::exp is a
+    // float-vector op; for a scalar fallback we approximate via
+    // exp(x) ≈ 2^(x * log2(e)) using a Taylor expansion on the
+    // fractional part. For baseline v0 we use a simple ldexp-based
+    // form that the AIE compiler supports without intrinsic deps.
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float v = (float)scores[i] - max_val;
+        // Clamp to avoid underflow blowing up later passes
+        if (v < -80.0f) v = -80.0f;
+        // exp(v) via 2^k method: split v*log2(e) into integer+frac
+        float x = v * 1.4426950408889634f;        // log2(e)
+        int   k = (int)x;
+        if (x < (float)k) k -= 1;                 // floor
+        float f = x - (float)k;
+        // 2^f via 4-term polynomial (max error ~1e-3 over [0,1])
+        float p = 1.0f + f * (0.6931472f + f * (0.2402265f + f * 0.05551327f));
+        // Build 2^k by manipulating the IEEE-754 exponent
+        union { float fv; uint32_t u; } pack;
+        pack.fv = p;
+        int e2 = ((int)((pack.u >> 23) & 0xFF)) + k;
+        if (e2 <= 0) {
+            pack.fv = 0.0f;
+        } else if (e2 >= 255) {
+            pack.fv = 1e30f;
+        } else {
+            pack.u = (pack.u & 0x807FFFFFu) | ((uint32_t)e2 << 23);
+        }
+        float e = pack.fv;
+        sum += e;
+        scores[i] = (bfloat16)e;
+    }
+    // Pass 3: normalize
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < n; i++) {
+        scores[i] = (bfloat16)((float)scores[i] * inv_sum);
+    }
+}
+
+// Per-head scores · V_chunk accumulate-into ctx_head. ctx_head is a
+// HEAD_DIM bf16 accumulator that the caller zeroes before the first chunk
+// and reads after the last. scores_chunk is K_CHUNK weights from the
+// softmax output (chunk-local), v_chunk is K_CHUNK rows of HEAD_DIM bf16.
+extern "C" void attn_av_ctx_chunk_bf16(
+        const bfloat16 *scores_chunk,  // [K_CHUNK]
+        const bfloat16 *v_chunk,       // [K_CHUNK × HEAD_DIM]
+        bfloat16       *ctx_head,      // [HEAD_DIM] accumulator
+        int32_t         zero_first      // 1 = clear ctx_head before; 0 = accumulate
+    ) {
+    if (zero_first) {
+        for (int d = 0; d < HEAD_DIM; d++) ctx_head[d] = (bfloat16)0.0f;
+    }
+    for (int j = 0; j < ATTN_K_CHUNK; j++) {
+        float w = (float)scores_chunk[j];
+        const bfloat16 *v_row = v_chunk + j * HEAD_DIM;
+        for (int d = 0; d < HEAD_DIM; d++) {
+            ctx_head[d] = (bfloat16)((float)ctx_head[d] + w * (float)v_row[d]);
+        }
+    }
+}
