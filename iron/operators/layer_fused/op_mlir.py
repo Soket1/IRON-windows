@@ -138,6 +138,15 @@ class LayerFusedMLIR(MLIROperator):
     def _bundle_byte_sizes(self):
         """Compute byte sizes for the 5 BO bundles. Single source of
         truth for both the runtime arg spec (here) and design.py.
+
+        Layout (bf16-element-counted byte regions, all even-sized):
+          BO0 (in)    = W_norm1 [E] | W_q [E×E INT4] | W_k [E×kvE INT4]
+                                    | W_v [E×kvE INT4]
+          BO1 (in)    = W_o    [E×E INT4]
+          BO2 (in)    = W_norm2 [E] | W_gate [E×H INT4] | W_up [E×H INT4]
+                                    | W_down [H×E INT4]
+          BO3 (inout) = K_cache | V_cache  (per-layer, DDR_PATCH'd)
+          BO4 (inout) = activations (x, scratch, ..., outL)
         """
         e, h, g = self.embed_dim, self.hidden_dim, self.group_size
         c = self.num_aie_columns
@@ -171,12 +180,15 @@ class LayerFusedMLIR(MLIROperator):
         packed_d = m_input_d * h // 2 + m_input_d * groups_h * 2
         total_d = c * (e // c) * packed_d
 
-        # BO0: Q + K + V weights concatenated
-        bo0_bytes = total_q + 2 * total_kv_one
+        # Norm gain weights (bf16)
+        norm_bytes = e * 2
+
+        # BO0: W_norm1 (bf16) + Q + K + V weights
+        bo0_bytes = norm_bytes + total_q + 2 * total_kv_one
         # BO1: O_proj weights
         bo1_bytes = total_o
-        # BO2: gate+up+down weights
-        bo2_bytes = total_gu + total_d
+        # BO2: W_norm2 (bf16) + gate+up+down weights
+        bo2_bytes = norm_bytes + total_gu + total_d
         # BO3: K_cache | V_cache, both bf16
         kv_one_bytes = nkv * mx * hd * 2
         bo3_bytes = 2 * kv_one_bytes

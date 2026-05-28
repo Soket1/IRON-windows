@@ -53,4 +53,33 @@ void layer_fused_noop_bf16(bfloat16 *__restrict__ in,
     }
 }
 
+// Weighted RMSNorm: output[i] = (input[i] / rms(input)) * gain[i]
+// epsilon = 1e-5 (matches existing rms_norm.cc + post_attn_rms_norm_bf16)
+// Used by both pre-RMS (W_norm1) and post-RMS (W_norm2) stages.
+void layer_fused_rms_norm_bf16(const bfloat16 *input, const bfloat16 *gain,
+                               bfloat16 *output, int32_t n) {
+    constexpr float eps = 1e-5f;
+    constexpr int VEC = 16;
+
+    ::aie::vector<float, VEC> acc = ::aie::zeros<float, VEC>();
+    int chunks = n / VEC;
+    for (int i = 0; i < chunks; i++) {
+        ::aie::vector<bfloat16, VEC> v = ::aie::load_v<VEC>(input + i * VEC);
+        ::aie::vector<float, VEC> sq = ::aie::mul_square(v);
+        acc = ::aie::add(acc, sq);
+    }
+    float sum_sq = ::aie::reduce_add(acc);
+    for (int i = chunks * VEC; i < n; i++) {
+        float x = (float)input[i];
+        sum_sq += x * x;
+    }
+
+    float inv_rms = aie::invsqrt(sum_sq / n + eps);
+
+    for (int i = 0; i < n; i++) {
+        output[i] = (bfloat16)((float)input[i] * inv_rms * (float)gain[i]);
+    }
+    (void)chunks;
+}
+
 }  // extern "C"
