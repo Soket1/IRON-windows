@@ -273,6 +273,21 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_kv_chunk_ty, np.int32],
     )
+    attn_qhead_load_fn = Kernel(
+        f"{func_prefix}attn_qhead_load_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_q_head_ty, np.int32, np.int32],
+    )
+    attn_compute_real_qhead_acc_fn = Kernel(
+        f"{func_prefix}attn_compute_real_qhead_acc_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.int32],
+    )
+    attn_drain_real_ctx_fn = Kernel(
+        f"{func_prefix}attn_drain_real_ctx_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_chunk_ty, np.int32],
+    )
     # Streaming variant: compute on the static buffer WITHOUT a drain
     # (ctx state stays in static for the next chunk). Last body chunk
     # calls attn_compute_from_static_fn (with drain) instead.
@@ -449,6 +464,10 @@ def my_layer_fused(
     # spike-only; correctness lands in A1.3.5 with online softmax.
     ATTN_N_CHUNKS = 16
     SUBS_PER_BODY = ATTN_N_CHUNKS * ATTN_SUBCHUNKS_PER_CHUNK
+    # Number of REAL q_heads streamed per body iter via the q_rot fifo
+    # (rest of the heads_per_tile use kv_chunk seed). Spike — keeping
+    # the fifo small to bound shim BD count.
+    N_QHEADS_LOADED = 4
     kv_l3l2_fifos = [ObjectFifo(L1_kv_subchunk_ty, name=f"kv_L3L2_{c}",
                                 depth=ATTN_SUBCHUNKS_PER_CHUNK)
                      for c in attn_cols]
@@ -459,6 +478,17 @@ def my_layer_fused(
                      for i, c in enumerate(attn_cols)]
     attn_drain_fifos = [ObjectFifo(L1_kv_chunk_ty, name=f"attn_drain_{c}",
                                    depth=1) for c in attn_cols]
+
+    # NOTE: q_rot via MemTile gather attempted but shim 2-S2MM cap is
+    # exhausted on EVERY col (col 0: rms_in + Aqkv; cols 1-7: Aqkv +
+    # kv_l3l2). Dropping in a q_rot producer from any shim → MemTile
+    # entry fails placement.
+    #
+    # Real fix needs producer-side rerouting: e.g. drop the dedicated
+    # rms_in shim path and have col 0's qkv worker read the activation
+    # from BO4 via a different channel, freeing col 0 shim S2MM for
+    # the q_rot producer. That's an L1.3.x rearchitecture, not a spike
+    # tweak. Kernels left in `.cc` for that step.
 
     # NOTE: a real q_rot input fifo would push attn cols 1-7 to 3 shim
     # S2MM channels (Aqkv + kv_l3l2 + q_rot), exceeding the AIE2P 2-S2MM
@@ -488,6 +518,33 @@ def my_layer_fused(
                     zf = 1 if _c == 0 else 0
                     acc_fn(zf)
 
+    # Col-1 body with REAL q_rot input via MemTile gather. Per body
+    # iter: load N_QHEADS_LOADED q_heads (each HEAD_DIM bf16) from the
+    # q_rot fifo into static, then run the streaming attention chain.
+    def attn_gather_body_q(kv_in, q_in, drain_out,
+                           qload_fn, kload_fn, real_acc_fn, drain_real_fn):
+        for _ in range_(0xFFFFFFFF):
+            # Load q_heads once per body iter (real q_rot data).
+            for h in range(N_QHEADS_LOADED):
+                q = q_in.acquire(1)
+                qload_fn(q, h, hd)
+                q_in.release(1)
+            # Stream kv chunks; last chunk drains.
+            for _c in range(ATTN_N_CHUNKS):
+                for k in range(ATTN_SUBCHUNKS_PER_CHUNK):
+                    sub = kv_in.acquire(1)
+                    kload_fn(sub, k, SUBCHUNK_ELEMS)
+                    kv_in.release(1)
+                zf = 1 if _c == 0 else 0
+                real_acc_fn(zf)
+            o = drain_out.acquire(1)
+            drain_real_fn(o, kv_chunk_elems)
+            drain_out.release(1)
+
+    # Build per-col attn workers. All cols use the streaming kv-seed
+    # variant; q_rot wiring is blocked by the shim 2-S2MM cap (see
+    # NOTE above). Col-1 q_rot variant kept in commented form for the
+    # rearchitecture step.
     attn_workers = [
         Worker(attn_gather_body,
                [kv_mem_fifos[i].cons(), attn_drain_fifos[i].prod(),

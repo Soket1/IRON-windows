@@ -813,3 +813,50 @@ extern "C" void attn_compute_from_static_acc_bf16(int32_t zero_first) {
         attn_av_ctx_chunk_bf16(scores, kv, ctx_h, zero_first);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Step-6 spike: real q_head input via MemTile cross-col gather.
+//
+// The compute tile body now acquires a q_head slice per body iter
+// and copies it into the per-tile static q_heads buffer at the head
+// index hidden by the worker loop. Same MemTile relay pattern as
+// kv sub-chunks. Full per-iter compute is identical to the prior
+// streaming spike — only the q_heads init source changes from a
+// kv_chunk seed to a real fifo.
+// ────────────────────────────────────────────────────────────────────────────
+
+extern "C" void attn_qhead_load_bf16(bfloat16 *__restrict q_in,
+                                     int32_t head_idx,
+                                     int32_t n) {
+    (void)n;
+    bfloat16 *dst = attn_q_heads4_static + head_idx * HEAD_DIM;
+    for (int i = 0; i < HEAD_DIM; i++) {
+        dst[i] = q_in[i];
+    }
+}
+
+// Streaming compute that uses the q_heads loaded via attn_qhead_load_bf16
+// (NOT the kv_chunk seed). Same scoring / softmax / ctx flow as the
+// _acc_bf16 variant.
+extern "C" void attn_compute_real_qhead_acc_bf16(int32_t zero_first) {
+    constexpr int32_t kScaleBitsInvSqrt64 = 0x3E00;
+    bfloat16 *kv = attn_kv_full_static;
+    for (int h = 0; h < ATTN_HEADS_PER_TILE; h++) {
+        bfloat16 *q_h    = attn_q_heads4_static + h * HEAD_DIM;
+        bfloat16 *scores = attn_scores4_static  + h * ATTN_K_CHUNK;
+        bfloat16 *ctx_h  = attn_ctx4_static     + h * HEAD_DIM;
+        attn_qk_score_chunk_bf16(q_h, kv, scores, kScaleBitsInvSqrt64);
+        attn_softmax_inplace_bf16(scores, ATTN_K_CHUNK);
+        attn_av_ctx_chunk_bf16(scores, kv, ctx_h, zero_first);
+    }
+}
+
+extern "C" void attn_drain_real_ctx_bf16(bfloat16 *__restrict ctx_out,
+                                         int32_t n) {
+    for (int i = 0; i < ATTN_HEADS_PER_TILE * HEAD_DIM && i < n; i++) {
+        ctx_out[i] = attn_ctx4_static[i];
+    }
+    for (int i = ATTN_HEADS_PER_TILE * HEAD_DIM; i < n; i++) {
+        ctx_out[i] = (bfloat16)0.0f;
+    }
+}
