@@ -216,6 +216,29 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_q_head_ty, L1_kv_chunk_ty, L1_kv_chunk_ty, np.int32],
     )
+    # Step-3 spike: streaming attention over multiple KV chunks. Worker
+    # body iterates ATTN_N_CHUNKS K acquires + softmax + ATTN_N_CHUNKS V
+    # acquires + drain. Each kernel below performs one step.
+    attn_qk_score_at_fn = Kernel(
+        f"{func_prefix}attn_qk_score_at_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_chunk_ty, np.int32, np.int32],
+    )
+    attn_softmax_full_fn = Kernel(
+        f"{func_prefix}attn_softmax_full_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.int32],
+    )
+    attn_av_ctx_at_fn = Kernel(
+        f"{func_prefix}attn_av_ctx_at_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_chunk_ty, np.int32, np.int32],
+    )
+    attn_drain_ctx_fn = Kernel(
+        f"{func_prefix}attn_drain_ctx_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_chunk_ty, np.int32],
+    )
 
     # ── Pre-RMS input fifo ───────────────────────────────────────────────────
     # Single input fifo of depth=2 fed in two phases from rt.sequence
@@ -385,17 +408,17 @@ def my_layer_fused(
     attn_drain_fifos = [ObjectFifo(L1_kv_chunk_ty, name=f"attn_drain_{c}",
                                    depth=1) for c in attn_cols]
 
-    # NOTE: a real q_rot input fifo would push attn cols 1-7 to 3 shim
-    # S2MM channels (Aqkv + kv_l3l2 + q_rot), exceeding the AIE2P 2-S2MM
-    # cap. Placement fails on col 2 as soon as q_rot is wired through
-    # shim. The fix requires routing q_rot via a MemTile gather from the
-    # QKV worker outputs (no DDR roundtrip — FFLM property), which is a
-    # cross-col rearchitecture deferred to the next checkpoint.
-    #
-    # For this checkpoint we keep the 1-input attn body (kv only); the
-    # q_head is seeded from kv_chunk[0..63] inside attn_compute_chunk_bf16
-    # (dummy spike data). PDI density already at 27% — proves the
-    # attention compute kernels execute on AIE2P.
+    # NOTE: streaming attention over multiple chunks (the next step
+    # toward FFLM's ct_chunk_size=32 design) hits a shim BD inner-dim
+    # cap of 1023. kv_chunk_elems=2048 lands one transfer at a time
+    # only because mlir-aie auto-splits the innermost dim when outer
+    # dims are size-1. As soon as we add an outer dim (multiple chunks
+    # per body iter), the auto-splitter doesn't fire and aiecc errors
+    # with "Size 0 exceeds [0:1023]". Same blocker as the q_rot input
+    # fifo: requires MemTile gather to relay sub-1024 transfers.
+    # `attn_qk_score_at_bf16`, `attn_softmax_full_bf16`,
+    # `attn_av_ctx_at_bf16`, `attn_drain_ctx_bf16` left in the .cc
+    # ready to wire once the gather pattern lands.
 
     def attn_spike_body(kv_in, drain_out, fn):
         # Body shape unchanged from the noop spike. fn is now
@@ -460,9 +483,10 @@ def my_layer_fused(
         strides=[0, 0, 0, 1],
     )
 
-    # Attention spike: per-col read of 1 chunk (32 tokens × HEAD_DIM bf16)
-    # from BO3 K_cache region. Col c reads its kv_head c slice (offset
-    # c * MAX * HEAD_DIM in bf16 element units within BO3). Cols 1..7 only.
+    # Attention spike (single-chunk): per-col read of 1 chunk (32 tokens
+    # × HEAD_DIM bf16) from BO3 K_cache region. Col c reads its kv_head
+    # c slice (offset c * MAX * HEAD_DIM in bf16 element units within
+    # BO3). Cols 1..7 only.
     attn_kv_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo3_bytes // 2),

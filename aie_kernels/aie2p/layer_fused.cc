@@ -545,3 +545,75 @@ extern "C" void attn_compute_with_qhead_bf16(
         ctx_out[i] = (bfloat16)0.0f;
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Step-3 spike: streaming attention over multiple KV chunks.
+//
+// Worker body now iterates N_CHUNKS chunk acquires for K, runs softmax once
+// over the full scores buffer, then iterates N_CHUNKS for V accumulating
+// into ctx_head, then drains. Each kernel below performs ONE step of that
+// pipeline on a single chunk; the body schedules them in the right order.
+//
+// Static buffers grow: scores now holds N_CHUNKS*K_CHUNK partial scores.
+// ATTN_MAX_CHUNKS caps the streaming length at compile time (= context
+// window / K_CHUNK). For Llama-3.2-1B 1k context that's 32; we ship the
+// spike at ATTN_MAX_CHUNKS=4 = 128-token window to keep insts.bin small.
+// ────────────────────────────────────────────────────────────────────────────
+
+#ifndef ATTN_MAX_CHUNKS
+#define ATTN_MAX_CHUNKS 4
+#endif
+
+static bfloat16 attn_scores_full_static[ATTN_MAX_CHUNKS * ATTN_K_CHUNK]
+    __attribute__((aligned(64)));
+
+// Compute Q · K_chunk^T at chunk index `chunk_idx`, writing K_CHUNK
+// partial scores into the file-scope scratch at offset chunk_idx*K_CHUNK.
+// The seed q_head still comes from kv_chunk[0..63] for this spike — real
+// q_rot input arrives once MemTile gather replaces the shim cap blocker.
+extern "C" void attn_qk_score_at_bf16(bfloat16 *__restrict kv_chunk,
+                                      int32_t chunk_idx,
+                                      int32_t n_total) {
+    (void)n_total;
+    // On the first chunk, refresh the dummy q_head seed.
+    if (chunk_idx == 0) {
+        for (int i = 0; i < HEAD_DIM; i++) {
+            attn_q_head_static[i] = kv_chunk[i];
+        }
+    }
+    constexpr int32_t kScaleBitsInvSqrt64 = 0x3E00;
+    bfloat16 *scores_at = attn_scores_full_static + chunk_idx * ATTN_K_CHUNK;
+    attn_qk_score_chunk_bf16(attn_q_head_static, kv_chunk,
+                             scores_at, kScaleBitsInvSqrt64);
+}
+
+// Softmax over the full N_chunks*K_CHUNK scores buffer, in place.
+extern "C" void attn_softmax_full_bf16(int32_t n_chunks) {
+    int32_t n = n_chunks * ATTN_K_CHUNK;
+    if (n > ATTN_MAX_CHUNKS * ATTN_K_CHUNK) n = ATTN_MAX_CHUNKS * ATTN_K_CHUNK;
+    attn_softmax_inplace_bf16(attn_scores_full_static, n);
+}
+
+// Accumulate scores[chunk_idx*K_CHUNK..] · V_chunk into ctx_head. Caller
+// passes zero_first=1 on the first chunk to clear the accumulator.
+extern "C" void attn_av_ctx_at_bf16(bfloat16 *__restrict v_chunk,
+                                    int32_t chunk_idx,
+                                    int32_t zero_first) {
+    const bfloat16 *scores_at =
+        attn_scores_full_static + chunk_idx * ATTN_K_CHUNK;
+    attn_av_ctx_chunk_bf16(scores_at, v_chunk,
+                           attn_ctx_head_static, zero_first);
+}
+
+// Drain ctx_head into the leading HEAD_DIM bf16 of a chunk-shaped output;
+// zero the tail. Same shape as the previous spike's drain so the existing
+// attn_drain fifo type doesn't change.
+extern "C" void attn_drain_ctx_bf16(bfloat16 *__restrict ctx_out,
+                                    int32_t n) {
+    for (int i = 0; i < HEAD_DIM; i++) {
+        ctx_out[i] = attn_ctx_head_static[i];
+    }
+    for (int i = HEAD_DIM; i < n; i++) {
+        ctx_out[i] = (bfloat16)0.0f;
+    }
+}
