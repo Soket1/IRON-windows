@@ -184,41 +184,82 @@ def my_layer_fused(
         [rms_in_fifo.cons(), rms_out_fifo.prod(), rms_norm_fn],
     )
 
-    # ── Q GEMV (8 cols, output dim = E = embed_dim) ──────────────────────────
-    # Per-col weight stream: each col owns rows_per_col_q output rows.
-    rows_per_col_q  = e // cols
-    tiles_per_col_q = rows_per_col_q // m_input_qkv
-    bytes_col_q     = tiles_per_col_q * packed_qkv_tile_bytes
+    # ── Q/K/V GEMV (8 cols, unified worker doing 3 phases per outer iter) ───
+    # Per-col output dims:
+    #   Q:  rows_per_col_q  = e // cols           (256 for cols=8, e=2048)
+    #   K:  rows_per_col_kv = kv_e // cols        (64  for cols=8, kv_e=512)
+    #   V:  same as K
+    rows_per_col_q   = e // cols
+    tiles_per_col_q  = rows_per_col_q // m_input_qkv
+    bytes_col_q      = tiles_per_col_q * packed_qkv_tile_bytes
     assert tiles_per_col_q <= 1023, f"tiles_per_col_q={tiles_per_col_q} exceeds DMA cap"
 
-    # Q activation is normed (E bf16) broadcast to all cols via MemTile —
-    # mirrors post_attn_fused.design.py:192-194 kqv broadcast pattern.
-    Aq_fifos = [ObjectFifo(L1_Aq_ty, name=f"Aq_{i}", depth=2) for i in range(cols)]
+    rows_per_col_kv  = kv_e // cols
+    tiles_per_col_kv = rows_per_col_kv // m_input_qkv
+    bytes_col_kv     = tiles_per_col_kv * packed_qkv_tile_bytes
+    assert rows_per_col_kv % m_input_qkv == 0, (
+        f"rows_per_col_kv={rows_per_col_kv} must be divisible by m_input_qkv={m_input_qkv}"
+    )
+    assert tiles_per_col_kv <= 1023, f"tiles_per_col_kv={tiles_per_col_kv} exceeds DMA cap"
+
+    # ONE A fifo + ONE C fifo per col, reused across Q/K/V phases.
+    # Tile budget: 1 (pre_rms) + 8 (unified QKV) + 3 (skel) = 12 of 16
+    # compute tiles. Each worker uses 2 input channels (Aqkv + bq broadcast)
+    # and 1 output channel (Cqkv) — well within AIE2P per-tile DMA cap.
+    # Activation (normed) is broadcast via MemTile, same kqv pattern as
+    # post_attn_fused.design.py:192-194.
+    Aqkv_fifos = [ObjectFifo(L1_Aq_ty, name=f"Aqkv_{i}", depth=2) for i in range(cols)]
     bq_l3l2_fifo = ObjectFifo(L1_Bq_ty, name="bq_L3L2", depth=1)
     bq_mem_fifo  = bq_l3l2_fifo.cons().forward(
         name="bq_mem", depth=1, placement=Tile(col=0, row=1))
-    Cq_fifos = [ObjectFifo(L1_Cq_ty, name=f"Cq_{i}", depth=2) for i in range(cols)]
+    Cqkv_fifos = [ObjectFifo(L1_Cq_ty, name=f"Cqkv_{i}", depth=2) for i in range(cols)]
 
-    def q_gemv_body(Aq, Bq, Cq, fn):
+    # Unified QKV body: Q phase → K phase → V phase. The runtime sequence
+    # fills A with Aq/Ak/Av tap (different weight regions), fills bq with
+    # the same normed activation, and drains C to different BO4 regions
+    # (q_rot / k_rot / v) — same L1 fifos throughout, the source/sink TAPs
+    # carry the phase semantics.
+    def qkv_body(A, B, C, fn):
         for _ in range_(0xFFFFFFFF):
-            b = Bq.acquire(1)
+            # Q phase (tiles_per_col_q outer iters)
+            b = B.acquire(1)
             for _ in range_(tiles_per_col_q):
-                a = Aq.acquire(1)
-                c = Cq.acquire(1)
+                a = A.acquire(1)
+                c = C.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
-                Aq.release(1)
-                Cq.release(1)
-            Bq.release(1)
+                A.release(1)
+                C.release(1)
+            B.release(1)
+            # K phase
+            b = B.acquire(1)
+            for _ in range_(tiles_per_col_kv):
+                a = A.acquire(1)
+                c = C.acquire(1)
+                fn(m_input_qkv, 0, a, b, c)
+                A.release(1)
+                C.release(1)
+            B.release(1)
+            # V phase
+            b = B.acquire(1)
+            for _ in range_(tiles_per_col_kv):
+                a = A.acquire(1)
+                c = C.acquire(1)
+                fn(m_input_qkv, 0, a, b, c)
+                A.release(1)
+                C.release(1)
+            B.release(1)
 
-    q_workers = [
-        Worker(q_gemv_body,
-               [Aq_fifos[i].cons(), bq_mem_fifo.cons(),
-                Cq_fifos[i].prod(), qkv_gemv_fn])
+    qkv_workers = [
+        Worker(qkv_body,
+               [Aqkv_fifos[i].cons(), bq_mem_fifo.cons(),
+                Cqkv_fifos[i].prod(), qkv_gemv_fn])
         for i in range(cols)
     ]
 
-    # ── Skeleton passthrough fifos (BOs not yet wired into real compute) ─────
-    # BO1 (w_o), BO2 (w_ffn), BO3 (kv_pair) — keep DDR_PATCH ops alive.
+    # ── Skeleton passthrough workers (BO1/BO2/BO3 placeholders) ──────────────
+    # Three small noop workers keep DDR_PATCH ops alive on the unwired BOs.
+    # Real wiring lands in 2c-end (KV slot to BO3) + stage 3 (BO1 O_proj,
+    # BO2 SwiGLU weights).
     skel_in  = [ObjectFifo(L1_chunk, name=f"skel_in_{i}",  depth=2) for i in range(3)]
     skel_out = [ObjectFifo(L1_chunk, name=f"skel_out_{i}", depth=2) for i in range(3)]
 
@@ -256,15 +297,6 @@ def my_layer_fused(
         sizes=[1, 1, 1, e],
         strides=[0, 0, 0, 1],
     )
-
-    # Skeleton chunk TAPs for the still-unwired BOs (BO1 w_o, BO3 kv_pair).
-    def chunk_tap(total_elems):
-        return TensorAccessPattern(
-            tensor_dims=(1, total_elems),
-            offset=0,
-            sizes=[1, 1, 1, chunk_elems],
-            strides=[0, 0, 0, 1],
-        )
 
     # Skeleton chunk TAPs for the still-unwired BOs (BO1 w_o, BO2 w_ffn,
     # BO3 kv_pair).
@@ -306,6 +338,25 @@ def my_layer_fused(
         )
         for i in range(cols)
     ]
+    # K and V weight TAPs — same per-row tile size, fewer rows/col.
+    Ak_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo0_bytes // 2),
+            offset=bo0_off_W_k + i * (bytes_col_kv // 2),
+            sizes=[1, 1, 1, bytes_col_kv // 2],
+            strides=[0, 0, 0, 1],
+        )
+        for i in range(cols)
+    ]
+    Av_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo0_bytes // 2),
+            offset=bo0_off_W_v + i * (bytes_col_kv // 2),
+            sizes=[1, 1, 1, bytes_col_kv // 2],
+            strides=[0, 0, 0, 1],
+        )
+        for i in range(cols)
+    ]
     # Bq is normed (E bf16) in BO4 — broadcast via MemTile.
     bq_tap = TensorAccessPattern(
         tensor_dims=(1, bo4_elems),
@@ -324,12 +375,32 @@ def my_layer_fused(
         )
         for i in range(cols)
     ]
+    # Ck drains: BO4 k_rot region; rows_per_col_kv per col.
+    Ck_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo4_elems),
+            offset=bo4_off_k_rot + i * rows_per_col_kv,
+            sizes=[1, 1, tiles_per_col_kv, rows_per_col_kv // tiles_per_col_kv],
+            strides=[0, 0, rows_per_col_kv // tiles_per_col_kv, 1],
+        )
+        for i in range(cols)
+    ]
+    # Cv drains: BO4 v region (V doesn't get RoPE'd, goes straight to KV slot).
+    Cv_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo4_elems),
+            offset=bo4_off_v + i * rows_per_col_kv,
+            sizes=[1, 1, tiles_per_col_kv, rows_per_col_kv // tiles_per_col_kv],
+            strides=[0, 0, rows_per_col_kv // tiles_per_col_kv, 1],
+        )
+        for i in range(cols)
+    ]
 
     rt = Runtime()
     with rt.sequence(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
-        rt.start(pre_rms_worker, *q_workers, *skel_workers)
+        rt.start(pre_rms_worker, *qkv_workers, *skel_workers)
         # ── Phase 1: pre-RMS ────────────────────────────────────────────────
         tg_rms = rt.task_group()
         rt.fill (rms_in_fifo.prod(),  act,   x_tap,       task_group=tg_rms)
@@ -339,14 +410,40 @@ def my_layer_fused(
         rt.finish_task_group(tg_rms)
 
         # ── Phase 2: Q GEMV ─────────────────────────────────────────────────
+        # Unified qkv_worker first phase: A = Aq, B = normed broadcast,
+        # C drained to BO4 q_rot region.
         tg_q = rt.task_group()
         for i in range(cols):
-            rt.fill(Aq_fifos[i].prod(), w_qkv, Aq_taps[i], task_group=tg_q)
+            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Aq_taps[i], task_group=tg_q)
         rt.fill(bq_l3l2_fifo.prod(), act, bq_tap, task_group=tg_q)
         for i in range(cols):
-            rt.drain(Cq_fifos[i].cons(), act, Cq_taps[i],
+            rt.drain(Cqkv_fifos[i].cons(), act, Cq_taps[i],
                      task_group=tg_q, wait=True)
         rt.finish_task_group(tg_q)
+
+        # ── Phase 3: K GEMV ─────────────────────────────────────────────────
+        # Same unified worker, second phase: A = Ak, B = normed (re-filled),
+        # C drained to BO4 k_rot region.
+        tg_k = rt.task_group()
+        for i in range(cols):
+            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Ak_taps[i], task_group=tg_k)
+        rt.fill(bq_l3l2_fifo.prod(), act, bq_tap, task_group=tg_k)
+        for i in range(cols):
+            rt.drain(Cqkv_fifos[i].cons(), act, Ck_taps[i],
+                     task_group=tg_k, wait=True)
+        rt.finish_task_group(tg_k)
+
+        # ── Phase 4: V GEMV ─────────────────────────────────────────────────
+        # Third phase of unified worker: A = Av, B = normed (re-filled),
+        # C drained to BO4 v region.
+        tg_v = rt.task_group()
+        for i in range(cols):
+            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Av_taps[i], task_group=tg_v)
+        rt.fill(bq_l3l2_fifo.prod(), act, bq_tap, task_group=tg_v)
+        for i in range(cols):
+            rt.drain(Cqkv_fifos[i].cons(), act, Cv_taps[i],
+                     task_group=tg_v, wait=True)
+        rt.finish_task_group(tg_v)
 
         # ── Skeleton chunk fills/drains (BO1, BO2, BO3 placeholders) ────────
         tg_skel = rt.task_group()
