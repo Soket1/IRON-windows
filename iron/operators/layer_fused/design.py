@@ -239,6 +239,15 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_kv_chunk_ty, np.int32],
     )
+    # Step-4 spike: 4-head dense compute on a single KV chunk. Drop-in
+    # replacement for attn_compute_fn — same (kv_chunk, ctx_out, n)
+    # signature, 4× the per-call compute density (4 q_heads in one
+    # kernel invocation). Fits within shim 1-input + 1-output flow.
+    attn_compute_4heads_fn = Kernel(
+        f"{func_prefix}attn_compute_4heads_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_kv_chunk_ty, L1_kv_chunk_ty, np.int32],
+    )
 
     # ── Pre-RMS input fifo ───────────────────────────────────────────────────
     # Single input fifo of depth=2 fed in two phases from rt.sequence
@@ -422,8 +431,9 @@ def my_layer_fused(
 
     def attn_spike_body(kv_in, drain_out, fn):
         # Body shape unchanged from the noop spike. fn is now
-        # attn_compute_chunk_bf16, which internally runs qk_score →
-        # softmax → av_ctx on the chunk via per-tile static scratch.
+        # attn_compute_4heads_bf16, which runs 4 q-heads sequentially
+        # through qk_score → softmax → av_ctx in a single kernel
+        # invocation per body iter (per-tile L1 static scratch).
         for _ in range_(0xFFFFFFFF):
             i = kv_in.acquire(1)
             o = drain_out.acquire(1)
@@ -434,7 +444,7 @@ def my_layer_fused(
     attn_workers = [
         Worker(attn_spike_body,
                [kv_mem_fifos[i].cons(), attn_drain_fifos[i].prod(),
-                attn_compute_fn])
+                attn_compute_4heads_fn])
         for i in range(n_attn)
     ]
 

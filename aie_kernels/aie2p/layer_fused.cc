@@ -617,3 +617,64 @@ extern "C" void attn_drain_ctx_bf16(bfloat16 *__restrict ctx_out,
         ctx_out[i] = (bfloat16)0.0f;
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Step-4 spike: 4-head dense attention on a single KV chunk.
+//
+// Drop-in replacement for attn_compute_chunk_bf16 — same fifo signature
+// (kv_chunk, ctx_out, n) — but does 4× the per-call compute by handling
+// the 4 q heads/col GQA mapping in one kernel invocation. Each head uses
+// its own L1 static scratch; q_head seed comes from kv_chunk[h*64..(h+1)*64]
+// (still spike-data; real q_rot lands once MemTile gather replaces shim).
+//
+// Tiny ALU loops here translate directly to more dense per-tile core
+// instructions in the PDI — driving xclbin size up toward FFLM's
+// 414 KB target without changing the dataflow shape.
+// ────────────────────────────────────────────────────────────────────────────
+
+#ifndef ATTN_HEADS_PER_TILE
+#define ATTN_HEADS_PER_TILE 4
+#endif
+
+static bfloat16 attn_q_heads4_static[ATTN_HEADS_PER_TILE * HEAD_DIM]
+    __attribute__((aligned(64)));
+static bfloat16 attn_scores4_static[ATTN_HEADS_PER_TILE * ATTN_K_CHUNK]
+    __attribute__((aligned(64)));
+static bfloat16 attn_ctx4_static[ATTN_HEADS_PER_TILE * HEAD_DIM]
+    __attribute__((aligned(64)));
+
+extern "C" void attn_compute_4heads_bf16(bfloat16 *__restrict kv_chunk,
+                                         bfloat16 *__restrict ctx_out,
+                                         int32_t n) {
+    constexpr int32_t kScaleBitsInvSqrt64 = 0x3E00;
+
+    // 1. Init dummy q_heads from kv_chunk[0 .. 4*HEAD_DIM]. Real wiring
+    //    will pull these from a dedicated q_rot fifo.
+    for (int i = 0; i < ATTN_HEADS_PER_TILE * HEAD_DIM; i++) {
+        attn_q_heads4_static[i] = kv_chunk[i];
+    }
+
+    // 2. Per-head sequential attention over the chunk:
+    //    Q · K^T → softmax → · V_chunk → ctx_head[h]
+    for (int h = 0; h < ATTN_HEADS_PER_TILE; h++) {
+        bfloat16 *q_h     = attn_q_heads4_static + h * HEAD_DIM;
+        bfloat16 *scores  = attn_scores4_static  + h * ATTN_K_CHUNK;
+        bfloat16 *ctx_h   = attn_ctx4_static     + h * HEAD_DIM;
+
+        // Q · K^T
+        attn_qk_score_chunk_bf16(q_h, kv_chunk, scores, kScaleBitsInvSqrt64);
+        // In-place softmax over this head's K_CHUNK partials
+        attn_softmax_inplace_bf16(scores, ATTN_K_CHUNK);
+        // Scores · V_chunk → ctx_head accumulator (kv_chunk reused as V)
+        attn_av_ctx_chunk_bf16(scores, kv_chunk, ctx_h, /*zero_first=*/1);
+    }
+
+    // 3. Drain: 4 ctx_heads laid contiguously in ctx_out's first
+    //    4*HEAD_DIM bf16, zero the tail (ctx_out is kv_chunk_elems wide).
+    for (int i = 0; i < ATTN_HEADS_PER_TILE * HEAD_DIM; i++) {
+        ctx_out[i] = attn_ctx4_static[i];
+    }
+    for (int i = ATTN_HEADS_PER_TILE * HEAD_DIM; i < n; i++) {
+        ctx_out[i] = (bfloat16)0.0f;
+    }
+}
