@@ -457,7 +457,13 @@ def my_layer_fused(
     # ~12% of attention work back to CPU. Acceptable for v0; fix in next
     # step by swapping col 0's QKV worker to a smaller variant or by
     # rebalancing pre-RMS off col 0.
-    attn_cols = list(range(1, cols))  # cols 1..7
+    # R2a (P0.4): attention spike REMOVED. FFLM keeps attention in a
+    # SEPARATE attn.xclbin (CDO-proven) — it does NOT belong in the layer
+    # kernel. attn_out is fed from a BO region by a separate dispatch.
+    # Setting attn_cols=[] makes every attn fifo/worker/tap comprehension
+    # below empty and every tg_attn loop a no-op; the attn_gather_body
+    # defs remain but are never instantiated.
+    attn_cols = []  # was list(range(1, cols))
     n_attn = len(attn_cols)
     n_q_per_attn = num_heads // cols  # 4 q_heads per attn col (GQA)
     # MemTile gather + multi-chunk streaming. Per body iter:
