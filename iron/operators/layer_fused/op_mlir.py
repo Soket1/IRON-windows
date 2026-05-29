@@ -165,9 +165,13 @@ class LayerFusedMLIR(MLIROperator):
         # 2-byte output drain (1 bf16) which fails resource allocation.
         m_input_qkv = 2
         packed_q = m_input_qkv * e // 2 + m_input_qkv * groups_e * 2
-        total_q = c * (e // c) * packed_q
+        # packed_q is bytes for ONE tile = m_input_qkv rows. Per-col total =
+        # (rows_per_col / m_input_qkv) tiles × packed_q. Without the
+        # `// m_input_qkv` divisor the Q/K/V regions are sized 2× and the
+        # K/V TAPs read from past the packer-written bytes.
+        total_q = c * (e // c // m_input_qkv) * packed_q
         # K/V output dims are kv_e (= n_kv * head_dim), not e
-        total_kv_one = c * (kv_e // c) * packed_q  # K alone (or V alone)
+        total_kv_one = c * (kv_e // c // m_input_qkv) * packed_q  # K alone (or V alone)
 
         m_input_o = 1
         packed_o = m_input_o * e // 2 + m_input_o * groups_e * 2

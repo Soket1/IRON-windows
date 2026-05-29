@@ -64,8 +64,12 @@ def my_layer_fused(
 
     m_input_qkv = 2  # AIE2P shim DMA cap: drain len must be ≥ 4 bytes
     packed_q   = m_input_qkv * e // 2 + m_input_qkv * groups_e * 2
-    total_q    = cols * (e // cols) * packed_q
-    total_kv_one = cols * (kv_e // cols) * packed_q
+    # `packed_q` is bytes for ONE tile = m_input_qkv consecutive rows.
+    # Per-col total = (rows_per_col / m_input_qkv) tiles × packed_q.
+    # Forgetting `/ m_input_qkv` here overcounts the Q/K/V regions by
+    # m_input_qkv × and shifts K/V offsets past where the packer writes.
+    total_q      = cols * (e    // cols // m_input_qkv) * packed_q
+    total_kv_one = cols * (kv_e // cols // m_input_qkv) * packed_q
     bo0_bytes  = norm_bytes + total_q + 2 * total_kv_one
 
     m_input_o  = 1
