@@ -321,6 +321,168 @@ extern "C" void layer_fused_rope_apply_bf16(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Post-QKV stages (O_proj, residual ADD, post-RMS, SwiGLU gate/up/down).
+//
+// Ported from post_attn_fused.cc. The INT4 dequant+GEMV math is IDENTICAL
+// to the _qkv_gemv template above (same -8 bias, double-pump, write
+// c_out[row]) — so O_proj / down reuse _qkv_gemv directly, parameterised
+// only by the K dimension (EMBED_DIM for O_proj, HIDDEN_DIM for down).
+// Gate/up need per-phase static buffers (left=gate, right=up) consumed by
+// the fused silu*mul, so they get a small dedicated variant.
+// ────────────────────────────────────────────────────────────────────────────
+
+#ifndef M_OUTPUT_MAX
+#define M_OUTPUT_MAX 4096
+#endif
+
+static bfloat16 lf_left_buf[M_OUTPUT_MAX]  __attribute__((aligned(64)));
+static bfloat16 lf_right_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
+
+extern "C" {
+
+// O_proj GEMV: INT4 E×E. attn_out (E bf16) → o_out slice. K = EMBED_DIM.
+void layer_fused_o_proj_bf16(
+        uint32_t m, uint32_t row_offset,
+        const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
+    _qkv_gemv<32, GROUP_SIZE, EMBED_DIM>(
+        m, a + row_offset * (EMBED_DIM/2 + EMBED_DIM/GROUP_SIZE*2), b, c);
+}
+
+// Down GEMV: INT4 H×E. silu_out (H bf16) → ffn_out slice. K = HIDDEN_DIM.
+void layer_fused_down_bf16(
+        uint32_t m, uint32_t row_offset,
+        const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
+    _qkv_gemv<32, GROUP_SIZE, HIDDEN_DIM>(
+        m, a + row_offset * (HIDDEN_DIM/2 + HIDDEN_DIM/GROUP_SIZE*2), b, c);
+}
+
+// Elementwise ADD: c[i] = a[i] + b[i]  (residual: o_out + inpL → inpFF).
+void layer_fused_add_bf16(
+        const bfloat16 *a, const bfloat16 *b, bfloat16 *c, int32_t n) {
+    constexpr int VEC = 16;
+    int chunks = n / VEC;
+    AIE_PREPARE_FOR_PIPELINING
+    for (int i = 0; i < chunks; i++) {
+        auto va = ::aie::load_v<VEC>(a + i * VEC);
+        auto vb = ::aie::load_v<VEC>(b + i * VEC);
+        ::aie::store_v(c + i * VEC, ::aie::add(va, vb));
+    }
+    for (int i = chunks * VEC; i < n; i++) {
+        c[i] = (bfloat16)((float)a[i] + (float)b[i]);
+    }
+}
+
+// Weighted RMSNorm: output[i] = (input[i] / rms(input)) * gain[i], eps=1e-5.
+void layer_fused_rms_norm2_bf16(
+        const bfloat16 *input, const bfloat16 *gain,
+        bfloat16 *output, int32_t n) {
+    constexpr float eps = 1e-5f;
+    constexpr int VEC = 16;
+    ::aie::vector<float, VEC> acc = ::aie::zeros<float, VEC>();
+    int chunks = n / VEC;
+    for (int i = 0; i < chunks; i++) {
+        ::aie::vector<bfloat16, VEC> v = ::aie::load_v<VEC>(input + i * VEC);
+        ::aie::vector<float, VEC> sq = ::aie::mul_square(v);
+        acc = ::aie::add(acc, sq);
+    }
+    float sum_sq = ::aie::reduce_add(acc);
+    for (int i = chunks * VEC; i < n; i++) {
+        float x = (float)input[i];
+        sum_sq += x * x;
+    }
+    float inv_rms = aie::invsqrt(sum_sq / n + eps);
+    for (int i = 0; i < n; i++) {
+        output[i] = (bfloat16)((float)input[i] * inv_rms * (float)gain[i]);
+    }
+    (void)chunks;
+}
+
+}  // extern "C"
+
+// Gate/Up dual-GEMV: same INT4 dequant+GEMV as _qkv_gemv, but writes row
+// results into a static buffer (phase 0 → lf_left_buf [gate], phase 1 →
+// lf_right_buf [up]) at row_offset, so the fused silu*mul can read both.
+// K = EMBED_DIM (gate/up project E→H).
+template <uint32_t block_size, uint32_t G, uint32_t DK>
+static void _lf_dual_gemv(uint32_t m, uint32_t row_offset,
+                          const uint8_t *__restrict a_in,
+                          const bfloat16 *__restrict b_in,
+                          int phase) {
+    static_assert(block_size == 32, "block_size must be 32");
+    constexpr uint32_t groups_per_row = DK / G;
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    bfloat16 *dest = (phase == 0) ? lf_left_buf : lf_right_buf;
+    const uint4 *weights_packed = reinterpret_cast<const uint4 *>(a_in);
+    const bfloat16 *scales =
+        reinterpret_cast<const bfloat16 *>(a_in + m * DK / 2);
+    for (uint32_t row = 0; row < m; row++) {
+        const uint4 *w_row = weights_packed + row * DK / 2;
+        const bfloat16 *s_row = scales + row * groups_per_row;
+        const bfloat16 *b_ptr = b_in;
+        aie::accum<accfloat, block_size> acc = aie::zeros<accfloat, block_size>();
+        aie::vector<bfloat16, block_size> offset =
+            aie::broadcast<bfloat16, block_size>(8.0f);
+        for (uint32_t g = 0; g < groups_per_row; g++)
+            AIE_PREPARE_FOR_PIPELINING
+            {
+                bfloat16 sf = s_row[g];
+                aie::vector<bfloat16, block_size> sf_bc =
+                    aie::broadcast<bfloat16, block_size>(sf);
+                aie::vector<uint4, block_size> I0 =
+                    aie::load_v<block_size>(w_row);
+                w_row += block_size / 2;
+                aie::vector<uint8,  block_size> a8  = aie::unpack(I0);
+                aie::vector<uint16, block_size> a16 = aie::unpack(a8);
+                aie::vector<bfloat16, block_size> abf =
+                    aie::to_float<bfloat16>(a16, 0);
+                aie::vector<bfloat16, block_size> asgn = aie::sub(abf, offset);
+                aie::vector<bfloat16, block_size> w =
+                    aie::mul(asgn, sf_bc).template to_vector<bfloat16>();
+                aie::vector<bfloat16, block_size> bv =
+                    aie::load_v<block_size>(b_ptr);
+                b_ptr += block_size;
+                acc = aie::mac(acc, w, bv);
+            }
+        dest[row_offset + row] = static_cast<bfloat16>(
+            aie::reduce_add(acc.template to_vector<float>()));
+    }
+}
+
+extern "C" {
+
+// Gate/Up entry: phase 0 → lf_left_buf, phase 1 → lf_right_buf.
+void layer_fused_gate_up_bf16(
+        uint32_t m, uint32_t row_offset,
+        const uint8_t *a, const bfloat16 *b, int phase) {
+    _lf_dual_gemv<32, GROUP_SIZE, EMBED_DIM>(m, row_offset, a, b, phase);
+}
+
+// Fused SiLU*Mul: out[i] = silu(lf_left_buf[i]) * lf_right_buf[i].
+// silu(x) = x * sigmoid(x), sigmoid(x) = 0.5*(1 + tanh(x/2)).
+void layer_fused_silu_mul_bf16(bfloat16 *c_out, uint32_t m_output) {
+    constexpr int VEC = 8;
+    int chunks = (int)m_output / VEC;
+    aie::vector<bfloat16, VEC> r05 = aie::broadcast<bfloat16, VEC>(0.5f);
+    aie::vector<bfloat16, VEC> r1  = aie::broadcast<bfloat16, VEC>(1.0f);
+    AIE_PREPARE_FOR_PIPELINING
+    for (int i = 0; i < chunks; i++) {
+        aie::vector<bfloat16, VEC> l = aie::load_v<VEC>(lf_left_buf  + i * VEC);
+        aie::vector<bfloat16, VEC> r = aie::load_v<VEC>(lf_right_buf + i * VEC);
+        auto half_x = aie::mul(l, r05);
+        auto tanh_h = aie::tanh<bfloat16>(half_x.template to_vector<float>());
+        auto t_p1   = aie::add(tanh_h, r1);
+        aie::vector<bfloat16, VEC> sig =
+            aie::mul(t_p1, r05).template to_vector<bfloat16>();
+        auto silu  = aie::mul(l, sig);
+        auto fused = aie::mul(silu.template to_vector<bfloat16>(), r);
+        aie::store_v(c_out + i * VEC, fused.template to_vector<bfloat16>());
+    }
+    (void)chunks;
+}
+
+}  // extern "C"
+
+// ────────────────────────────────────────────────────────────────────────────
 // GQA attention compute (U1a per-head sequential, with streaming KV).
 //
 // Per-column work for Llama-3.2-1B:
