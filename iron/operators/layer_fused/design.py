@@ -24,7 +24,7 @@ from ml_dtypes import bfloat16
 from aie.dialects.aie import *
 from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, Buffer
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2, Tile
 
@@ -487,17 +487,17 @@ def my_layer_fused(
     cols_per_join = cols // n_join                       # 4
     join_mem_cols = [1, 5]                               # free MemTile columns
     o_out_round_ty = np.ndarray[(cols_per_join * m_input_o,), dtype_vec]  # 8 bf16
-    o_out_joined = [ObjectFifo(o_out_round_ty, name=f"o_out_joined_{g}", depth=2)
-                    for g in range(n_join)]
+    o_out_joined = [ObjectFifo(o_out_round_ty, name=f"o_out_joined_{jg}", depth=2)
+                    for jg in range(n_join)]
     Co_sub = [None] * cols
-    for g in range(n_join):
-        subs = o_out_joined[g].prod().join(
+    for jg in range(n_join):                 # NOT 'g' — would shadow group_size
+        subs = o_out_joined[jg].prod().join(
             [j * m_input_o for j in range(cols_per_join)],
             obj_types=[L1_Co_ty] * cols_per_join,
-            names=[f"Co_{g*cols_per_join + j}" for j in range(cols_per_join)],
-            placement=Tile(col=join_mem_cols[g], row=1))
+            names=[f"Co_{jg*cols_per_join + j}" for j in range(cols_per_join)],
+            placement=Tile(col=join_mem_cols[jg], row=1))
         for j in range(cols_per_join):
-            Co_sub[g * cols_per_join + j] = subs[j]
+            Co_sub[jg * cols_per_join + j] = subs[j]
 
     def o_proj_body(Ao, Bo, Co, fn):
         for _ in range_(0xFFFFFFFF):
@@ -517,6 +517,41 @@ def my_layer_fused(
                placement=Tile(col=i, row=3))
         for i in range(cols)
     ]
+
+    # ── ANM leader (P0.4-R2-F2c): ADD + post-RMS, single tile ──────────────────
+    # inpFF = o_out + inpL (into a LOCAL Buffer, not drained — final residual
+    # handled in R2-F4); ffn_in = rms_norm(inpFF) * W_norm2, drained to BO4.
+    # 1 input fifo (anm_in: 3 fills o_out/inpL/gain) + 1 output (ffn_in) keeps
+    # the leader column at 2 S2MM + 2 MM2S (with its QKV Aqkv/Cqkv).
+    add_fn = Kernel(
+        f"{func_prefix}layer_fused_add_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_E_ty, L1_E_ty, L1_E_ty, np.int32],
+    )
+    rms2_fn = Kernel(
+        f"{func_prefix}layer_fused_rms_norm2_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_E_ty, L1_E_ty, L1_E_ty, np.int32],
+    )
+    anm_in_fifo  = ObjectFifo(L1_E_ty, name="anm_in",  depth=3)
+    anm_ffi_fifo = ObjectFifo(L1_E_ty, name="anm_ffi", depth=1)
+    anm_inpff_buf = Buffer(type=L1_E_ty, name="anm_inpff_buf")
+
+    def anm_body(in_fifo, ffi_out, inpff, af, nf):
+        for _ in range_(0xFFFFFFFF):
+            sub = in_fifo.acquire(3)        # [o_out, inpL, gain]
+            s, l, gn = sub[0], sub[1], sub[2]
+            ffi = ffi_out.acquire(1)
+            af(s, l, inpff, e)              # inpFF = o_out + inpL  (local buf)
+            nf(inpff, gn, ffi, e)           # ffn_in = rms(inpFF) * gain
+            in_fifo.release(3)
+            ffi_out.release(1)
+
+    anm_worker = Worker(
+        anm_body,
+        [anm_in_fifo.cons(), anm_ffi_fifo.prod(), anm_inpff_buf, add_fn, rms2_fn],
+        placement=Tile(col=7, row=4),
+    )
 
     # ── Skeleton passthroughs DROPPED for attention budget ───────────────────
     # Tile budget: 0 pre_rms + 8 qkv + 8 attn = 16 of 16 (full). BO1
@@ -808,23 +843,35 @@ def my_layer_fused(
         sizes=[1, 1, 1, e],
         strides=[0, 0, 0, 1],
     )
+    # ── ANM TAPs (P0.4-R2-F2c) ───────────────────────────────────────────────
+    def _bo4_lin(off):
+        return TensorAccessPattern(tensor_dims=(1, bo4_elems), offset=off,
+                                   sizes=[1, 1, 1, e], strides=[0, 0, 0, 1])
+    anm_oout_tap = _bo4_lin(bo4_off_o_out)    # o_out  (BO4, written by join)
+    anm_inpL_tap = _bo4_lin(bo4_off_x)        # inpL   (BO4)
+    anm_gain_tap = TensorAccessPattern(tensor_dims=(1, bo2_bytes // 2),
+                                       offset=bo2_off_W_norm2,
+                                       sizes=[1, 1, 1, e], strides=[0, 0, 0, 1])
+    anm_ffi_tap  = _bo4_lin(bo4_off_ffn_in)   # ffn_in drain
+
     # o_out_joined[g] drains round-major [round r][col-in-group][row] → BO4
     # col-major o_out[(g*4 + col)*256 + r*m_input_o + row]. Mirror of split.
     o_out_join_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo4_elems),
-            offset=bo4_off_o_out + g * cols_per_join * rows_per_col_o,
+            offset=bo4_off_o_out + jg * cols_per_join * rows_per_col_o,
             sizes=[1, tiles_per_col_o, cols_per_join, m_input_o],
             strides=[0, m_input_o, rows_per_col_o, 1],
         )
-        for g in range(n_join)
+        for jg in range(n_join)
     ]
 
     rt = Runtime()
     with rt.sequence(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
-        rt.start(*qkv_workers, *skel_workers, *attn_workers, *o_proj_workers)
+        rt.start(*qkv_workers, *skel_workers, *attn_workers, *o_proj_workers,
+                 anm_worker)
         # ── Phase 1: pre-RMS inputs (col 0's worker does the compute) ───────
         # No drain — pre_rms_col0 kernel writes normed into the bq_l3l2
         # fifo producer slot (broadcast via MemTile) AND into a static L1
@@ -881,10 +928,19 @@ def my_layer_fused(
         for s in range(n_shim_o):
             rt.fill(ao_src_fifos[s].prod(), w_o, ao_src_taps[s], task_group=tg_o)
         rt.fill(bo_l3l2_fifo.prod(), act, attn_out_tap, task_group=tg_o)
-        for g in range(n_join):
-            rt.drain(o_out_joined[g].cons(), act, o_out_join_taps[g],
-                     task_group=tg_o, wait=(g == n_join - 1))
+        for jg in range(n_join):
+            rt.drain(o_out_joined[jg].cons(), act, o_out_join_taps[jg],
+                     task_group=tg_o, wait=(jg == n_join - 1))
         rt.finish_task_group(tg_o)
+
+        # ── Phase 6: ANM (ADD + post-RMS), DDR o_out → ffn_in (R2-F2c) ───────
+        tg_anm = rt.task_group()
+        rt.fill(anm_in_fifo.prod(), act,   anm_oout_tap, task_group=tg_anm)
+        rt.fill(anm_in_fifo.prod(), act,   anm_inpL_tap, task_group=tg_anm)
+        rt.fill(anm_in_fifo.prod(), w_ffn, anm_gain_tap, task_group=tg_anm)
+        rt.drain(anm_ffi_fifo.cons(), act, anm_ffi_tap,
+                 task_group=tg_anm, wait=True)
+        rt.finish_task_group(tg_anm)
 
         # ATTN phase deferred — will land in next step with MemTile gather.
 
