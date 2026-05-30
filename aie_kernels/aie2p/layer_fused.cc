@@ -43,6 +43,16 @@
 #define MAX_SEQ_LEN 2048
 #endif
 
+#ifndef NUM_AIE_COLUMNS
+#define NUM_AIE_COLUMNS 8
+#endif
+
+// Per-column slice of the hidden dim, used by the on-chip (decomp-B) down
+// projection: each column reduces only its HIDDEN_DIM/cols slice of silu_out
+// (kept on-chip via inter_fifo) and emits a PARTIAL EMBED_DIM vector. The
+// host sums the NUM_AIE_COLUMNS partials. This keeps silu_out off DDR (F5).
+#define INTER_DIM_PER_COL (HIDDEN_DIM / NUM_AIE_COLUMNS)
+
 extern "C" {
 
 void layer_fused_noop_bf16(bfloat16 *__restrict__ in,
@@ -354,6 +364,23 @@ void layer_fused_down_bf16(
         const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
     _qkv_gemv<32, GROUP_SIZE, HIDDEN_DIM>(
         m, a + row_offset * (HIDDEN_DIM/2 + HIDDEN_DIM/GROUP_SIZE*2), b, c);
+}
+
+// Down PARTIAL GEMV (decomp-B, on-chip FFLM-style): INT4 with K =
+// INTER_DIM_PER_COL = HIDDEN_DIM/cols. Each column reduces ONLY its
+// HIDDEN_DIM/cols slice of silu_out (delivered on-chip via inter_fifo, no
+// DDR bounce) against its weight slice W_down[:, c*K:(c+1)*K], producing a
+// PARTIAL EMBED_DIM output. The host sums the cols partials → ffn_out. The
+// weight tile a holds m rows × K/2 INT4 + m*K/group_size*2 scale bytes;
+// row_offset advances by full E rows are produced per call (m = m_input_d
+// rows of the partial-E output, with row_offset selecting the E sub-range).
+void layer_fused_down_partial_bf16(
+        uint32_t m, uint32_t row_offset,
+        const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
+    _qkv_gemv<32, GROUP_SIZE, INTER_DIM_PER_COL>(
+        m,
+        a + row_offset * (INTER_DIM_PER_COL/2 + INTER_DIM_PER_COL/GROUP_SIZE*2),
+        b, c);
 }
 
 // Elementwise ADD: c[i] = a[i] + b[i]  (residual: o_out + inpL → inpFF).

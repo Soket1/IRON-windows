@@ -72,17 +72,17 @@ def my_layer_fused(
     total_kv_one = cols * (kv_e // cols // m_input_qkv) * packed_q
     bo0_bytes  = norm_bytes + total_q + 2 * total_kv_one
 
-    m_input_o  = 1
+    m_input_o  = 2  # R2-F1: DMA BD align (4 bytes min)
     packed_o   = m_input_o * e // 2 + m_input_o * groups_e * 2
-    total_o    = cols * (e // cols) * packed_o
+    total_o    = cols * (e // cols // m_input_o) * packed_o
     bo1_bytes  = total_o
 
     m_input_gu = 4
     packed_gu  = m_input_gu * e // 2 + m_input_gu * groups_e * 2
     total_gu   = cols * 2 * (h // cols // m_input_gu) * packed_gu
-    m_input_d  = 1
+    m_input_d  = 2  # R2-F3: DMA BD align (4 bytes min)
     packed_d   = m_input_d * h // 2 + m_input_d * groups_h * 2
-    total_d    = cols * (e // cols) * packed_d
+    total_d    = cols * (e // cols // m_input_d) * packed_d
     bo2_bytes  = norm_bytes + total_gu + total_d
 
     kv_one_bytes = nkv * mx * hd * 2
@@ -91,6 +91,7 @@ def my_layer_fused(
     bo4_elems = (
         e + 2 * mx * hd + e + e + kv_e + kv_e
         + e + e + e + e + e + h + e + e
+        + cols * e  # ffn_out_partials (decomp-B: cols partial-E vectors)
     )
     bo4_bytes = bo4_elems * 2
 
@@ -106,6 +107,9 @@ def my_layer_fused(
     bo0_off_W_v     = bo0_off_W_k     + total_kv_one // 2
     # BO2: W_norm2 at offset 0, then gate, up, down.
     bo2_off_W_norm2 = 0
+    bo2_off_gate    = bo2_off_W_norm2 + e
+    bo2_off_up      = bo2_off_gate    + total_gu // 4  # gate+up interleaved, each is half
+    bo2_off_down    = bo2_off_gate    + total_gu // 2  # after both gate+up
     # BO4 layout (bf16 elements):
     bo4_off_x         = 0
     bo4_off_rope_lut  = bo4_off_x        + e
@@ -121,7 +125,9 @@ def my_layer_fused(
     bo4_off_silu_out  = bo4_off_ffn_in   + e
     bo4_off_ffn_out   = bo4_off_silu_out + h
     bo4_off_outL      = bo4_off_ffn_out  + e
-    assert bo4_off_outL + e == bo4_elems
+    # decomp-B: each down col drains a full-E partial; host sums the cols.
+    bo4_off_ffn_part  = bo4_off_outL     + e
+    assert bo4_off_ffn_part + cols * e == bo4_elems
 
     # ── L3 (DDR / runtime sequence) types ────────────────────────────────────
     L3_w_qkv  = np.ndarray[(bo0_bytes // 2,), dtype_vec]
@@ -547,11 +553,218 @@ def my_layer_fused(
             in_fifo.release(3)
             ffi_out.release(1)
 
-    anm_worker = Worker(
-        anm_body,
-        [anm_in_fifo.cons(), anm_ffi_fifo.prod(), anm_inpff_buf, add_fn, rms2_fn],
-        placement=Tile(col=7, row=4),
+    # anm_worker FOLDED into gate_up col-0 worker (R2-F3): the layer needs
+    # 33 core tiles (qkv8 + o_proj8 + anm1 + gate_up8 + down8) but AIE2P has
+    # only 32 (4 core rows × 8 cols). The ANM leader's ADD+RMS runs ONCE per
+    # dispatch and is sequenced (tg_anm) strictly before gate/up (tg_gu), so
+    # it temporally shares col-0's gate_up tile — the FFLM tile-reuse idiom.
+    # The ANM phase drains ffn_in to BO4; tg_gu then broadcasts it back. The
+    # task_group barrier guarantees ANM finishes before the broadcast fill.
+
+    # ── SwiGLU stage (P0.4-R2-F3): gate/up dual GEMV + silu*mul + down ──────────
+    # Mirrors the PROVEN post_attn_fused convention (cols=4 reference), adapted
+    # to cols=8 via MemTile weight split (shim S2MM cap). Per tile: gate GEMV
+    # (phase 0 → kernel static lf_left_buf), up GEMV (phase 1 → lf_right_buf),
+    # then silu_mul(left,right) → Cgu slice. ffn_in broadcast via forward;
+    # silu_out drained PER-COLUMN to BO4 (8 MM2S ≤ 16 per-task-group cap, so no
+    # join needed). down: K=H, silu_out broadcast, ffn_out per-col drain.
+    #
+    # BO2 gate/up layout (xdna_pack_layer_fused_w_ffn): per col, tiles are
+    # interleaved [gate_t0|up_t0|gate_t1|up_t1|...]. So each col's weight
+    # stream = 2*tiles_per_col_gu tiles of packed_gu_tile bytes. The MemTile
+    # split must route 2 consecutive tiles (gate,up of round t) — handled by
+    # the worker acquiring twice from its per-col sub-fifo.
+    rows_per_col_gu  = h // cols                       # 1024
+    tiles_per_col_gu = rows_per_col_gu // m_input_gu   # 256
+    packed_gu_tile   = m_input_gu * e // 2 + m_input_gu * groups_e * 2
+    bytes_col_gu     = 2 * tiles_per_col_gu * packed_gu_tile  # gate+up
+    n_shim_gu        = 1
+    cols_per_shim_gu = cols // n_shim_gu               # 8 (split 1→8, saves shim S2MM)
+
+    rows_per_col_d   = e // cols                       # 256
+    tiles_per_col_d  = rows_per_col_d // m_input_d     # 128
+    packed_d_tile    = m_input_d * h // 2 + m_input_d * groups_h * 2
+    bytes_col_d      = tiles_per_col_d * packed_d_tile
+    n_shim_d         = 2
+    cols_per_shim_d  = cols // n_shim_d                # 4
+
+    # ── decomp-B (on-chip FFLM): down with K = INTER_DIM_PER_COL = H/cols ──────
+    # Each column reduces ONLY its 1024-elem silu slice (kept on-chip via
+    # inter_fifo, NO BO4 bounce) against W_down[:, c*K:(c+1)*K], producing a
+    # PARTIAL E vector. Host sums the cols partials → ffn_out. silu_mul writes
+    # the FULL per-col slice (1024) into inter_fifo in one shot.
+    inter_dim_per_col = h // cols                       # 1024 = K for down-B
+    # down-B weight tile: m_input_dp rows × (K/2 INT4 + K/g*2 scale) bytes.
+    m_input_dp        = 2                               # DMA BD align (4 B drain)
+    rows_per_col_dp   = e                               # 2048 (FULL E partial)
+    tiles_per_col_dp  = rows_per_col_dp // m_input_dp   # 1024
+    groups_inter      = inter_dim_per_col // g          # 32
+    packed_dp_tile    = m_input_dp * inter_dim_per_col // 2 + m_input_dp * groups_inter * 2
+    bytes_col_dp      = tiles_per_col_dp * packed_dp_tile
+    n_shim_dp         = 1
+    cols_per_shim_dp  = cols // n_shim_dp               # 8 (split 1→8, saves shim S2MM)
+
+    L1_Agu_ty   = np.ndarray[(packed_gu_tile,), dtype_packed]            # 1 tile
+    Agu_src_ty  = np.ndarray[(cols_per_shim_gu * packed_gu_tile,), dtype_packed]  # 1 round
+    L1_Bgu_ty   = np.ndarray[(e,), dtype_vec]
+    # silu slice carried on-chip to down-B (full per-col 1024 elements).
+    L1_inter_ty = np.ndarray[(inter_dim_per_col,), dtype_vec]
+    # down-B: weight tile, silu input (held = inter), partial-E output slice.
+    L1_Adp_ty   = np.ndarray[(packed_dp_tile,), dtype_packed]
+    Adp_src_ty  = np.ndarray[(cols_per_shim_dp * packed_dp_tile,), dtype_packed]
+    L1_Cdp_ty   = np.ndarray[(m_input_dp,), dtype_vec]
+
+    gate_up_fn = Kernel(
+        f"{func_prefix}layer_fused_gate_up_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.int32, np.int32, L1_Agu_ty, L1_Bgu_ty, np.int32],
     )
+    silu_mul_fn = Kernel(
+        f"{func_prefix}layer_fused_silu_mul_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [L1_inter_ty, np.int32],
+    )
+    down_fn = Kernel(
+        f"{func_prefix}layer_fused_down_partial_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.int32, np.int32, L1_Adp_ty, L1_inter_ty, L1_Cdp_ty],
+    )
+
+    # gate/up weights split (mirrors the proven O_proj split): the shim
+    # source L2 buffer holds ONE ROUND = cols_per_shim_gu tiles; split routes
+    # tile j to col j's compute tile. The agu_src_taps TAP streams
+    # 2*tiles_per_col_gu rounds (the interleaved [g0|u0|g1|u1...] BO2 layout),
+    # so each col's worker sees gate,up,gate,up,... on successive acquires.
+    agu_src_fifos = [ObjectFifo(Agu_src_ty, name=f"Agu_src_{s}", depth=2)
+                     for s in range(n_shim_gu)]
+    Agu_sub = [None] * cols
+    for s in range(n_shim_gu):
+        subs = agu_src_fifos[s].cons().split(
+            [j * packed_gu_tile for j in range(cols_per_shim_gu)],
+            obj_types=[L1_Agu_ty] * cols_per_shim_gu,
+            names=[f"Agu_{s*cols_per_shim_gu + j}" for j in range(cols_per_shim_gu)],
+            placement=Tile(col=2 + 2 * s, row=1))
+        for j in range(cols_per_shim_gu):
+            Agu_sub[s * cols_per_shim_gu + j] = subs[j]
+
+    # ffn_in broadcast (E bf16) from BO4
+    ffi_l3l2_fifo = ObjectFifo(L1_Bgu_ty, name="ffi_L3L2", depth=1)
+    ffi_mem_fifo  = ffi_l3l2_fifo.cons().forward(
+        name="ffi_mem", depth=1, placement=Tile(col=6, row=1))
+
+    # ── inter_fifos: gate/up silu → down, ON-CHIP (decomp-B, no DDR bounce) ────
+    # prod() on the gate/up worker (col i), cons() on the down worker (col i).
+    # IRON routes this compute-tile → compute-tile stream WITHOUT a MemTile
+    # placement or BO4 drain — the donor swiglu_fused_decode idiom (F5 lever).
+    # depth=2 so gate/up can start the next token's slice while down consumes.
+    inter_fifos = [ObjectFifo(L1_inter_ty, name=f"inter_{i}", depth=2)
+                   for i in range(cols)]
+
+    # gate/up body (decomp-B): accumulate ALL gate tiles → lf_left_buf,
+    # ALL up tiles → lf_right_buf (per-tile m_input_gu rows at row_offset),
+    # then ONE silu_mul over the full 1024-elem slice → inter_fifo.
+    def gate_up_body(Agu, Bgu, Inter, gu_fn, sm_fn):
+        for _ in range_(0xFFFFFFFF):
+            b = Bgu.acquire(1)
+            # interleaved stream [g0|u0|g1|u1...]: gate phase writes left_buf
+            # at advancing row_offset, up phase writes right_buf.
+            ro = 0
+            for _ in range_(tiles_per_col_gu):
+                a_g = Agu.acquire(1)
+                gu_fn(m_input_gu, ro, a_g, b, 0)   # gate -> lf_left_buf[ro:]
+                Agu.release(1)
+                a_u = Agu.acquire(1)
+                gu_fn(m_input_gu, ro, a_u, b, 1)   # up   -> lf_right_buf[ro:]
+                Agu.release(1)
+                ro += m_input_gu
+            inter = Inter.acquire(1)
+            sm_fn(inter, inter_dim_per_col)        # silu(left)*right -> inter
+            Inter.release(1)
+            Bgu.release(1)
+
+    # col-0 variant: folded ANM (ADD+post-RMS) FIRST (sequenced by tg_anm
+    # before tg_gu), then the gate/up decomp-B loop. Frees the standalone ANM
+    # tile so the layer fits 32 core tiles (qkv8 + o_proj8 + gate_up8 + down8).
+    def gate_up_anm_body(anm_in, anm_ffi, inpff, af, nf,
+                         Agu, Bgu, Inter, gu_fn, sm_fn):
+        for _ in range_(0xFFFFFFFF):
+            # ── ANM (one shot per dispatch) ──
+            sub = anm_in.acquire(3)        # [o_out, inpL, gain]
+            ffi = anm_ffi.acquire(1)
+            af(sub[0], sub[1], inpff, e)   # inpFF = o_out + inpL (local buf)
+            nf(inpff, sub[2], ffi, e)      # ffn_in = rms(inpFF) * gain
+            anm_in.release(3)
+            anm_ffi.release(1)
+            # ── gate/up decomp-B (blocks on Bgu until tg_gu broadcasts ffn_in) ──
+            b = Bgu.acquire(1)
+            ro = 0
+            for _ in range_(tiles_per_col_gu):
+                a_g = Agu.acquire(1)
+                gu_fn(m_input_gu, ro, a_g, b, 0)
+                Agu.release(1)
+                a_u = Agu.acquire(1)
+                gu_fn(m_input_gu, ro, a_u, b, 1)
+                Agu.release(1)
+                ro += m_input_gu
+            inter = Inter.acquire(1)
+            sm_fn(inter, inter_dim_per_col)
+            Inter.release(1)
+            Bgu.release(1)
+
+    gate_up_workers = [
+        Worker(gate_up_anm_body,
+               [anm_in_fifo.cons(), anm_ffi_fifo.prod(), anm_inpff_buf,
+                add_fn, rms2_fn,
+                Agu_sub[0].cons(), ffi_mem_fifo.cons(),
+                inter_fifos[0].prod(), gate_up_fn, silu_mul_fn],
+               placement=Tile(col=0, row=4))
+    ] + [
+        Worker(gate_up_body,
+               [Agu_sub[i].cons(), ffi_mem_fifo.cons(),
+                inter_fifos[i].prod(), gate_up_fn, silu_mul_fn],
+               placement=Tile(col=i, row=4))
+        for i in range(1, cols)
+    ]
+
+    # down-B weights split: W_down[:, c*K:(c+1)*K] per col, K=inter_dim_per_col.
+    # Each shim source carries cols_per_shim_dp full col streams.
+    adp_src_fifos = [ObjectFifo(Adp_src_ty, name=f"Adp_src_{s}", depth=2)
+                     for s in range(n_shim_dp)]
+    Adp_sub = [None] * cols
+    col_stream_dp = tiles_per_col_dp * packed_dp_tile
+    for s in range(n_shim_dp):
+        subs = adp_src_fifos[s].cons().split(
+            [j * packed_dp_tile for j in range(cols_per_shim_dp)],
+            obj_types=[L1_Adp_ty] * cols_per_shim_dp,
+            names=[f"Adp_{s*cols_per_shim_dp + j}" for j in range(cols_per_shim_dp)],
+            placement=Tile(col=1 + 2 * s, row=1))
+        for j in range(cols_per_shim_dp):
+            Adp_sub[s * cols_per_shim_dp + j] = subs[j]
+
+    # ffn_out PARTIAL per-col drain: each col writes a full-E partial vector.
+    # Host sums the cols partials → ffn_out. Cdp carries m_input_dp slices.
+    Cdp_fifos = [ObjectFifo(L1_Cdp_ty, name=f"Cdp_{i}", depth=2) for i in range(cols)]
+
+    # down-B body: hold the col's silu slice (inter, from gate/up ON-CHIP),
+    # GEMV against W_down[:, c-slice] (K=inter_dim_per_col) → partial E.
+    def down_body(Adp, Inter, Cdp, fn):
+        for _ in range_(0xFFFFFFFF):
+            b = Inter.acquire(1)               # this col's 1024 silu elems
+            for _ in range_(tiles_per_col_dp):
+                a = Adp.acquire(1)
+                c = Cdp.acquire(1)
+                fn(m_input_dp, 0, a, b, c)
+                Adp.release(1)
+                Cdp.release(1)
+            Inter.release(1)
+
+    down_workers = [
+        Worker(down_body,
+               [Adp_sub[i].cons(), inter_fifos[i].cons(),
+                Cdp_fifos[i].prod(), down_fn],
+               placement=Tile(col=i, row=5))
+        for i in range(cols)
+    ]
 
     # ── Skeleton passthroughs DROPPED for attention budget ───────────────────
     # Tile budget: 0 pre_rms + 8 qkv + 8 attn = 16 of 16 (full). BO1
@@ -854,6 +1067,49 @@ def my_layer_fused(
                                        sizes=[1, 1, 1, e], strides=[0, 0, 0, 1])
     anm_ffi_tap  = _bo4_lin(bo4_off_ffn_in)   # ffn_in drain
 
+    # ── SwiGLU TAPs (P0.4-R2-F3, decomp-B on-chip) ───────────────────────────
+    # gate/up weights: BO2 interleaved [g0|u0|g1|u1...] per col, stride
+    # bytes_col_gu between cols. The split L2 source holds ONE round
+    # (cols_per_shim_gu tiles); this TAP streams 2*tiles_per_col_gu rounds —
+    # round r reads tile r of each of this shim's cols (gate when r even, up
+    # when r odd, matching the interleave). Mirrors the O_proj split TAP.
+    agu_src_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo2_bytes // 2),
+            offset=bo2_off_gate + s * cols_per_shim_gu * (bytes_col_gu // 2),
+            sizes=[1, 2 * tiles_per_col_gu, cols_per_shim_gu, packed_gu_tile // 2],
+            strides=[0, packed_gu_tile // 2, bytes_col_gu // 2, 1],
+        )
+        for s in range(n_shim_gu)
+    ]
+    ffn_in_tap = _bo4_lin(bo4_off_ffn_in)
+
+    # down-B weights: W_down packed per-col (K=inter_dim_per_col slice). Split
+    # L2 source holds ONE round (cols_per_shim_dp tiles); TAP streams
+    # tiles_per_col_dp rounds.
+    adp_src_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo2_bytes // 2),
+            offset=bo2_off_down + s * cols_per_shim_dp * (bytes_col_dp // 2),
+            sizes=[1, tiles_per_col_dp, cols_per_shim_dp, packed_dp_tile // 2],
+            strides=[0, packed_dp_tile // 2, bytes_col_dp // 2, 1],
+        )
+        for s in range(n_shim_dp)
+    ]
+
+    # ffn_out partial drains: col i writes a full-E partial → BO4 partials
+    # region at offset i*E. Cdp carries m_input_dp-row slices; reorder TAP
+    # walks tiles_per_col_dp rounds.
+    ffn_part_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo4_elems),
+            offset=bo4_off_ffn_part + i * e,
+            sizes=[1, 1, tiles_per_col_dp, m_input_dp],
+            strides=[0, 0, m_input_dp, 1],
+        )
+        for i in range(cols)
+    ]
+
     # o_out_joined[g] drains round-major [round r][col-in-group][row] → BO4
     # col-major o_out[(g*4 + col)*256 + r*m_input_o + row]. Mirror of split.
     o_out_join_taps = [
@@ -871,7 +1127,7 @@ def my_layer_fused(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
         rt.start(*qkv_workers, *skel_workers, *attn_workers, *o_proj_workers,
-                 anm_worker)
+                 *gate_up_workers, *down_workers)
         # ── Phase 1: pre-RMS inputs (col 0's worker does the compute) ───────
         # No drain — pre_rms_col0 kernel writes normed into the bq_l3l2
         # fifo producer slot (broadcast via MemTile) AND into a static L1
@@ -941,6 +1197,22 @@ def my_layer_fused(
         rt.drain(anm_ffi_fifo.cons(), act, anm_ffi_tap,
                  task_group=tg_anm, wait=True)
         rt.finish_task_group(tg_anm)
+
+        # ── Phase 7: SwiGLU gate/up + silu → down (decomp-B, ON-CHIP) ────────
+        # silu_out is NOT drained to DDR — it flows gate/up → down via the
+        # per-col inter_fifo (compute-tile → compute-tile stream, F5 lever).
+        # gate/up and down run in ONE task_group (the inter_fifo couples them);
+        # only the FINAL ffn_out partials drain. Host sums the cols partials.
+        tg_ffn = rt.task_group()
+        for s in range(n_shim_gu):
+            rt.fill(agu_src_fifos[s].prod(), w_ffn, agu_src_taps[s], task_group=tg_ffn)
+        rt.fill(ffi_l3l2_fifo.prod(), act, ffn_in_tap, task_group=tg_ffn)
+        for s in range(n_shim_dp):
+            rt.fill(adp_src_fifos[s].prod(), w_ffn, adp_src_taps[s], task_group=tg_ffn)
+        for i in range(cols):
+            rt.drain(Cdp_fifos[i].cons(), act, ffn_part_taps[i],
+                     task_group=tg_ffn, wait=(i == cols - 1))
+        rt.finish_task_group(tg_ffn)
 
         # ATTN phase deferred — will land in next step with MemTile gather.
 
