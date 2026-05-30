@@ -205,7 +205,7 @@ class LayerFusedMLIR(MLIROperator):
         #         q_rot [E] | k_rot [kv_e] | v [kv_e] |
         #         attn_out [E] | o_proj_out [E] | inpFF [E] |
         #         normed [E] | ffn_in [E] | silu_out [H] | ffn_out [E] |
-        #         outL [E]
+        #         outL [E] | ffn_out_partials [cols*E]
         bo4_elems = (
             e                            # x
             + 2 * mx * hd                # rope_lut (sin, cos per pos × head_dim)
@@ -221,6 +221,7 @@ class LayerFusedMLIR(MLIROperator):
             + h                          # silu_out
             + e                          # ffn_out
             + e                          # outL
+            + c * e                      # ffn_out_partials (decomp-B: cols partial-E vectors)
         )
         bo4_bytes = bo4_elems * 2
         return bo0_bytes, bo1_bytes, bo2_bytes, bo3_bytes, bo4_bytes, bo4_elems

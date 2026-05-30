@@ -361,14 +361,54 @@ def my_layer_fused(
     # central distribution).
     bq_mem_fifo  = bq_l3l2_fifo.cons().forward(
         name="bq_mem", depth=1, placement=Tile(col=4, row=1))
-    Cqkv_fifos = [ObjectFifo(L1_Cq_ty, name=f"Cqkv_{i}", depth=2) for i in range(cols)]
+    # Cross-column MemTile join for QKV outputs.
+    # 3 fifos (Q/K/V) × 2 cols per MemTile = 6 S2MM per MemTile (= cap).
+    # 4 groups of 2 cols → 4 MM2S total for Q, 4 for K, 4 for V = 12 MM2S.
+    n_join_qkv        = 4
+    cols_per_join_qkv = cols // n_join_qkv          # 2
+    join_mem_cols_qkv = [0, 3, 4, 7]                # one free MemTile per group
+    Cq_round_ty  = np.ndarray[(cols_per_join_qkv * m_input_qkv,), dtype_vec]
+    Ck_round_ty  = np.ndarray[(cols_per_join_qkv * m_input_qkv,), dtype_vec]
+    Cv_round_ty  = np.ndarray[(cols_per_join_qkv * m_input_qkv,), dtype_vec]
+    Cq_joined = [ObjectFifo(Cq_round_ty, name=f"Cq_joined_{jg}", depth=2)
+                 for jg in range(n_join_qkv)]
+    Ck_joined = [ObjectFifo(Ck_round_ty, name=f"Ck_joined_{jg}", depth=2)
+                 for jg in range(n_join_qkv)]
+    Cv_joined = [ObjectFifo(Cv_round_ty, name=f"Cv_joined_{jg}", depth=2)
+                 for jg in range(n_join_qkv)]
+    Cq_sub = [None] * cols
+    Ck_sub = [None] * cols
+    Cv_sub = [None] * cols
+    for jg in range(n_join_qkv):
+        subs = Cq_joined[jg].prod().join(
+            [j * m_input_qkv for j in range(cols_per_join_qkv)],
+            obj_types=[L1_Cq_ty] * cols_per_join_qkv,
+            names=[f"Cq_{jg*cols_per_join_qkv + j}" for j in range(cols_per_join_qkv)],
+            placement=Tile(col=join_mem_cols_qkv[jg], row=1))
+        for j in range(cols_per_join_qkv):
+            Cq_sub[jg * cols_per_join_qkv + j] = subs[j]
+        subs = Ck_joined[jg].prod().join(
+            [j * m_input_qkv for j in range(cols_per_join_qkv)],
+            obj_types=[L1_Cq_ty] * cols_per_join_qkv,
+            names=[f"Ck_{jg*cols_per_join_qkv + j}" for j in range(cols_per_join_qkv)],
+            placement=Tile(col=join_mem_cols_qkv[jg], row=1))
+        for j in range(cols_per_join_qkv):
+            Ck_sub[jg * cols_per_join_qkv + j] = subs[j]
+        subs = Cv_joined[jg].prod().join(
+            [j * m_input_qkv for j in range(cols_per_join_qkv)],
+            obj_types=[L1_Cq_ty] * cols_per_join_qkv,
+            names=[f"Cv_{jg*cols_per_join_qkv + j}" for j in range(cols_per_join_qkv)],
+            placement=Tile(col=join_mem_cols_qkv[jg], row=1))
+        for j in range(cols_per_join_qkv):
+            Cv_sub[jg * cols_per_join_qkv + j] = subs[j]
 
     # ── Worker bodies ────────────────────────────────────────────────────────
     # Col 0: 4-phase body (pre-RMS → Q → K → V). Pre-RMS writes to BOTH the
     # static L1 buffer (consumed by qkv_gemv_static below) AND to the bq
     # fifo prod slot (broadcast). QKV phases use the static-input variant
     # so col 0's tile stays at 2 input channels (rms_in + Aqkv).
-    def col0_body(rms_in, bq_prod, Aqkv, Cqkv, pre_rms_fn, qkv_static_fn):
+    # Col 0: separate Q/K/V output fifos (Cq/Ck/Cv sub-fifos from cross-col join).
+    def col0_body(rms_in, bq_prod, Aqkv, Cq, Ck, Cv, pre_rms_fn, qkv_static_fn):
         for _ in range_(0xFFFFFFFF):
             # Pre-RMS phase
             sub = rms_in.acquire(2)
@@ -381,64 +421,64 @@ def my_layer_fused(
             # Q phase (static-input GEMV, no B fifo acquire)
             for _ in range_(tiles_per_col_q):
                 a = Aqkv.acquire(1)
-                c = Cqkv.acquire(1)
+                c = Cq.acquire(1)
                 qkv_static_fn(m_input_qkv, 0, a, c)
                 Aqkv.release(1)
-                Cqkv.release(1)
+                Cq.release(1)
             # K phase
             for _ in range_(tiles_per_col_kv):
                 a = Aqkv.acquire(1)
-                c = Cqkv.acquire(1)
+                c = Ck.acquire(1)
                 qkv_static_fn(m_input_qkv, 0, a, c)
                 Aqkv.release(1)
-                Cqkv.release(1)
+                Ck.release(1)
             # V phase
             for _ in range_(tiles_per_col_kv):
                 a = Aqkv.acquire(1)
-                c = Cqkv.acquire(1)
+                c = Cv.acquire(1)
                 qkv_static_fn(m_input_qkv, 0, a, c)
                 Aqkv.release(1)
-                Cqkv.release(1)
+                Cv.release(1)
 
-    # Cols 1-7: 3-phase body. Acquire B (bq_mem broadcast) ONCE per outer
-    # iter, reuse for all three QKV phases. (Was acquire/release per phase,
-    # but with col 0 producing bq once and depth=1, multi-acquire deadlocks.)
-    def colN_body(A, B, C, fn):
+    # Cols 1-7: separate Q/K/V output fifos.
+    def colN_body(A, B, Cq, Ck, Cv, fn):
         for _ in range_(0xFFFFFFFF):
             b = B.acquire(1)
             # Q phase
             for _ in range_(tiles_per_col_q):
                 a = A.acquire(1)
-                c = C.acquire(1)
+                c = Cq.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
                 A.release(1)
-                C.release(1)
+                Cq.release(1)
             # K phase
             for _ in range_(tiles_per_col_kv):
                 a = A.acquire(1)
-                c = C.acquire(1)
+                c = Ck.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
                 A.release(1)
-                C.release(1)
+                Ck.release(1)
             # V phase
             for _ in range_(tiles_per_col_kv):
                 a = A.acquire(1)
-                c = C.acquire(1)
+                c = Cv.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
                 A.release(1)
-                C.release(1)
+                Cv.release(1)
             B.release(1)
 
     col0_worker = Worker(
         col0_body,
         [rms_in_fifo.cons(), bq_l3l2_fifo.prod(),
-         Aqkv_fifos[0].cons(), Cqkv_fifos[0].prod(),
+         Aqkv_fifos[0].cons(),
+         Cq_sub[0].prod(), Ck_sub[0].prod(), Cv_sub[0].prod(),
          pre_rms_col0_fn, qkv_gemv_static_fn],
     )
     qkv_workers_rest = [
         Worker(colN_body,
                [Aqkv_fifos[i].cons(), bq_mem_fifo.cons(),
-                Cqkv_fifos[i].prod(), qkv_gemv_fn])
+                Cq_sub[i].prod(), Ck_sub[i].prod(), Cv_sub[i].prod(),
+                qkv_gemv_fn])
         for i in range(1, cols)
     ]
     qkv_workers = [col0_worker] + qkv_workers_rest
@@ -477,10 +517,15 @@ def my_layer_fused(
             placement=Tile(col=2 + 2 * s, row=1))   # MemTile cols 2,4
         for j in range(cols_per_shim):
             Ao_sub[s * cols_per_shim + j] = subs[j]
-    # attn_out broadcast (E bf16) from BO4.
+    # attn_out broadcast (E bf16) from BO4 → O_proj workers: 1 shim S2MM.
     bo_l3l2_fifo = ObjectFifo(L1_Bo_ty, name="bo_L3L2", depth=1)
     bo_mem_fifo  = bo_l3l2_fifo.cons().forward(
         name="bo_mem", depth=1, placement=Tile(col=6, row=1))
+    # ffn_in broadcast: ANM worker writes directly into this fifo (no shim fill).
+    # gate/up workers consume via ffi_mem_fifo forward. 0 shim S2MM, 0 MM2S.
+    ffi_l3l2_fifo = ObjectFifo(L1_Bo_ty, name="ffi_L3L2", depth=1)
+    ffi_mem_fifo  = ffi_l3l2_fifo.cons().forward(
+        name="ffi_mem", depth=1, placement=Tile(col=6, row=1))
     # P0.4-R2-F2b: O_proj outputs joined ON-CHIP at a MemTile (gather 8 cols
     # → one E vector) instead of 8 separate DDR drains. Each join "round"
     # assembles one tile (m_input_o rows) from each of the 8 cols; the joined
@@ -540,7 +585,8 @@ def my_layer_fused(
         [L1_E_ty, L1_E_ty, L1_E_ty, np.int32],
     )
     anm_in_fifo  = ObjectFifo(L1_E_ty, name="anm_in",  depth=3)
-    anm_ffi_fifo = ObjectFifo(L1_E_ty, name="anm_ffi", depth=1)
+    # ANM writes ffn_in directly into ffi_l3l2_fifo (no shim drain).
+    # gate/up workers consume via ffi_mem_fifo forward. Saves 1 MM2S.
     anm_inpff_buf = Buffer(type=L1_E_ty, name="anm_inpff_buf")
 
     def anm_body(in_fifo, ffi_out, inpff, af, nf):
@@ -578,8 +624,8 @@ def my_layer_fused(
     tiles_per_col_gu = rows_per_col_gu // m_input_gu   # 256
     packed_gu_tile   = m_input_gu * e // 2 + m_input_gu * groups_e * 2
     bytes_col_gu     = 2 * tiles_per_col_gu * packed_gu_tile  # gate+up
-    n_shim_gu        = 1
-    cols_per_shim_gu = cols // n_shim_gu               # 8 (split 1→8, saves shim S2MM)
+    n_shim_gu        = 2
+    cols_per_shim_gu = cols // n_shim_gu               # 4 (split 2→4, ≤6 MM2S per MemTile)
 
     rows_per_col_d   = e // cols                       # 256
     tiles_per_col_d  = rows_per_col_d // m_input_d     # 128
@@ -635,6 +681,7 @@ def my_layer_fused(
     # tile j to col j's compute tile. The agu_src_taps TAP streams
     # 2*tiles_per_col_gu rounds (the interleaved [g0|u0|g1|u1...] BO2 layout),
     # so each col's worker sees gate,up,gate,up,... on successive acquires.
+    agu_mem_cols     = [2, 5]                            # cols 2,5 — each gets 4 MM2S
     agu_src_fifos = [ObjectFifo(Agu_src_ty, name=f"Agu_src_{s}", depth=2)
                      for s in range(n_shim_gu)]
     Agu_sub = [None] * cols
@@ -643,14 +690,12 @@ def my_layer_fused(
             [j * packed_gu_tile for j in range(cols_per_shim_gu)],
             obj_types=[L1_Agu_ty] * cols_per_shim_gu,
             names=[f"Agu_{s*cols_per_shim_gu + j}" for j in range(cols_per_shim_gu)],
-            placement=Tile(col=2 + 2 * s, row=1))
+            placement=Tile(col=agu_mem_cols[s], row=1))
         for j in range(cols_per_shim_gu):
             Agu_sub[s * cols_per_shim_gu + j] = subs[j]
 
     # ffn_in broadcast (E bf16) from BO4
-    ffi_l3l2_fifo = ObjectFifo(L1_Bgu_ty, name="ffi_L3L2", depth=1)
-    ffi_mem_fifo  = ffi_l3l2_fifo.cons().forward(
-        name="ffi_mem", depth=1, placement=Tile(col=6, row=1))
+    # ffi_l3l2_fifo declared above; ANM worker writes ffn_in directly into it.
 
     # ── inter_fifos: gate/up silu → down, ON-CHIP (decomp-B, no DDR bounce) ────
     # prod() on the gate/up worker (col i), cons() on the down worker (col i).
@@ -713,7 +758,7 @@ def my_layer_fused(
 
     gate_up_workers = [
         Worker(gate_up_anm_body,
-               [anm_in_fifo.cons(), anm_ffi_fifo.prod(), anm_inpff_buf,
+               [anm_in_fifo.cons(), ffi_l3l2_fifo.prod(), anm_inpff_buf,
                 add_fn, rms2_fn,
                 Agu_sub[0].cons(), ffi_mem_fifo.cons(),
                 inter_fifos[0].prod(), gate_up_fn, silu_mul_fn],
@@ -741,9 +786,23 @@ def my_layer_fused(
         for j in range(cols_per_shim_dp):
             Adp_sub[s * cols_per_shim_dp + j] = subs[j]
 
-    # ffn_out PARTIAL per-col drain: each col writes a full-E partial vector.
-    # Host sums the cols partials → ffn_out. Cdp carries m_input_dp slices.
-    Cdp_fifos = [ObjectFifo(L1_Cdp_ty, name=f"Cdp_{i}", depth=2) for i in range(cols)]
+    # Cross-column MemTile join for down partial outputs — mirrors O_proj R2-F2b.
+    # 8 per-col drains → 2 groups of 4 cols → 2 MM2S (vs 8 direct MM2S).
+    n_join_dp     = 2
+    cols_per_join_dp  = cols // n_join_dp               # 4
+    join_mem_cols_dp  = [3, 4]                           # free MemTile cols
+    Cdp_round_ty  = np.ndarray[(cols_per_join_dp * m_input_dp,), dtype_vec]
+    Cdp_joined = [ObjectFifo(Cdp_round_ty, name=f"Cdp_joined_{jg}", depth=2)
+                  for jg in range(n_join_dp)]
+    Cdp_sub = [None] * cols
+    for jg in range(n_join_dp):
+        subs = Cdp_joined[jg].prod().join(
+            [j * m_input_dp for j in range(cols_per_join_dp)],
+            obj_types=[L1_Cdp_ty] * cols_per_join_dp,
+            names=[f"Cdp_{jg*cols_per_join_dp + j}" for j in range(cols_per_join_dp)],
+            placement=Tile(col=join_mem_cols_dp[jg], row=1))
+        for j in range(cols_per_join_dp):
+            Cdp_sub[jg * cols_per_join_dp + j] = subs[j]
 
     # down-B body: hold the col's silu slice (inter, from gate/up ON-CHIP),
     # GEMV against W_down[:, c-slice] (K=inter_dim_per_col) → partial E.
@@ -761,7 +820,7 @@ def my_layer_fused(
     down_workers = [
         Worker(down_body,
                [Adp_sub[i].cons(), inter_fifos[i].cons(),
-                Cdp_fifos[i].prod(), down_fn],
+                Cdp_sub[i].prod(), down_fn],
                placement=Tile(col=i, row=5))
         for i in range(cols)
     ]
@@ -1005,36 +1064,37 @@ def my_layer_fused(
         sizes=[1, 1, 1, e],
         strides=[0, 0, 0, 1],
     )
-    # Cq drains: each col writes rows_per_col_q bf16 elements into BO4
-    # q_rot region (will be RoPE'd in stage 2d).
-    Cq_taps = [
+    # Cq_join_taps: joined drain for Q output — round-major layout.
+    # Each round = cols_per_join_qkv cols × m_input_qkv rows, written to
+    # BO4 q_rot region. Group jg covers cols [jg*4 .. jg*4+3].
+    Cq_join_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo4_elems),
-            offset=bo4_off_q_rot + i * rows_per_col_q,
-            sizes=[1, 1, tiles_per_col_q, rows_per_col_q // tiles_per_col_q],
-            strides=[0, 0, rows_per_col_q // tiles_per_col_q, 1],
+            offset=bo4_off_q_rot + jg * cols_per_join_qkv * rows_per_col_q,
+            sizes=[1, tiles_per_col_q, cols_per_join_qkv, m_input_qkv],
+            strides=[0, m_input_qkv, rows_per_col_q, 1],
         )
-        for i in range(cols)
+        for jg in range(n_join_qkv)
     ]
-    # Ck drains: BO4 k_rot region; rows_per_col_kv per col.
-    Ck_taps = [
+    # Ck_join_taps: joined drain for K output → BO4 k_rot region.
+    Ck_join_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo4_elems),
-            offset=bo4_off_k_rot + i * rows_per_col_kv,
-            sizes=[1, 1, tiles_per_col_kv, rows_per_col_kv // tiles_per_col_kv],
-            strides=[0, 0, rows_per_col_kv // tiles_per_col_kv, 1],
+            offset=bo4_off_k_rot + jg * cols_per_join_qkv * rows_per_col_kv,
+            sizes=[1, tiles_per_col_kv, cols_per_join_qkv, m_input_qkv],
+            strides=[0, m_input_qkv, rows_per_col_kv, 1],
         )
-        for i in range(cols)
+        for jg in range(n_join_qkv)
     ]
-    # Cv drains: BO4 v region (V doesn't get RoPE'd, goes straight to KV slot).
-    Cv_taps = [
+    # Cv_join_taps: joined drain for V output → BO4 v region.
+    Cv_join_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo4_elems),
-            offset=bo4_off_v + i * rows_per_col_kv,
-            sizes=[1, 1, tiles_per_col_kv, rows_per_col_kv // tiles_per_col_kv],
-            strides=[0, 0, rows_per_col_kv // tiles_per_col_kv, 1],
+            offset=bo4_off_v + jg * cols_per_join_qkv * rows_per_col_kv,
+            sizes=[1, tiles_per_col_kv, cols_per_join_qkv, m_input_qkv],
+            strides=[0, m_input_qkv, rows_per_col_kv, 1],
         )
-        for i in range(cols)
+        for jg in range(n_join_qkv)
     ]
 
     # ── O_proj TAPs (P0.4-R2-F1) ─────────────────────────────────────────────
@@ -1097,17 +1157,17 @@ def my_layer_fused(
         for s in range(n_shim_dp)
     ]
 
-    # ffn_out partial drains: col i writes a full-E partial → BO4 partials
-    # region at offset i*E. Cdp carries m_input_dp-row slices; reorder TAP
-    # walks tiles_per_col_dp rounds.
-    ffn_part_taps = [
+    # ffn_out partial drains: cross-column join TAP — mirrors O_proj join TAP.
+    # Group jg covers cols [jg*4 .. jg*4+3]; each round = cols_per_join_dp
+    # cols × m_input_dp rows, written to BO4 ffn_part region.
+    ffn_part_join_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo4_elems),
-            offset=bo4_off_ffn_part + i * e,
-            sizes=[1, 1, tiles_per_col_dp, m_input_dp],
-            strides=[0, 0, m_input_dp, 1],
+            offset=bo4_off_ffn_part + jg * cols_per_join_dp * e,
+            sizes=[1, tiles_per_col_dp, cols_per_join_dp, m_input_dp],
+            strides=[0, m_input_dp, e, 1],
         )
-        for i in range(cols)
+        for jg in range(n_join_dp)
     ]
 
     # o_out_joined[g] drains round-major [round r][col-in-group][row] → BO4
@@ -1149,8 +1209,8 @@ def my_layer_fused(
         for i in range(cols):
             rt.fill(Aqkv_fifos[i].prod(), w_qkv, Aq_taps[i], task_group=tg_q)
         # No bq_l3l2 fill — col 0's body produces it from pre_rms_col0 output.
-        for i in range(cols):
-            rt.drain(Cqkv_fifos[i].cons(), act, Cq_taps[i],
+        for jg in range(n_join_qkv):
+            rt.drain(Cq_joined[jg].cons(), act, Cq_join_taps[jg],
                      task_group=tg_q, wait=True)
         rt.finish_task_group(tg_q)
 
@@ -1161,8 +1221,8 @@ def my_layer_fused(
         tg_k = rt.task_group()
         for i in range(cols):
             rt.fill(Aqkv_fifos[i].prod(), w_qkv, Ak_taps[i], task_group=tg_k)
-        for i in range(cols):
-            rt.drain(Cqkv_fifos[i].cons(), act, Ck_taps[i],
+        for jg in range(n_join_qkv):
+            rt.drain(Ck_joined[jg].cons(), act, Ck_join_taps[jg],
                      task_group=tg_k, wait=True)
         rt.finish_task_group(tg_k)
 
@@ -1172,8 +1232,8 @@ def my_layer_fused(
         tg_v = rt.task_group()
         for i in range(cols):
             rt.fill(Aqkv_fifos[i].prod(), w_qkv, Av_taps[i], task_group=tg_v)
-        for i in range(cols):
-            rt.drain(Cqkv_fifos[i].cons(), act, Cv_taps[i],
+        for jg in range(n_join_qkv):
+            rt.drain(Cv_joined[jg].cons(), act, Cv_join_taps[jg],
                      task_group=tg_v, wait=True)
         rt.finish_task_group(tg_v)
 
@@ -1189,13 +1249,13 @@ def my_layer_fused(
                      task_group=tg_o, wait=(jg == n_join - 1))
         rt.finish_task_group(tg_o)
 
-        # ── Phase 6: ANM (ADD + post-RMS), DDR o_out → ffn_in (R2-F2c) ───────
+        # ── Phase 6: ANM (ADD + post-RMS), o_out → ffn_in on-chip (R2-F2c) ──────
+        # ANM worker writes ffn_in directly into ffi_l3l2_fifo (no DDR drain).
+        # gate/up workers consume via ffi_mem_fifo forward in tg_ffn.
         tg_anm = rt.task_group()
         rt.fill(anm_in_fifo.prod(), act,   anm_oout_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), act,   anm_inpL_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), w_ffn, anm_gain_tap, task_group=tg_anm)
-        rt.drain(anm_ffi_fifo.cons(), act, anm_ffi_tap,
-                 task_group=tg_anm, wait=True)
         rt.finish_task_group(tg_anm)
 
         # ── Phase 7: SwiGLU gate/up + silu → down (decomp-B, ON-CHIP) ────────
@@ -1206,12 +1266,12 @@ def my_layer_fused(
         tg_ffn = rt.task_group()
         for s in range(n_shim_gu):
             rt.fill(agu_src_fifos[s].prod(), w_ffn, agu_src_taps[s], task_group=tg_ffn)
-        rt.fill(ffi_l3l2_fifo.prod(), act, ffn_in_tap, task_group=tg_ffn)
+        # ffn_in already in ffi_l3l2_fifo — written by ANM worker directly.
         for s in range(n_shim_dp):
             rt.fill(adp_src_fifos[s].prod(), w_ffn, adp_src_taps[s], task_group=tg_ffn)
-        for i in range(cols):
-            rt.drain(Cdp_fifos[i].cons(), act, ffn_part_taps[i],
-                     task_group=tg_ffn, wait=(i == cols - 1))
+        for jg in range(n_join_dp):
+            rt.drain(Cdp_joined[jg].cons(), act, ffn_part_join_taps[jg],
+                     task_group=tg_ffn, wait=(jg == n_join_dp - 1))
         rt.finish_task_group(tg_ffn)
 
         # ATTN phase deferred — will land in next step with MemTile gather.
