@@ -437,6 +437,65 @@ def my_layer_fused(
     ]
     qkv_workers = [col0_worker] + qkv_workers_rest
 
+    # ── O_proj stage (P0.4-R2-F1): FFLM-style MemTile weight distribution ──────
+    # Weights are NOT fed per-column-shim (that made col 0 hit 3 S2MM > cap).
+    # Instead n_shim_o shim sources (on columns with room) each fill a small
+    # L2 buffer of `cols_per_shim` tiles, MemTile-`split` routing one tile to
+    # each of its columns' O_proj compute tiles (row 3). attn_out broadcast via
+    # forward; o_out drained to BO4 (DDR baseline; R2-F2 chains on-chip).
+    m_input_o       = 2   # 2 output rows/tile → drain = 4 bytes (DMA BD align)
+    rows_per_col_o  = e // cols                       # 256
+    tiles_per_col_o = rows_per_col_o // m_input_o     # 128
+    packed_o_tile   = m_input_o * e // 2 + m_input_o * groups_e * 2  # 2304 B
+    bytes_col_o     = tiles_per_col_o * packed_o_tile
+    n_shim_o        = 2                                # 2 shim sources
+    cols_per_shim   = cols // n_shim_o                 # 4 cols per source
+    L1_Ao_ty   = np.ndarray[(packed_o_tile,), dtype_packed]            # 1 tile
+    Ao_src_ty  = np.ndarray[(cols_per_shim * packed_o_tile,), dtype_packed]
+    L1_Bo_ty   = np.ndarray[(e,), dtype_vec]
+    L1_Co_ty   = np.ndarray[(m_input_o,), dtype_vec]
+    o_proj_fn = Kernel(
+        f"{func_prefix}layer_fused_o_proj_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.int32, np.int32, L1_Ao_ty, L1_Bo_ty, L1_Co_ty],
+    )
+    # Weight sources + MemTile split → per-col weight sub-fifos.
+    ao_src_fifos = [ObjectFifo(Ao_src_ty, name=f"Ao_src_{s}", depth=2)
+                    for s in range(n_shim_o)]
+    Ao_sub = [None] * cols
+    for s in range(n_shim_o):
+        subs = ao_src_fifos[s].cons().split(
+            [j * packed_o_tile for j in range(cols_per_shim)],
+            obj_types=[L1_Ao_ty] * cols_per_shim,
+            names=[f"Ao_{s*cols_per_shim + j}" for j in range(cols_per_shim)],
+            placement=Tile(col=2 + 2 * s, row=1))   # MemTile cols 2,4
+        for j in range(cols_per_shim):
+            Ao_sub[s * cols_per_shim + j] = subs[j]
+    # attn_out broadcast (E bf16) from BO4.
+    bo_l3l2_fifo = ObjectFifo(L1_Bo_ty, name="bo_L3L2", depth=1)
+    bo_mem_fifo  = bo_l3l2_fifo.cons().forward(
+        name="bo_mem", depth=1, placement=Tile(col=6, row=1))
+    Co_fifos = [ObjectFifo(L1_Co_ty, name=f"Co_{i}", depth=2) for i in range(cols)]
+
+    def o_proj_body(Ao, Bo, Co, fn):
+        for _ in range_(0xFFFFFFFF):
+            b = Bo.acquire(1)
+            for _ in range_(tiles_per_col_o):
+                a = Ao.acquire(1)
+                c = Co.acquire(1)
+                fn(m_input_o, 0, a, b, c)
+                Ao.release(1)
+                Co.release(1)
+            Bo.release(1)
+
+    o_proj_workers = [
+        Worker(o_proj_body,
+               [Ao_sub[i].cons(), bo_mem_fifo.cons(),
+                Co_fifos[i].prod(), o_proj_fn],
+               placement=Tile(col=i, row=3))
+        for i in range(cols)
+    ]
+
     # ── Skeleton passthroughs DROPPED for attention budget ───────────────────
     # Tile budget: 0 pre_rms + 8 qkv + 8 attn = 16 of 16 (full). BO1
     # (w_o) and BO2 (w_ffn) lose their compute-tile placeholder at this
@@ -708,14 +767,40 @@ def my_layer_fused(
         for i in range(cols)
     ]
 
-    # ATTN Kch_taps removed — BO3 will be wired via MemTile-mediated
-    # streaming in the next step (separate attention worker per col).
+    # ── O_proj TAPs (P0.4-R2-F1) ─────────────────────────────────────────────
+    # ao_src[s] fill: assemble each streamed object as [col0_tile_j | col1_.. |
+    # ..colN_tile_j] for this shim's cols_per_shim columns, reading BO1's
+    # per-col-contiguous layout with a column stride of bytes_col_o.
+    ao_src_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo1_bytes // 2),
+            offset=s * cols_per_shim * (bytes_col_o // 2),
+            sizes=[1, tiles_per_col_o, cols_per_shim, packed_o_tile // 2],
+            strides=[0, packed_o_tile // 2, bytes_col_o // 2, 1],
+        )
+        for s in range(n_shim_o)
+    ]
+    attn_out_tap = TensorAccessPattern(
+        tensor_dims=(1, bo4_elems),
+        offset=bo4_off_attn_out,
+        sizes=[1, 1, 1, e],
+        strides=[0, 0, 0, 1],
+    )
+    Co_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo4_elems),
+            offset=bo4_off_o_out + i * rows_per_col_o,
+            sizes=[1, 1, tiles_per_col_o, rows_per_col_o // tiles_per_col_o],
+            strides=[0, 0, rows_per_col_o // tiles_per_col_o, 1],
+        )
+        for i in range(cols)
+    ]
 
     rt = Runtime()
     with rt.sequence(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
-        rt.start(*qkv_workers, *skel_workers, *attn_workers)
+        rt.start(*qkv_workers, *skel_workers, *attn_workers, *o_proj_workers)
         # ── Phase 1: pre-RMS inputs (col 0's worker does the compute) ───────
         # No drain — pre_rms_col0 kernel writes normed into the bq_l3l2
         # fifo producer slot (broadcast via MemTile) AND into a static L1
@@ -764,6 +849,18 @@ def my_layer_fused(
             rt.drain(Cqkv_fifos[i].cons(), act, Cv_taps[i],
                      task_group=tg_v, wait=True)
         rt.finish_task_group(tg_v)
+
+        # ── Phase 5: O_proj GEMV (P0.4-R2-F1) ───────────────────────────────
+        # FFLM-style: weights via MemTile split from n_shim_o sources,
+        # attn_out broadcast via forward, o_out drained to BO4 (DDR baseline).
+        tg_o = rt.task_group()
+        for s in range(n_shim_o):
+            rt.fill(ao_src_fifos[s].prod(), w_o, ao_src_taps[s], task_group=tg_o)
+        rt.fill(bo_l3l2_fifo.prod(), act, attn_out_tap, task_group=tg_o)
+        for i in range(cols):
+            rt.drain(Co_fifos[i].cons(), act, Co_taps[i],
+                     task_group=tg_o, wait=True)
+        rt.finish_task_group(tg_o)
 
         # ATTN phase deferred — will land in next step with MemTile gather.
 
