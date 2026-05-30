@@ -475,7 +475,29 @@ def my_layer_fused(
     bo_l3l2_fifo = ObjectFifo(L1_Bo_ty, name="bo_L3L2", depth=1)
     bo_mem_fifo  = bo_l3l2_fifo.cons().forward(
         name="bo_mem", depth=1, placement=Tile(col=6, row=1))
-    Co_fifos = [ObjectFifo(L1_Co_ty, name=f"Co_{i}", depth=2) for i in range(cols)]
+    # P0.4-R2-F2b: O_proj outputs joined ON-CHIP at a MemTile (gather 8 cols
+    # → one E vector) instead of 8 separate DDR drains. Each join "round"
+    # assembles one tile (m_input_o rows) from each of the 8 cols; the joined
+    # stream drains to BO4 with ONE MM2S (vs 8) via a reorder TAP. This frees
+    # 7 MM2S — required to fit the global shim budget when ANM is added.
+    # A MemTile has limited input DMA channels (<8), so an 8-way join on one
+    # MemTile overflows. Gather in n_join groups (4 cols each) on separate
+    # MemTiles → n_join drains (still frees 8-n_join MM2S vs per-col drains).
+    n_join        = 2
+    cols_per_join = cols // n_join                       # 4
+    join_mem_cols = [1, 5]                               # free MemTile columns
+    o_out_round_ty = np.ndarray[(cols_per_join * m_input_o,), dtype_vec]  # 8 bf16
+    o_out_joined = [ObjectFifo(o_out_round_ty, name=f"o_out_joined_{g}", depth=2)
+                    for g in range(n_join)]
+    Co_sub = [None] * cols
+    for g in range(n_join):
+        subs = o_out_joined[g].prod().join(
+            [j * m_input_o for j in range(cols_per_join)],
+            obj_types=[L1_Co_ty] * cols_per_join,
+            names=[f"Co_{g*cols_per_join + j}" for j in range(cols_per_join)],
+            placement=Tile(col=join_mem_cols[g], row=1))
+        for j in range(cols_per_join):
+            Co_sub[g * cols_per_join + j] = subs[j]
 
     def o_proj_body(Ao, Bo, Co, fn):
         for _ in range_(0xFFFFFFFF):
@@ -491,7 +513,7 @@ def my_layer_fused(
     o_proj_workers = [
         Worker(o_proj_body,
                [Ao_sub[i].cons(), bo_mem_fifo.cons(),
-                Co_fifos[i].prod(), o_proj_fn],
+                Co_sub[i].prod(), o_proj_fn],
                placement=Tile(col=i, row=3))
         for i in range(cols)
     ]
@@ -786,14 +808,16 @@ def my_layer_fused(
         sizes=[1, 1, 1, e],
         strides=[0, 0, 0, 1],
     )
-    Co_taps = [
+    # o_out_joined[g] drains round-major [round r][col-in-group][row] → BO4
+    # col-major o_out[(g*4 + col)*256 + r*m_input_o + row]. Mirror of split.
+    o_out_join_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo4_elems),
-            offset=bo4_off_o_out + i * rows_per_col_o,
-            sizes=[1, 1, tiles_per_col_o, rows_per_col_o // tiles_per_col_o],
-            strides=[0, 0, rows_per_col_o // tiles_per_col_o, 1],
+            offset=bo4_off_o_out + g * cols_per_join * rows_per_col_o,
+            sizes=[1, tiles_per_col_o, cols_per_join, m_input_o],
+            strides=[0, m_input_o, rows_per_col_o, 1],
         )
-        for i in range(cols)
+        for g in range(n_join)
     ]
 
     rt = Runtime()
@@ -857,9 +881,9 @@ def my_layer_fused(
         for s in range(n_shim_o):
             rt.fill(ao_src_fifos[s].prod(), w_o, ao_src_taps[s], task_group=tg_o)
         rt.fill(bo_l3l2_fifo.prod(), act, attn_out_tap, task_group=tg_o)
-        for i in range(cols):
-            rt.drain(Co_fifos[i].cons(), act, Co_taps[i],
-                     task_group=tg_o, wait=True)
+        for g in range(n_join):
+            rt.drain(o_out_joined[g].cons(), act, o_out_join_taps[g],
+                     task_group=tg_o, wait=(g == n_join - 1))
         rt.finish_task_group(tg_o)
 
         # ATTN phase deferred — will land in next step with MemTile gather.
