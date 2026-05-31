@@ -150,6 +150,13 @@ def my_layer_fused(
     L1_Bq_ty = np.ndarray[(e,), dtype_vec]
     L1_Cq_ty = np.ndarray[(m_input_qkv,), dtype_vec]
 
+    # FFLM-style QKV weight distribution via MemTile split (replaces per-col
+    # shim S2MM). 2 shim sources, each split → 4 cols. Frees 6 shim S2MM
+    # (was 8 per-col, now 2 per-source). Mirrors O_proj split (L466-478).
+    n_shim_qkv       = 2
+    cols_per_shim_qkv = cols // n_shim_qkv            # 4 cols per source
+    Aqkv_src_ty = np.ndarray[(cols_per_shim_qkv * packed_qkv_tile_bytes,), dtype_packed]
+
     # Attention KV chunk type: K_CHUNK tokens × HEAD_DIM bf16 elements.
     # Matches FFLM's ct_chunk_size=32 (mha.dll RE'd disasm) and our kernel
     # ATTN_K_CHUNK macro. Per-col attention reads its 1 kv_head slice from
@@ -353,16 +360,29 @@ def my_layer_fused(
     # Col 0's pre-RMS kernel writes the normed result into the bq_l3l2_fifo
     # producer slot directly. MemTile broadcast fanout publishes it to all
     # 8 cols' .cons() ports. depth=1 — one normed token per outer iteration.
-    Aqkv_fifos = [ObjectFifo(L1_Aq_ty, name=f"Aqkv_{i}", depth=2) for i in range(cols)]
+    #
+    # FFLM-style QKV weight split: 2 shim sources → MemTile split → 8 sub-fifos.
+    # Frees 6 shim S2MM vs the old per-col approach (was 8, now 2).
+    # MemTile placement [0,4] avoids overlap with O_proj splits [1,5].
+    aqkv_mem_cols = [0, 4]
+    aqkv_src_fifos = [ObjectFifo(Aqkv_src_ty, name=f"Aqkv_src_{s}", depth=2)
+                      for s in range(n_shim_qkv)]
+    Aqkv_sub = [None] * cols
+    for s in range(n_shim_qkv):
+        subs = aqkv_src_fifos[s].cons().split(
+            [j * packed_qkv_tile_bytes for j in range(cols_per_shim_qkv)],
+            obj_types=[L1_Aq_ty] * cols_per_shim_qkv,
+            names=[f"Aqkv_{s * cols_per_shim_qkv + j}" for j in range(cols_per_shim_qkv)],
+            placement=Tile(col=aqkv_mem_cols[s], row=1),
+        )
+        for j in range(cols_per_shim_qkv):
+            Aqkv_sub[s * cols_per_shim_qkv + j] = subs[j]
+
     bq_l3l2_fifo = ObjectFifo(L1_Bq_ty, name="bq_L3L2", depth=1)
-    # bq broadcast staged through col 0's MemTile (col 0 also produces it
-    # via pre_rms_col0_fn). Note: col 0 MemTile is now shared with the
-    # kv_mem_fifos[0] gather forward — IRON's MemTile placer can typically
-    # handle multiple forwards on the same tile if they don't exceed the
-    # channel-pair budget. If placement fails, move bq to col 4 (mid-col
-    # central distribution).
+    # bq broadcast staged through MemTile col 2 (avoids overlap with QKV
+    # split cols [0,4] and O_proj split cols [1,5]).
     bq_mem_fifo  = bq_l3l2_fifo.cons().forward(
-        name="bq_mem", depth=1, placement=Tile(col=4, row=1))
+        name="bq_mem", depth=1, placement=Tile(col=2, row=1))
     # FFLM-style: ONE Cqkv_joined[col] fifo per col (not Q+K+V separately).
     # Q/K/V phases share the same shim MM2S channel via time-multiplexed BD
     # chain in rt.inline_ops (npu_dma_memcpy_nd × 3 → cmds2seq, like FFLM).
@@ -430,12 +450,12 @@ def my_layer_fused(
     col0_worker = Worker(
         col0_body,
         [rms_in_fifo.cons(), bq_l3l2_fifo.prod(),
-         Aqkv_fifos[0].cons(), Cqkv_joined[0].prod(),
+         Aqkv_sub[0].cons(), Cqkv_joined[0].prod(),
          pre_rms_col0_fn, qkv_gemv_static_fn],
     )
     qkv_workers_rest = [
         Worker(colN_body,
-               [Aqkv_fifos[i].cons(), bq_mem_fifo.cons(),
+               [Aqkv_sub[i].cons(), bq_mem_fifo.cons(),
                 Cqkv_joined[i].prod(), qkv_gemv_fn])
         for i in range(1, cols)
     ]
@@ -509,13 +529,8 @@ def my_layer_fused(
         for j in range(cols_per_join):
             Co_sub[jg * cols_per_join + j] = subs[j]
 
-    # FFLM-style on-chip O_proj→ANM: forward each o_out_joined[jg] to col 0
-    # MemTile, ANM compute tile (col 0 row 4) acquires both via 2 .cons()
-    # ports. No DDR drain → saves 2 shim MM2S, fits cap.
-    o_out_anm = [o_out_joined[jg].cons().forward(
-                    name=f"o_out_anm_{jg}", depth=2,
-                    placement=Tile(col=0, row=1))
-                 for jg in range(n_join)]
+    # FFLM-style on-chip O_proj→ANM: o_out_joined[jg] is consumed directly by ANM
+    # compute tile (col 0 row 4) via 2 .cons() ports. No DDR drain → saves 2 shim MM2S.
 
     def o_proj_body(Ao, Bo, Co, fn):
         for _ in range_(0xFFFFFFFF):
@@ -756,7 +771,7 @@ def my_layer_fused(
     gate_up_workers = [
         Worker(gate_up_anm_body,
                [anm_in_fifo.cons(), ffi_l3l2_fifo.prod(),
-                o_out_anm[0].cons(), o_out_anm[1].cons(),
+                o_out_joined[0].cons(), o_out_joined[1].cons(),
                 anm_oout_buf, o_out_assemble_fn,
                 anm_inpff_buf, add_fn, rms2_fn,
                 Agu_sub[0].cons(), ffi_mem_fifo.cons(),
@@ -822,8 +837,8 @@ def my_layer_fused(
 
     # ── Attention workers (7 cols 1-7, col 0 SKIPPED for shim-channel cap) ──
     # AIE2P shim has 2 S2MM + 2 MM2S channels per col. Col 0 is already at
-    # 3 S2MM (Aqkv + rms_in + bq broadcast not from shim) + 1 MM2S (Cqkv);
-    # adding kv_l3l2_fifos[0] + attn_drain_fifos[0] would push it over.
+    # With QKV MemTile-split: col 0 no longer has per-col Aqkv shim S2MM.
+    # Col 0 shim = rms_in S2MM + Cqkv MM2S = 1+1 (room for more).
     #
     # For this checkpoint we wire attention on cols 1-7 only (7 of 8 kv
     # heads). Col 0's kv_head (head 0) does NOT get attention compute on
@@ -864,8 +879,8 @@ def my_layer_fused(
                                    depth=1) for c in attn_cols]
 
     # NOTE: q_rot via MemTile gather attempted but shim 2-S2MM cap is
-    # exhausted on EVERY col (col 0: rms_in + Aqkv; cols 1-7: Aqkv +
-    # kv_l3l2). Dropping in a q_rot producer from any shim → MemTile
+    # was exhausted on EVERY col before QKV MemTile-split. Now that Aqkv
+    # goes via split (not per-col shim), cols 1-7 have room. Dropping in a
     # entry fails placement.
     #
     # Real fix needs producer-side rerouting: e.g. drop the dedicated
@@ -1007,41 +1022,37 @@ def my_layer_fused(
     ]
 
     # ── Q GEMV TAPs ──────────────────────────────────────────────────────────
-    # Each col reads its bytes_col_q slice of W_q from BO0 (declared as
-    # bf16-element halved-shape, so byte offset = element offset × 2).
-    # bytes_col_q is in BYTES; the L3 type is bf16 elements; offsets and
-    # sizes inside the TAP are in *element* units (the design's L3 ndarray
-    # type was declared bf16 — the BD generator multiplies by itemsize for
-    # the actual byte count).
-    # post_attn_fused.design.py:330 also uses sizes=[1,1,1,N] linear chunk
-    # to avoid the partial-merge bug; we follow.
-    Aq_taps = [
+    # FFLM-style QKV weight TAPs for MemTile-split sources.
+    # Each aqkv_src_tap[phase][s] assembles one round of tiles from
+    # cols_per_shim_qkv columns, reading BO0's per-col-contiguous layout
+    # with a column stride. Mirrors O_proj split TAPs (ao_src_taps).
+    # Phase 0=Q, 1=K, 2=V. Each source s covers cols [s*cps .. (s+1)*cps).
+    Aqkv_src_q_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo0_bytes // 2),
-            offset=bo0_off_W_q + i * (bytes_col_q // 2),
-            sizes=[1, 1, 1, bytes_col_q // 2],
-            strides=[0, 0, 0, 1],
+            offset=bo0_off_W_q + s * cols_per_shim_qkv * (bytes_col_q // 2),
+            sizes=[1, tiles_per_col_q, cols_per_shim_qkv, packed_qkv_tile_bytes // 2],
+            strides=[0, packed_qkv_tile_bytes // 2, bytes_col_q // 2, 1],
         )
-        for i in range(cols)
+        for s in range(n_shim_qkv)
     ]
-    # K and V weight TAPs — same per-row tile size, fewer rows/col.
-    Ak_taps = [
+    Aqkv_src_k_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo0_bytes // 2),
-            offset=bo0_off_W_k + i * (bytes_col_kv // 2),
-            sizes=[1, 1, 1, bytes_col_kv // 2],
-            strides=[0, 0, 0, 1],
+            offset=bo0_off_W_k + s * cols_per_shim_qkv * (bytes_col_kv // 2),
+            sizes=[1, tiles_per_col_kv, cols_per_shim_qkv, packed_qkv_tile_bytes // 2],
+            strides=[0, packed_qkv_tile_bytes // 2, bytes_col_kv // 2, 1],
         )
-        for i in range(cols)
+        for s in range(n_shim_qkv)
     ]
-    Av_taps = [
+    Aqkv_src_v_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo0_bytes // 2),
-            offset=bo0_off_W_v + i * (bytes_col_kv // 2),
-            sizes=[1, 1, 1, bytes_col_kv // 2],
-            strides=[0, 0, 0, 1],
+            offset=bo0_off_W_v + s * cols_per_shim_qkv * (bytes_col_kv // 2),
+            sizes=[1, tiles_per_col_kv, cols_per_shim_qkv, packed_qkv_tile_bytes // 2],
+            strides=[0, packed_qkv_tile_bytes // 2, bytes_col_kv // 2, 1],
         )
-        for i in range(cols)
+        for s in range(n_shim_qkv)
     ]
     # Bq is normed (E bf16) in BO4 — broadcast via MemTile.
     bq_tap = TensorAccessPattern(
@@ -1152,16 +1163,16 @@ def my_layer_fused(
         # ── Phase 2-4: QKV GEMV — FFLM-style time-multiplex BD chain ──────────
         # Per col: ONE shim MM2S channel carries Q→K→V via 3 chained BDs
         # (npu_dma_memcpy_nd × 3 → cmds2seq, exactly the FFLM mechanism).
-        # Aqkv weights still load per-phase via 3 fills on Aqkv_fifos (S2MM
-        # side; the QKV worker body consumes them in Q→K→V order).
+        # Weights load via MemTile-split sources (2 S2MM, not 8 per-col).
+        # Each source fills Q→K→V tiles in order; the split routes each
+        # round's sub-tile to the correct col's compute tile.
         tg_qkv = rt.task_group()
-        # Q phase: weight fills, dummy drains to register cons endpoints
-        for i in range(cols):
-            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Aq_taps[i], task_group=tg_qkv)
+        # Q phase: weight fills via split sources
+        for s in range(n_shim_qkv):
+            rt.fill(aqkv_src_fifos[s].prod(), w_qkv, Aqkv_src_q_taps[s], task_group=tg_qkv)
         for i in range(cols):
             # Dummy drain to register the shim cons endpoint (creates the
             # shim_dma_allocation that the inline_ops chain then re-uses).
-            # 1-byte tap; the real drain is done by the chain below.
             tap_dummy = TensorAccessPattern(
                 tensor_dims=(1, bo4_elems),
                 offset=Cq_offsets[i],
@@ -1169,12 +1180,12 @@ def my_layer_fused(
                 strides=[0, 0, 0, 1],
             )
             rt.drain(Cqkv_joined[i].cons(), act, tap_dummy, task_group=tg_qkv)
-        # K phase weights
-        for i in range(cols):
-            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Ak_taps[i], task_group=tg_qkv)
-        # V phase weights
-        for i in range(cols):
-            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Av_taps[i], task_group=tg_qkv)
+        # K phase weights via split sources
+        for s in range(n_shim_qkv):
+            rt.fill(aqkv_src_fifos[s].prod(), w_qkv, Aqkv_src_k_taps[s], task_group=tg_qkv)
+        # V phase weights via split sources
+        for s in range(n_shim_qkv):
+            rt.fill(aqkv_src_fifos[s].prod(), w_qkv, Aqkv_src_v_taps[s], task_group=tg_qkv)
 
         # FFLM time-multiplex chain: per col, configure ONE task with 3 BDs
         # (Q→K→V) on the same shim MM2S channel. This is the npu_dma_memcpy_nd
