@@ -424,6 +424,24 @@ void layer_fused_rms_norm2_bf16(
     (void)chunks;
 }
 
+// O_proj output assembler: rounds arrive as N_COLS×M_ROWS bf16 chunks
+// (round-major from cross-col MemTile join). For round r, chunk[k*M+j]
+// must be placed at out[(group_base + k) * COL_STRIDE + r*M + j], where
+// group_base = group_idx * N_COLS, COL_STRIDE = e/cols, M = m_input_o.
+// One call per (chunk, round) — no internal loop over rounds.
+void layer_fused_o_out_assemble_bf16(
+        const bfloat16 *chunk, bfloat16 *out,
+        int32_t round_idx, int32_t group_base,
+        int32_t n_cols, int32_t m_rows, int32_t col_stride) {
+    for (int k = 0; k < n_cols; k++) {
+        int32_t col = group_base + k;
+        for (int j = 0; j < m_rows; j++) {
+            out[col * col_stride + round_idx * m_rows + j] =
+                chunk[k * m_rows + j];
+        }
+    }
+}
+
 }  // extern "C"
 
 // Gate/Up dual-GEMV: same INT4 dequant+GEMV as _qkv_gemv, but writes row
