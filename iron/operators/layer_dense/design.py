@@ -464,6 +464,7 @@ def my_layer_fused(
         [np.int32, np.int32, L1_Ao_ty, L1_Bo_ty, L1_Co_ty],
     )
     # Weight sources + MemTile split → per-col weight sub-fifos.
+    ao_mem_cols     = [1, 5]                          # MemTile cols for Ao split
     ao_src_fifos = [ObjectFifo(Ao_src_ty, name=f"Ao_src_{s}", depth=2)
                     for s in range(n_shim_o)]
     Ao_sub = [None] * cols
@@ -472,7 +473,7 @@ def my_layer_fused(
             [j * packed_o_tile for j in range(cols_per_shim)],
             obj_types=[L1_Ao_ty] * cols_per_shim,
             names=[f"Ao_{s*cols_per_shim + j}" for j in range(cols_per_shim)],
-            placement=Tile(col=2 + 2 * s, row=1))   # MemTile cols 2,4
+            placement=Tile(col=ao_mem_cols[s], row=1))
         for j in range(cols_per_shim):
             Ao_sub[s * cols_per_shim + j] = subs[j]
     # attn_out broadcast (E bf16) from BO4 → O_proj workers: 1 shim S2MM.
@@ -494,7 +495,7 @@ def my_layer_fused(
     # MemTiles → n_join drains (still frees 8-n_join MM2S vs per-col drains).
     n_join        = 2
     cols_per_join = cols // n_join                       # 4
-    join_mem_cols = [1, 5]                               # free MemTile columns
+    join_mem_cols = [4, 7]                               # free MemTile columns
     o_out_round_ty = np.ndarray[(cols_per_join * m_input_o,), dtype_vec]  # 8 bf16
     o_out_joined = [ObjectFifo(o_out_round_ty, name=f"o_out_joined_{jg}", depth=2)
                     for jg in range(n_join)]
@@ -627,8 +628,8 @@ def my_layer_fused(
     groups_inter      = inter_dim_per_col // g          # 32
     packed_dp_tile    = m_input_dp * inter_dim_per_col // 2 + m_input_dp * groups_inter * 2
     bytes_col_dp      = tiles_per_col_dp * packed_dp_tile
-    n_shim_dp         = 1
-    cols_per_shim_dp  = cols // n_shim_dp               # 8 (split 1→8, saves shim S2MM)
+    n_shim_dp         = 2
+    cols_per_shim_dp  = cols // n_shim_dp               # 4 (split 2→4, ≤6 MM2S per MemTile)
 
     L1_Agu_ty   = np.ndarray[(packed_gu_tile,), dtype_packed]            # 1 tile
     Agu_src_ty  = np.ndarray[(cols_per_shim_gu * packed_gu_tile,), dtype_packed]  # 1 round
@@ -661,7 +662,7 @@ def my_layer_fused(
     # tile j to col j's compute tile. The agu_src_taps TAP streams
     # 2*tiles_per_col_gu rounds (the interleaved [g0|u0|g1|u1...] BO2 layout),
     # so each col's worker sees gate,up,gate,up,... on successive acquires.
-    agu_mem_cols     = [2, 5]                            # cols 2,5 — each gets 4 MM2S
+    agu_mem_cols     = [2, 6]                            # cols 2,6 — each gets 4 MM2S
     agu_src_fifos = [ObjectFifo(Agu_src_ty, name=f"Agu_src_{s}", depth=2)
                      for s in range(n_shim_gu)]
     Agu_sub = [None] * cols
@@ -770,17 +771,17 @@ def my_layer_fused(
     ]
 
     # down-B weights split: W_down[:, c*K:(c+1)*K] per col, K=inter_dim_per_col.
-    # Each shim source carries cols_per_shim_dp full col streams.
+    # 2 shim sources (n_shim_dp=2), each split → 4 cols on its MemTile (4 MM2S).
+    adp_mem_cols     = [3, 7]                            # MemTile cols for Adp split
     adp_src_fifos = [ObjectFifo(Adp_src_ty, name=f"Adp_src_{s}", depth=2)
                      for s in range(n_shim_dp)]
     Adp_sub = [None] * cols
-    col_stream_dp = tiles_per_col_dp * packed_dp_tile
     for s in range(n_shim_dp):
         subs = adp_src_fifos[s].cons().split(
             [j * packed_dp_tile for j in range(cols_per_shim_dp)],
             obj_types=[L1_Adp_ty] * cols_per_shim_dp,
             names=[f"Adp_{s*cols_per_shim_dp + j}" for j in range(cols_per_shim_dp)],
-            placement=Tile(col=1 + 2 * s, row=1))
+            placement=Tile(col=adp_mem_cols[s], row=1))
         for j in range(cols_per_shim_dp):
             Adp_sub[s * cols_per_shim_dp + j] = subs[j]
 
