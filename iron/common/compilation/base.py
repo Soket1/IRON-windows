@@ -393,6 +393,7 @@ class _MLIRInputMixin:
                 d
                 for d in self.dependencies
                 if isinstance(d, (SourceArtifact, PythonGeneratedMLIRArtifact))
+                or d.__class__.__name__ == "FusedMLIRSource"
             ),
             None,
         )

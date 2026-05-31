@@ -527,6 +527,8 @@ void layer_fused_silu_mul_bf16(bfloat16 *c_out, uint32_t m_output) {
 
 }  // extern "C"
 
+#ifdef COMPILE_ATTN
+
 // ────────────────────────────────────────────────────────────────────────────
 // GQA attention compute (U1a per-head sequential, with streaming KV).
 //
@@ -1067,3 +1069,5 @@ extern "C" void attn_drain_real_ctx_bf16(bfloat16 *__restrict ctx_out,
         ctx_out[i] = (bfloat16)0.0f;
     }
 }
+
+#endif // COMPILE_ATTN

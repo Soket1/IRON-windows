@@ -132,6 +132,7 @@ class LayerFusedMLIR(MLIROperator):
                     f"-DNUM_KV_HEADS={self.num_kv_heads}",
                     f"-DMAX_SEQ_LEN={self.max_seq_len}",
                     f"-DNUM_AIE_COLUMNS={self.num_aie_columns}",
+                    f"-DM_OUTPUT_MAX={self.hidden_dim // self.num_aie_columns}",
                 ],
             ),
         ]

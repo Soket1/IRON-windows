@@ -1072,8 +1072,8 @@ def my_layer_fused(
         TensorAccessPattern(
             tensor_dims=(1, bo1_bytes // 2),
             offset=s * cols_per_shim * (bytes_col_o // 2),
-            sizes=[1, tiles_per_col_o, cols_per_shim, packed_o_tile // 2],
-            strides=[0, packed_o_tile // 2, bytes_col_o // 2, 1],
+            sizes=[16, 64, 18, 32],
+            strides=[(packed_o_tile // 2) * 32, (packed_o_tile // 2) // 2, 32, 1],
         )
         for s in range(n_shim_o)
     ]
@@ -1104,8 +1104,8 @@ def my_layer_fused(
         TensorAccessPattern(
             tensor_dims=(1, bo2_bytes // 2),
             offset=bo2_off_gate + s * cols_per_shim_gu * (bytes_col_gu // 2),
-            sizes=[1, 2 * tiles_per_col_gu, cols_per_shim_gu, packed_gu_tile // 2],
-            strides=[0, packed_gu_tile // 2, bytes_col_gu // 2, 1],
+            sizes=[32, 64, 72, 32],
+            strides=[packed_gu_tile // 2, (packed_gu_tile // 2) * 32, 32, 1],
         )
         for s in range(n_shim_gu)
     ]
@@ -1118,8 +1118,8 @@ def my_layer_fused(
         TensorAccessPattern(
             tensor_dims=(1, bo2_bytes // 2),
             offset=bo2_off_down + s * cols_per_shim_dp * (bytes_col_dp // 2),
-            sizes=[1, tiles_per_col_dp, cols_per_shim_dp, packed_dp_tile // 2],
-            strides=[0, packed_dp_tile // 2, bytes_col_dp // 2, 1],
+            sizes=[2 * cols_per_shim_dp, tiles_per_col_dp // 2, 18, 32],
+            strides=[(tiles_per_col_dp // 2) * (packed_dp_tile // 2), packed_dp_tile // 2, 32, 1],
         )
         for s in range(n_shim_dp)
     ]
@@ -1144,8 +1144,8 @@ def my_layer_fused(
         TensorAccessPattern(
             tensor_dims=(1, bo4_elems),
             offset=bo4_off_ffn_part + jg * cols_per_join_dp * rows_per_col_dp,
-            sizes=[1, tiles_per_col_dp, cols_per_join_dp, m_input_dp],
-            strides=[0, m_input_dp, rows_per_col_dp, 1],
+            sizes=[2, tiles_per_col_dp // 2, cols_per_join_dp, m_input_dp],
+            strides=[(tiles_per_col_dp // 2) * m_input_dp, m_input_dp, rows_per_col_dp, 1],
         )
         for jg in range(n_join_dp)
     ]
