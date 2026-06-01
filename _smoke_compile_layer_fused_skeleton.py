@@ -36,7 +36,7 @@ op = LayerFusedMLIR(
     embed_dim=2048, hidden_dim=8192,
     num_heads=32, num_kv_heads=8, head_dim=64,
     max_seq_len=2048,
-    num_aie_columns=8, group_size=32,
+    num_aie_columns=4, group_size=32,
     context=ctx,
 )
 log.info("op.name=%s", op.name)

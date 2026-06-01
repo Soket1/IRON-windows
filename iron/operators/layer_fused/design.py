@@ -23,6 +23,8 @@ from ml_dtypes import bfloat16
 
 from aie.dialects.aie import *
 from aie.dialects.aiex import *
+from aie.dialects import arith
+from aie.extras import types as T
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, Buffer
 from aie.iron.placers import SequentialPlacer
@@ -147,6 +149,13 @@ def my_layer_fused(
     L1_Aq_ty = np.ndarray[(packed_qkv_tile_bytes,), dtype_packed]
     L1_Bq_ty = np.ndarray[(e,), dtype_vec]
     L1_Cq_ty = np.ndarray[(m_input_qkv,), dtype_vec]
+
+    # FFLM-style QKV weight distribution via MemTile split (replaces per-col
+    # shim S2MM). 2 shim sources, each split → 4 cols. Frees 6 shim S2MM
+    # (was 8 per-col, now 2 per-source). Mirrors O_proj split (L466-478).
+    n_shim_qkv       = 2
+    cols_per_shim_qkv = cols // n_shim_qkv            # 4 cols per source
+    Aqkv_src_ty = np.ndarray[(cols_per_shim_qkv * packed_qkv_tile_bytes,), dtype_packed]
 
     # Attention KV chunk type: K_CHUNK tokens × HEAD_DIM bf16 elements.
     # Matches FFLM's ct_chunk_size=32 (mha.dll RE'd disasm) and our kernel
@@ -351,64 +360,45 @@ def my_layer_fused(
     # Col 0's pre-RMS kernel writes the normed result into the bq_l3l2_fifo
     # producer slot directly. MemTile broadcast fanout publishes it to all
     # 8 cols' .cons() ports. depth=1 — one normed token per outer iteration.
-    Aqkv_fifos = [ObjectFifo(L1_Aq_ty, name=f"Aqkv_{i}", depth=2) for i in range(cols)]
+    #
+    # FFLM-style QKV weight split: 2 shim sources → MemTile split → 8 sub-fifos.
+    # Frees 6 shim S2MM vs the old per-col approach (was 8, now 2).
+    # MemTile placement [0,4] avoids overlap with O_proj splits [1,5].
+    aqkv_mem_cols = [0, 4]
+    aqkv_src_fifos = [ObjectFifo(Aqkv_src_ty, name=f"Aqkv_src_{s}", depth=2)
+                      for s in range(n_shim_qkv)]
+    Aqkv_sub = [None] * cols
+    for s in range(n_shim_qkv):
+        subs = aqkv_src_fifos[s].cons().split(
+            [j * packed_qkv_tile_bytes for j in range(cols_per_shim_qkv)],
+            obj_types=[L1_Aq_ty] * cols_per_shim_qkv,
+            names=[f"Aqkv_{s * cols_per_shim_qkv + j}" for j in range(cols_per_shim_qkv)],
+            placement=Tile(col=aqkv_mem_cols[s], row=1),
+        )
+        for j in range(cols_per_shim_qkv):
+            Aqkv_sub[s * cols_per_shim_qkv + j] = subs[j]
+
     bq_l3l2_fifo = ObjectFifo(L1_Bq_ty, name="bq_L3L2", depth=1)
-    # bq broadcast staged through col 0's MemTile (col 0 also produces it
-    # via pre_rms_col0_fn). Note: col 0 MemTile is now shared with the
-    # kv_mem_fifos[0] gather forward — IRON's MemTile placer can typically
-    # handle multiple forwards on the same tile if they don't exceed the
-    # channel-pair budget. If placement fails, move bq to col 4 (mid-col
-    # central distribution).
+    # bq broadcast staged through MemTile col 2 (avoids overlap with QKV
+    # split cols [0,4] and O_proj split cols [1,5]).
     bq_mem_fifo  = bq_l3l2_fifo.cons().forward(
-        name="bq_mem", depth=1, placement=Tile(col=4, row=1))
-    # Cross-column MemTile join for QKV outputs.
-    # 3 fifos (Q/K/V) × 2 cols per MemTile = 6 S2MM per MemTile (= cap).
-    # 4 groups of 2 cols → 4 MM2S total for Q, 4 for K, 4 for V = 12 MM2S.
-    n_join_qkv        = 4
-    cols_per_join_qkv = cols // n_join_qkv          # 2
-    join_mem_cols_qkv = [0, 3, 4, 7]                # one free MemTile per group
-    Cq_round_ty  = np.ndarray[(cols_per_join_qkv * m_input_qkv,), dtype_vec]
-    Ck_round_ty  = np.ndarray[(cols_per_join_qkv * m_input_qkv,), dtype_vec]
-    Cv_round_ty  = np.ndarray[(cols_per_join_qkv * m_input_qkv,), dtype_vec]
-    Cq_joined = [ObjectFifo(Cq_round_ty, name=f"Cq_joined_{jg}", depth=2)
-                 for jg in range(n_join_qkv)]
-    Ck_joined = [ObjectFifo(Ck_round_ty, name=f"Ck_joined_{jg}", depth=2)
-                 for jg in range(n_join_qkv)]
-    Cv_joined = [ObjectFifo(Cv_round_ty, name=f"Cv_joined_{jg}", depth=2)
-                 for jg in range(n_join_qkv)]
-    Cq_sub = [None] * cols
-    Ck_sub = [None] * cols
-    Cv_sub = [None] * cols
-    for jg in range(n_join_qkv):
-        subs = Cq_joined[jg].prod().join(
-            [j * m_input_qkv for j in range(cols_per_join_qkv)],
-            obj_types=[L1_Cq_ty] * cols_per_join_qkv,
-            names=[f"Cq_{jg*cols_per_join_qkv + j}" for j in range(cols_per_join_qkv)],
-            placement=Tile(col=join_mem_cols_qkv[jg], row=1))
-        for j in range(cols_per_join_qkv):
-            Cq_sub[jg * cols_per_join_qkv + j] = subs[j]
-        subs = Ck_joined[jg].prod().join(
-            [j * m_input_qkv for j in range(cols_per_join_qkv)],
-            obj_types=[L1_Cq_ty] * cols_per_join_qkv,
-            names=[f"Ck_{jg*cols_per_join_qkv + j}" for j in range(cols_per_join_qkv)],
-            placement=Tile(col=join_mem_cols_qkv[jg], row=1))
-        for j in range(cols_per_join_qkv):
-            Ck_sub[jg * cols_per_join_qkv + j] = subs[j]
-        subs = Cv_joined[jg].prod().join(
-            [j * m_input_qkv for j in range(cols_per_join_qkv)],
-            obj_types=[L1_Cq_ty] * cols_per_join_qkv,
-            names=[f"Cv_{jg*cols_per_join_qkv + j}" for j in range(cols_per_join_qkv)],
-            placement=Tile(col=join_mem_cols_qkv[jg], row=1))
-        for j in range(cols_per_join_qkv):
-            Cv_sub[jg * cols_per_join_qkv + j] = subs[j]
+        name="bq_mem", depth=1, placement=Tile(col=2, row=1))
+    # FFLM-style: ONE Cqkv_joined[col] fifo per col (not Q+K+V separately).
+    # Q/K/V phases share the same shim MM2S channel via time-multiplexed BD
+    # chain in rt.inline_ops (npu_dma_memcpy_nd × 3 → cmds2seq, like FFLM).
+    # 8 cols × 1 MM2S = 8 shim MM2S total for QKV outputs.
+    Cqkv_joined = [ObjectFifo(L1_Cq_ty, name=f"Cqkv_{i}", depth=2)
+                   for i in range(cols)]
 
     # ── Worker bodies ────────────────────────────────────────────────────────
     # Col 0: 4-phase body (pre-RMS → Q → K → V). Pre-RMS writes to BOTH the
     # static L1 buffer (consumed by qkv_gemv_static below) AND to the bq
     # fifo prod slot (broadcast). QKV phases use the static-input variant
     # so col 0's tile stays at 2 input channels (rms_in + Aqkv).
-    # Col 0: separate Q/K/V output fifos (Cq/Ck/Cv sub-fifos from cross-col join).
-    def col0_body(rms_in, bq_prod, Aqkv, Cq, Ck, Cv, pre_rms_fn, qkv_static_fn):
+    # FFLM-style: ONE Cqkv output fifo per col, drained by 3 BD chain
+    # (Q/K/V) in inline_ops. Worker writes m_input_qkv-row tiles back-to-back;
+    # rt.inline_ops chain reorders them into BO4 q_rot/k_rot/v regions.
+    def col0_body(rms_in, bq_prod, Aqkv, Cqkv, pre_rms_fn, qkv_static_fn):
         for _ in range_(0xFFFFFFFF):
             # Pre-RMS phase
             sub = rms_in.acquire(2)
@@ -417,68 +407,56 @@ def my_layer_fused(
             bq_out = bq_prod.acquire(1)
             pre_rms_fn(x_in, gain, bq_out, e)
             rms_in.release(2)
-            bq_prod.release(1)  # publish normed via MemTile to cols 1-7
+            bq_prod.release(1)
             # Q phase (static-input GEMV, no B fifo acquire)
             for _ in range_(tiles_per_col_q):
                 a = Aqkv.acquire(1)
-                c = Cq.acquire(1)
+                c = Cqkv.acquire(1)
                 qkv_static_fn(m_input_qkv, 0, a, c)
                 Aqkv.release(1)
-                Cq.release(1)
+                Cqkv.release(1)
             # K phase
             for _ in range_(tiles_per_col_kv):
                 a = Aqkv.acquire(1)
-                c = Ck.acquire(1)
+                c = Cqkv.acquire(1)
                 qkv_static_fn(m_input_qkv, 0, a, c)
                 Aqkv.release(1)
-                Ck.release(1)
+                Cqkv.release(1)
             # V phase
             for _ in range_(tiles_per_col_kv):
                 a = Aqkv.acquire(1)
-                c = Cv.acquire(1)
+                c = Cqkv.acquire(1)
                 qkv_static_fn(m_input_qkv, 0, a, c)
                 Aqkv.release(1)
-                Cv.release(1)
+                Cqkv.release(1)
 
-    # Cols 1-7: separate Q/K/V output fifos.
-    def colN_body(A, B, Cq, Ck, Cv, fn):
+    def colN_body(A, B, C, fn):
         for _ in range_(0xFFFFFFFF):
             b = B.acquire(1)
-            # Q phase
             for _ in range_(tiles_per_col_q):
-                a = A.acquire(1)
-                c = Cq.acquire(1)
+                a = A.acquire(1); c = C.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
-                A.release(1)
-                Cq.release(1)
-            # K phase
+                A.release(1); C.release(1)
             for _ in range_(tiles_per_col_kv):
-                a = A.acquire(1)
-                c = Ck.acquire(1)
+                a = A.acquire(1); c = C.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
-                A.release(1)
-                Ck.release(1)
-            # V phase
+                A.release(1); C.release(1)
             for _ in range_(tiles_per_col_kv):
-                a = A.acquire(1)
-                c = Cv.acquire(1)
+                a = A.acquire(1); c = C.acquire(1)
                 fn(m_input_qkv, 0, a, b, c)
-                A.release(1)
-                Cv.release(1)
+                A.release(1); C.release(1)
             B.release(1)
 
     col0_worker = Worker(
         col0_body,
         [rms_in_fifo.cons(), bq_l3l2_fifo.prod(),
-         Aqkv_fifos[0].cons(),
-         Cq_sub[0].prod(), Ck_sub[0].prod(), Cv_sub[0].prod(),
+         Aqkv_sub[0].cons(), Cqkv_joined[0].prod(),
          pre_rms_col0_fn, qkv_gemv_static_fn],
     )
     qkv_workers_rest = [
         Worker(colN_body,
-               [Aqkv_fifos[i].cons(), bq_mem_fifo.cons(),
-                Cq_sub[i].prod(), Ck_sub[i].prod(), Cv_sub[i].prod(),
-                qkv_gemv_fn])
+               [Aqkv_sub[i].cons(), bq_mem_fifo.cons(),
+                Cqkv_joined[i].prod(), qkv_gemv_fn])
         for i in range(1, cols)
     ]
     qkv_workers = [col0_worker] + qkv_workers_rest
@@ -506,6 +484,7 @@ def my_layer_fused(
         [np.int32, np.int32, L1_Ao_ty, L1_Bo_ty, L1_Co_ty],
     )
     # Weight sources + MemTile split → per-col weight sub-fifos.
+    ao_mem_cols     = [1, 5]                          # MemTile cols for Ao split
     ao_src_fifos = [ObjectFifo(Ao_src_ty, name=f"Ao_src_{s}", depth=2)
                     for s in range(n_shim_o)]
     Ao_sub = [None] * cols
@@ -514,7 +493,7 @@ def my_layer_fused(
             [j * packed_o_tile for j in range(cols_per_shim)],
             obj_types=[L1_Ao_ty] * cols_per_shim,
             names=[f"Ao_{s*cols_per_shim + j}" for j in range(cols_per_shim)],
-            placement=Tile(col=2 + 2 * s, row=1))   # MemTile cols 2,4
+            placement=Tile(col=ao_mem_cols[s], row=1))
         for j in range(cols_per_shim):
             Ao_sub[s * cols_per_shim + j] = subs[j]
     # attn_out broadcast (E bf16) from BO4 → O_proj workers: 1 shim S2MM.
@@ -534,7 +513,7 @@ def my_layer_fused(
     # A MemTile has limited input DMA channels (<8), so an 8-way join on one
     # MemTile overflows. Gather in n_join groups (4 cols each) on separate
     # MemTiles → n_join drains (still frees 8-n_join MM2S vs per-col drains).
-    n_join        = 2
+    n_join        = 1 if cols == 4 else 2
     cols_per_join = cols // n_join                       # 4
     join_mem_cols = [1, 5]                               # free MemTile columns
     o_out_round_ty = np.ndarray[(cols_per_join * m_input_o,), dtype_vec]  # 8 bf16
@@ -549,6 +528,9 @@ def my_layer_fused(
             placement=Tile(col=join_mem_cols[jg], row=1))
         for j in range(cols_per_join):
             Co_sub[jg * cols_per_join + j] = subs[j]
+
+    # FFLM-style on-chip O_proj→ANM: o_out_joined[jg] is consumed directly by ANM
+    # compute tile (col 0 row 4) via 2 .cons() ports. No DDR drain → saves 2 shim MM2S.
 
     def o_proj_body(Ao, Bo, Co, fn):
         for _ in range_(0xFFFFFFFF):
@@ -584,10 +566,27 @@ def my_layer_fused(
         f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
         [L1_E_ty, L1_E_ty, L1_E_ty, np.int32],
     )
-    anm_in_fifo  = ObjectFifo(L1_E_ty, name="anm_in",  depth=3)
+    # FFLM-style: o_out arrives via DDR round-trip (2 S2MM cap).
+    # anm_in_fifo carries inpL + gain (2 sequential fills).
+    anm_in_fifo  = ObjectFifo(L1_E_ty, name="anm_in",  depth=2)
+    # Staged through MemTile col 1 to free col 0's shim MM2S.
+    anm_mem_fifo = anm_in_fifo.cons().forward(
+        name="anm_mem", depth=2, placement=Tile(col=1, row=1))
     # ANM writes ffn_in directly into ffi_l3l2_fifo (no shim drain).
     # gate/up workers consume via ffi_mem_fifo forward. Saves 1 MM2S.
     anm_inpff_buf = Buffer(type=L1_E_ty, name="anm_inpff_buf")
+    # Local buffer where ANM assembles full E o_out from on-chip forward fifos
+    # (o_out_anm_0/1 each carry round-major chunks of cols_per_join*m_input_o
+    # bf16 elements; assemble copies them into col-major position).
+    anm_oout_buf  = Buffer(type=L1_E_ty, name="anm_oout_buf")
+
+    o_out_assemble_fn = Kernel(
+        f"{func_prefix}layer_fused_o_out_assemble_bf16",
+        f"{func_prefix}layer_fused_{e}_{h}_g{g}.o",
+        [np.ndarray[(cols_per_join * m_input_o,), dtype_vec],
+         L1_E_ty,
+         np.int32, np.int32, np.int32, np.int32, np.int32],
+    )
 
     def anm_body(in_fifo, ffi_out, inpff, af, nf):
         for _ in range_(0xFFFFFFFF):
@@ -647,8 +646,8 @@ def my_layer_fused(
     groups_inter      = inter_dim_per_col // g          # 32
     packed_dp_tile    = m_input_dp * inter_dim_per_col // 2 + m_input_dp * groups_inter * 2
     bytes_col_dp      = tiles_per_col_dp * packed_dp_tile
-    n_shim_dp         = 1
-    cols_per_shim_dp  = cols // n_shim_dp               # 8 (split 1→8, saves shim S2MM)
+    n_shim_dp         = 2
+    cols_per_shim_dp  = cols // n_shim_dp               # 4 (split 2→4, ≤6 MM2S per MemTile)
 
     L1_Agu_ty   = np.ndarray[(packed_gu_tile,), dtype_packed]            # 1 tile
     Agu_src_ty  = np.ndarray[(cols_per_shim_gu * packed_gu_tile,), dtype_packed]  # 1 round
@@ -681,7 +680,7 @@ def my_layer_fused(
     # tile j to col j's compute tile. The agu_src_taps TAP streams
     # 2*tiles_per_col_gu rounds (the interleaved [g0|u0|g1|u1...] BO2 layout),
     # so each col's worker sees gate,up,gate,up,... on successive acquires.
-    agu_mem_cols     = [2, 5]                            # cols 2,5 — each gets 4 MM2S
+    agu_mem_cols     = [2, 6]                            # cols 2,6 — each gets 4 MM2S
     agu_src_fifos = [ObjectFifo(Agu_src_ty, name=f"Agu_src_{s}", depth=2)
                      for s in range(n_shim_gu)]
     Agu_sub = [None] * cols
@@ -727,76 +726,67 @@ def my_layer_fused(
             Inter.release(1)
             Bgu.release(1)
 
-    # col-0 variant: folded ANM (ADD+post-RMS) FIRST (sequenced by tg_anm
-    # before tg_gu), then the gate/up decomp-B loop. Frees the standalone ANM
-    # tile so the layer fits 32 core tiles (qkv8 + o_proj8 + gate_up8 + down8).
-    def gate_up_anm_body(anm_in, anm_ffi, inpff, af, nf,
-                         Agu, Bgu, Inter, gu_fn, sm_fn):
+    def anm_standalone_body(anm_in, ffi_out, oo_joined, oo_buf, o_asm_fn, inpff, af, nf):
         for _ in range_(0xFFFFFFFF):
+            # ── o_out assemble on-chip ──
+            for r in range_(tiles_per_col_o):
+                r_i32 = arith.index_cast(T.i32(), r)
+                chunk = oo_joined.acquire(1)
+                o_asm_fn(chunk, oo_buf, r_i32, 0, cols_per_join, m_input_o, e // cols)
+                oo_joined.release(1)
             # ── ANM (one shot per dispatch) ──
-            sub = anm_in.acquire(3)        # [o_out, inpL, gain]
-            ffi = anm_ffi.acquire(1)
-            af(sub[0], sub[1], inpff, e)   # inpFF = o_out + inpL (local buf)
-            nf(inpff, sub[2], ffi, e)      # ffn_in = rms(inpFF) * gain
-            anm_in.release(3)
-            anm_ffi.release(1)
-            # ── gate/up decomp-B (blocks on Bgu until tg_gu broadcasts ffn_in) ──
-            b = Bgu.acquire(1)
-            ro = 0
-            for _ in range_(tiles_per_col_gu):
-                a_g = Agu.acquire(1)
-                gu_fn(m_input_gu, ro, a_g, b, 0)
-                Agu.release(1)
-                a_u = Agu.acquire(1)
-                gu_fn(m_input_gu, ro, a_u, b, 1)
-                Agu.release(1)
-                ro += m_input_gu
-            inter = Inter.acquire(1)
-            sm_fn(inter, inter_dim_per_col)
-            Inter.release(1)
-            Bgu.release(1)
+            sub = anm_in.acquire(2)        # [inpL, gain]
+            inpL, gn = sub[0], sub[1]
+            ffi = ffi_out.acquire(1)
+            af(oo_buf, inpL, inpff, e)     # inpFF = o_out + inpL
+            nf(inpff, gn, ffi, e)          # ffn_in = rms(inpFF) * gain
+            anm_in.release(2)
+            ffi_out.release(1)
+
+    # Standalone ANM worker on a free tile
+    anm_worker = Worker(
+        anm_standalone_body,
+        [anm_mem_fifo.cons(), ffi_l3l2_fifo.prod(),
+         o_out_joined[0].cons(),
+         anm_oout_buf, o_out_assemble_fn,
+         anm_inpff_buf, add_fn, rms2_fn],
+        placement=Tile(col=4, row=4)
+    )
 
     gate_up_workers = [
-        Worker(gate_up_anm_body,
-               [anm_in_fifo.cons(), ffi_l3l2_fifo.prod(), anm_inpff_buf,
-                add_fn, rms2_fn,
-                Agu_sub[0].cons(), ffi_mem_fifo.cons(),
-                inter_fifos[0].prod(), gate_up_fn, silu_mul_fn],
-               placement=Tile(col=0, row=4))
-    ] + [
         Worker(gate_up_body,
                [Agu_sub[i].cons(), ffi_mem_fifo.cons(),
                 inter_fifos[i].prod(), gate_up_fn, silu_mul_fn],
                placement=Tile(col=i, row=4))
-        for i in range(1, cols)
+        for i in range(cols)
     ]
 
     # down-B weights split: W_down[:, c*K:(c+1)*K] per col, K=inter_dim_per_col.
-    # Each shim source carries cols_per_shim_dp full col streams.
+    # 2 shim sources (n_shim_dp=2), each split → 4 cols on its MemTile (4 MM2S).
+    adp_mem_cols     = [3, 7]                            # MemTile cols for Adp split
     adp_src_fifos = [ObjectFifo(Adp_src_ty, name=f"Adp_src_{s}", depth=2)
                      for s in range(n_shim_dp)]
     Adp_sub = [None] * cols
-    col_stream_dp = tiles_per_col_dp * packed_dp_tile
     for s in range(n_shim_dp):
         subs = adp_src_fifos[s].cons().split(
             [j * packed_dp_tile for j in range(cols_per_shim_dp)],
             obj_types=[L1_Adp_ty] * cols_per_shim_dp,
             names=[f"Adp_{s*cols_per_shim_dp + j}" for j in range(cols_per_shim_dp)],
-            placement=Tile(col=1 + 2 * s, row=1))
+            placement=Tile(col=adp_mem_cols[s], row=1))
         for j in range(cols_per_shim_dp):
             Adp_sub[s * cols_per_shim_dp + j] = subs[j]
 
-    # Cross-column MemTile join for down partial outputs — mirrors O_proj R2-F2b.
-    # 8 per-col drains → 2 groups of 4 cols → 2 MM2S (vs 8 direct MM2S).
-    n_join_dp     = 2
-    cols_per_join_dp  = cols // n_join_dp               # 4
-    join_mem_cols_dp  = [3, 4]                           # free MemTile cols
-    Cdp_round_ty  = np.ndarray[(cols_per_join_dp * m_input_dp,), dtype_vec]
-    Cdp_joined = [ObjectFifo(Cdp_round_ty, name=f"Cdp_joined_{jg}", depth=2)
-                  for jg in range(n_join_dp)]
+    # FFLM-style on-chip Down partials join to save 6 global S2MM channels:
+    # Join Down partials on MemTiles (gather 8 cols -> 2 groups -> 2 drains)
+    n_join_dp        = 2
+    cols_per_join_dp = cols // n_join_dp                       # 4
+    join_mem_cols_dp = [3, 7]                                 # free MemTile columns
+    ffn_out_round_ty = np.ndarray[(cols_per_join_dp * m_input_dp,), dtype_vec]
+    ffn_out_joined = [ObjectFifo(ffn_out_round_ty, name=f"ffn_out_joined_{jg}", depth=2)
+                      for jg in range(n_join_dp)]
     Cdp_sub = [None] * cols
     for jg in range(n_join_dp):
-        subs = Cdp_joined[jg].prod().join(
+        subs = ffn_out_joined[jg].prod().join(
             [j * m_input_dp for j in range(cols_per_join_dp)],
             obj_types=[L1_Cdp_ty] * cols_per_join_dp,
             names=[f"Cdp_{jg*cols_per_join_dp + j}" for j in range(cols_per_join_dp)],
@@ -804,11 +794,10 @@ def my_layer_fused(
         for j in range(cols_per_join_dp):
             Cdp_sub[jg * cols_per_join_dp + j] = subs[j]
 
-    # down-B body: hold the col's silu slice (inter, from gate/up ON-CHIP),
-    # GEMV against W_down[:, c-slice] (K=inter_dim_per_col) → partial E.
+    # down-B body: hold the col's silu slice, GEMV against W_down → partial E.
     def down_body(Adp, Inter, Cdp, fn):
         for _ in range_(0xFFFFFFFF):
-            b = Inter.acquire(1)               # this col's 1024 silu elems
+            b = Inter.acquire(1)
             for _ in range_(tiles_per_col_dp):
                 a = Adp.acquire(1)
                 c = Cdp.acquire(1)
@@ -836,8 +825,8 @@ def my_layer_fused(
 
     # ── Attention workers (7 cols 1-7, col 0 SKIPPED for shim-channel cap) ──
     # AIE2P shim has 2 S2MM + 2 MM2S channels per col. Col 0 is already at
-    # 3 S2MM (Aqkv + rms_in + bq broadcast not from shim) + 1 MM2S (Cqkv);
-    # adding kv_l3l2_fifos[0] + attn_drain_fifos[0] would push it over.
+    # With QKV MemTile-split: col 0 no longer has per-col Aqkv shim S2MM.
+    # Col 0 shim = rms_in S2MM + Cqkv MM2S = 1+1 (room for more).
     #
     # For this checkpoint we wire attention on cols 1-7 only (7 of 8 kv
     # heads). Col 0's kv_head (head 0) does NOT get attention compute on
@@ -878,8 +867,8 @@ def my_layer_fused(
                                    depth=1) for c in attn_cols]
 
     # NOTE: q_rot via MemTile gather attempted but shim 2-S2MM cap is
-    # exhausted on EVERY col (col 0: rms_in + Aqkv; cols 1-7: Aqkv +
-    # kv_l3l2). Dropping in a q_rot producer from any shim → MemTile
+    # was exhausted on EVERY col before QKV MemTile-split. Now that Aqkv
+    # goes via split (not per-col shim), cols 1-7 have room. Dropping in a
     # entry fails placement.
     #
     # Real fix needs producer-side rerouting: e.g. drop the dedicated
@@ -1021,41 +1010,37 @@ def my_layer_fused(
     ]
 
     # ── Q GEMV TAPs ──────────────────────────────────────────────────────────
-    # Each col reads its bytes_col_q slice of W_q from BO0 (declared as
-    # bf16-element halved-shape, so byte offset = element offset × 2).
-    # bytes_col_q is in BYTES; the L3 type is bf16 elements; offsets and
-    # sizes inside the TAP are in *element* units (the design's L3 ndarray
-    # type was declared bf16 — the BD generator multiplies by itemsize for
-    # the actual byte count).
-    # post_attn_fused.design.py:330 also uses sizes=[1,1,1,N] linear chunk
-    # to avoid the partial-merge bug; we follow.
-    Aq_taps = [
+    # FFLM-style QKV weight TAPs for MemTile-split sources.
+    # Each aqkv_src_tap[phase][s] assembles one round of tiles from
+    # cols_per_shim_qkv columns, reading BO0's per-col-contiguous layout
+    # with a column stride. Mirrors O_proj split TAPs (ao_src_taps).
+    # Phase 0=Q, 1=K, 2=V. Each source s covers cols [s*cps .. (s+1)*cps).
+    Aqkv_src_q_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo0_bytes // 2),
-            offset=bo0_off_W_q + i * (bytes_col_q // 2),
-            sizes=[1, 1, 1, bytes_col_q // 2],
-            strides=[0, 0, 0, 1],
+            offset=bo0_off_W_q + s * cols_per_shim_qkv * (bytes_col_q // 2),
+            sizes=[1, tiles_per_col_q, cols_per_shim_qkv, packed_qkv_tile_bytes // 2],
+            strides=[0, packed_qkv_tile_bytes // 2, bytes_col_q // 2, 1],
         )
-        for i in range(cols)
+        for s in range(n_shim_qkv)
     ]
-    # K and V weight TAPs — same per-row tile size, fewer rows/col.
-    Ak_taps = [
+    Aqkv_src_k_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo0_bytes // 2),
-            offset=bo0_off_W_k + i * (bytes_col_kv // 2),
-            sizes=[1, 1, 1, bytes_col_kv // 2],
-            strides=[0, 0, 0, 1],
+            offset=bo0_off_W_k + s * cols_per_shim_qkv * (bytes_col_kv // 2),
+            sizes=[1, tiles_per_col_kv, cols_per_shim_qkv, packed_qkv_tile_bytes // 2],
+            strides=[0, packed_qkv_tile_bytes // 2, bytes_col_kv // 2, 1],
         )
-        for i in range(cols)
+        for s in range(n_shim_qkv)
     ]
-    Av_taps = [
+    Aqkv_src_v_taps = [
         TensorAccessPattern(
             tensor_dims=(1, bo0_bytes // 2),
-            offset=bo0_off_W_v + i * (bytes_col_kv // 2),
-            sizes=[1, 1, 1, bytes_col_kv // 2],
-            strides=[0, 0, 0, 1],
+            offset=bo0_off_W_v + s * cols_per_shim_qkv * (bytes_col_kv // 2),
+            sizes=[1, tiles_per_col_kv, cols_per_shim_qkv, packed_qkv_tile_bytes // 2],
+            strides=[0, packed_qkv_tile_bytes // 2, bytes_col_kv // 2, 1],
         )
-        for i in range(cols)
+        for s in range(n_shim_qkv)
     ]
     # Bq is normed (E bf16) in BO4 — broadcast via MemTile.
     bq_tap = TensorAccessPattern(
@@ -1064,38 +1049,11 @@ def my_layer_fused(
         sizes=[1, 1, 1, e],
         strides=[0, 0, 0, 1],
     )
-    # Cq_join_taps: joined drain for Q output — round-major layout.
-    # Each round = cols_per_join_qkv cols × m_input_qkv rows, written to
-    # BO4 q_rot region. Group jg covers cols [jg*4 .. jg*4+3].
-    Cq_join_taps = [
-        TensorAccessPattern(
-            tensor_dims=(1, bo4_elems),
-            offset=bo4_off_q_rot + jg * cols_per_join_qkv * rows_per_col_q,
-            sizes=[1, tiles_per_col_q, cols_per_join_qkv, m_input_qkv],
-            strides=[0, m_input_qkv, rows_per_col_q, 1],
-        )
-        for jg in range(n_join_qkv)
-    ]
-    # Ck_join_taps: joined drain for K output → BO4 k_rot region.
-    Ck_join_taps = [
-        TensorAccessPattern(
-            tensor_dims=(1, bo4_elems),
-            offset=bo4_off_k_rot + jg * cols_per_join_qkv * rows_per_col_kv,
-            sizes=[1, tiles_per_col_kv, cols_per_join_qkv, m_input_qkv],
-            strides=[0, m_input_qkv, rows_per_col_kv, 1],
-        )
-        for jg in range(n_join_qkv)
-    ]
-    # Cv_join_taps: joined drain for V output → BO4 v region.
-    Cv_join_taps = [
-        TensorAccessPattern(
-            tensor_dims=(1, bo4_elems),
-            offset=bo4_off_v + jg * cols_per_join_qkv * rows_per_col_kv,
-            sizes=[1, tiles_per_col_kv, cols_per_join_qkv, m_input_qkv],
-            strides=[0, m_input_qkv, rows_per_col_kv, 1],
-        )
-        for jg in range(n_join_qkv)
-    ]
+    # Per-col offsets (BO4 element units). inline_ops chain uses these as
+    # shim_dma_bd offsets — Q/K/V/down all share one Cqkv/Cdp shim channel.
+    Cq_offsets = [bo4_off_q_rot + i * rows_per_col_q for i in range(cols)]
+    Ck_offsets = [bo4_off_k_rot + i * rows_per_col_kv for i in range(cols)]
+    Cv_offsets = [bo4_off_v     + i * rows_per_col_kv for i in range(cols)]
 
     # ── O_proj TAPs (P0.4-R2-F1) ─────────────────────────────────────────────
     # ao_src[s] fill: assemble each streamed object as [col0_tile_j | col1_.. |
@@ -1105,8 +1063,8 @@ def my_layer_fused(
         TensorAccessPattern(
             tensor_dims=(1, bo1_bytes // 2),
             offset=s * cols_per_shim * (bytes_col_o // 2),
-            sizes=[1, tiles_per_col_o, cols_per_shim, packed_o_tile // 2],
-            strides=[0, packed_o_tile // 2, bytes_col_o // 2, 1],
+            sizes=[16, 64, 18, 32],
+            strides=[(packed_o_tile // 2) * 32, (packed_o_tile // 2) // 2, 32, 1],
         )
         for s in range(n_shim_o)
     ]
@@ -1137,8 +1095,8 @@ def my_layer_fused(
         TensorAccessPattern(
             tensor_dims=(1, bo2_bytes // 2),
             offset=bo2_off_gate + s * cols_per_shim_gu * (bytes_col_gu // 2),
-            sizes=[1, 2 * tiles_per_col_gu, cols_per_shim_gu, packed_gu_tile // 2],
-            strides=[0, packed_gu_tile // 2, bytes_col_gu // 2, 1],
+            sizes=[32, 64, 72, 32],
+            strides=[packed_gu_tile // 2, (packed_gu_tile // 2) * 32, 32, 1],
         )
         for s in range(n_shim_gu)
     ]
@@ -1151,24 +1109,15 @@ def my_layer_fused(
         TensorAccessPattern(
             tensor_dims=(1, bo2_bytes // 2),
             offset=bo2_off_down + s * cols_per_shim_dp * (bytes_col_dp // 2),
-            sizes=[1, tiles_per_col_dp, cols_per_shim_dp, packed_dp_tile // 2],
-            strides=[0, packed_dp_tile // 2, bytes_col_dp // 2, 1],
+            sizes=[2 * cols_per_shim_dp, tiles_per_col_dp // 2, 18, 32],
+            strides=[(tiles_per_col_dp // 2) * (packed_dp_tile // 2), packed_dp_tile // 2, 32, 1],
         )
         for s in range(n_shim_dp)
     ]
 
-    # ffn_out partial drains: cross-column join TAP — mirrors O_proj join TAP.
-    # Group jg covers cols [jg*4 .. jg*4+3]; each round = cols_per_join_dp
-    # cols × m_input_dp rows, written to BO4 ffn_part region.
-    ffn_part_join_taps = [
-        TensorAccessPattern(
-            tensor_dims=(1, bo4_elems),
-            offset=bo4_off_ffn_part + jg * cols_per_join_dp * e,
-            sizes=[1, tiles_per_col_dp, cols_per_join_dp, m_input_dp],
-            strides=[0, m_input_dp, e, 1],
-        )
-        for jg in range(n_join_dp)
-    ]
+    # Per-col ffn_out partial drain offsets (each col writes a full-E partial
+    # at offset i*E into BO4 ffn_part region).
+    ffn_part_offsets = [bo4_off_ffn_part + i * e for i in range(cols)]
 
     # o_out_joined[g] drains round-major [round r][col-in-group][row] → BO4
     # col-major o_out[(g*4 + col)*256 + r*m_input_o + row]. Mirror of split.
@@ -1182,12 +1131,22 @@ def my_layer_fused(
         for jg in range(n_join)
     ]
 
+    ffn_out_join_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, bo4_elems),
+            offset=bo4_off_ffn_part + jg * cols_per_join_dp * rows_per_col_dp,
+            sizes=[2, tiles_per_col_dp // 2, cols_per_join_dp, m_input_dp],
+            strides=[(tiles_per_col_dp // 2) * m_input_dp, m_input_dp, rows_per_col_dp, 1],
+        )
+        for jg in range(n_join_dp)
+    ]
+
     rt = Runtime()
     with rt.sequence(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
         rt.start(*qkv_workers, *skel_workers, *attn_workers, *o_proj_workers,
-                 *gate_up_workers, *down_workers)
+                 *gate_up_workers, *down_workers, anm_worker)
         # ── Phase 1: pre-RMS inputs (col 0's worker does the compute) ───────
         # No drain — pre_rms_col0 kernel writes normed into the bq_l3l2
         # fifo producer slot (broadcast via MemTile) AND into a static L1
@@ -1199,61 +1158,78 @@ def my_layer_fused(
         rt.fill(rms_in_fifo.prod(), w_qkv, w_norm1_tap, task_group=tg_rms)
         rt.finish_task_group(tg_rms)
 
-        # ── Phase 2: Q GEMV ─────────────────────────────────────────────────
-        # Unified qkv body: A=Aq, B=normed broadcast (produced by col 0),
-        # C drained to BO4 q_rot region. No host-side bq fill — col 0
-        # produces it inline.
-        # Unified qkv_worker first phase: A = Aq, B = normed broadcast,
-        # C drained to BO4 q_rot region.
-        tg_q = rt.task_group()
+        # ── Phase 2-4: QKV GEMV — FFLM-style time-multiplex BD chain ──────────
+        # Per col: ONE shim MM2S channel carries Q→K→V via 3 chained BDs
+        # (npu_dma_memcpy_nd × 3 → cmds2seq, exactly the FFLM mechanism).
+        # Weights load via MemTile-split sources (2 S2MM, not 8 per-col).
+        # Each source fills Q→K→V tiles in order; the split routes each
+        # round's sub-tile to the correct col's compute tile.
+        tg_qkv = rt.task_group()
+        # Q phase: weight fills via split sources
+        for s in range(n_shim_qkv):
+            rt.fill(aqkv_src_fifos[s].prod(), w_qkv, Aqkv_src_q_taps[s], task_group=tg_qkv)
         for i in range(cols):
-            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Aq_taps[i], task_group=tg_q)
-        # No bq_l3l2 fill — col 0's body produces it from pre_rms_col0 output.
-        for jg in range(n_join_qkv):
-            rt.drain(Cq_joined[jg].cons(), act, Cq_join_taps[jg],
-                     task_group=tg_q, wait=True)
-        rt.finish_task_group(tg_q)
+            # Dummy drain to register the shim cons endpoint (creates the
+            # shim_dma_allocation that the inline_ops chain then re-uses).
+            tap_dummy = TensorAccessPattern(
+                tensor_dims=(1, bo4_elems),
+                offset=Cq_offsets[i],
+                sizes=[1, 1, 1, m_input_qkv],
+                strides=[0, 0, 0, 1],
+            )
+            rt.drain(Cqkv_joined[i].cons(), act, tap_dummy, task_group=tg_qkv)
+        # K phase weights via split sources
+        for s in range(n_shim_qkv):
+            rt.fill(aqkv_src_fifos[s].prod(), w_qkv, Aqkv_src_k_taps[s], task_group=tg_qkv)
+        # V phase weights via split sources
+        for s in range(n_shim_qkv):
+            rt.fill(aqkv_src_fifos[s].prod(), w_qkv, Aqkv_src_v_taps[s], task_group=tg_qkv)
 
-        # ── Phase 3: K GEMV ─────────────────────────────────────────────────
-        # Same unified worker, second phase: A = Ak, B reused from col-0's
-        # static buffer (col 0) or held bq_mem acquire (cols 1-7), C drained
-        # to BO4 k_rot region.
-        tg_k = rt.task_group()
-        for i in range(cols):
-            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Ak_taps[i], task_group=tg_k)
-        for jg in range(n_join_qkv):
-            rt.drain(Ck_joined[jg].cons(), act, Ck_join_taps[jg],
-                     task_group=tg_k, wait=True)
-        rt.finish_task_group(tg_k)
+        # FFLM time-multiplex chain: per col, configure ONE task with 3 BDs
+        # (Q→K→V) on the same shim MM2S channel. This is the npu_dma_memcpy_nd
+        # × 3 pattern that gen_layer_seq composes via cmds2seq.
+        def qkv_drain_chain(act_rt):
+            act_op = act_rt.op
+            for i in range(cols):
+                task = dma_configure_task_for(f"Cqkv_{i}", issue_token=True)
+                with bds(task) as bd:
+                    with bd[0]:  # Q
+                        shim_dma_bd(act_op,
+                                    offset=Cq_offsets[i],
+                                    sizes=[1, 1, 1, rows_per_col_q - m_input_qkv],
+                                    strides=[0, 0, 0, 1])
+                        EndOp()
+                    with bd[1]:  # K
+                        shim_dma_bd(act_op,
+                                    offset=Ck_offsets[i],
+                                    sizes=[1, 1, 1, rows_per_col_kv],
+                                    strides=[0, 0, 0, 1])
+                        EndOp()
+                    with bd[2]:  # V
+                        shim_dma_bd(act_op,
+                                    offset=Cv_offsets[i],
+                                    sizes=[1, 1, 1, rows_per_col_kv],
+                                    strides=[0, 0, 0, 1])
+                        EndOp()
+                dma_start_task(task)
+                dma_await_task(task)
 
-        # ── Phase 4: V GEMV ─────────────────────────────────────────────────
-        # Third phase of unified worker: A = Av, B reused, C drained to
-        # BO4 v region.
-        tg_v = rt.task_group()
-        for i in range(cols):
-            rt.fill(Aqkv_fifos[i].prod(), w_qkv, Av_taps[i], task_group=tg_v)
-        for jg in range(n_join_qkv):
-            rt.drain(Cv_joined[jg].cons(), act, Cv_join_taps[jg],
-                     task_group=tg_v, wait=True)
-        rt.finish_task_group(tg_v)
+        rt.inline_ops(qkv_drain_chain, [act])
+        rt.finish_task_group(tg_qkv)
 
         # ── Phase 5: O_proj GEMV (P0.4-R2-F1) ───────────────────────────────
         # FFLM-style: weights via MemTile split from n_shim_o sources,
-        # attn_out broadcast via forward, o_out drained to BO4 (DDR baseline).
+        # attn_out broadcast via forward. o_out joined and kept ON-CHIP.
         tg_o = rt.task_group()
         for s in range(n_shim_o):
             rt.fill(ao_src_fifos[s].prod(), w_o, ao_src_taps[s], task_group=tg_o)
         rt.fill(bo_l3l2_fifo.prod(), act, attn_out_tap, task_group=tg_o)
-        for jg in range(n_join):
-            rt.drain(o_out_joined[jg].cons(), act, o_out_join_taps[jg],
-                     task_group=tg_o, wait=(jg == n_join - 1))
         rt.finish_task_group(tg_o)
 
-        # ── Phase 6: ANM (ADD + post-RMS), o_out → ffn_in on-chip (R2-F2c) ──────
+        # ── Phase 6: ANM (ADD + post-RMS), o_out → ffn_in (ON-CHIP dataflow) ──
         # ANM worker writes ffn_in directly into ffi_l3l2_fifo (no DDR drain).
         # gate/up workers consume via ffi_mem_fifo forward in tg_ffn.
         tg_anm = rt.task_group()
-        rt.fill(anm_in_fifo.prod(), act,   anm_oout_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), act,   anm_inpL_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), w_ffn, anm_gain_tap, task_group=tg_anm)
         rt.finish_task_group(tg_anm)
@@ -1269,9 +1245,9 @@ def my_layer_fused(
         # ffn_in already in ffi_l3l2_fifo — written by ANM worker directly.
         for s in range(n_shim_dp):
             rt.fill(adp_src_fifos[s].prod(), w_ffn, adp_src_taps[s], task_group=tg_ffn)
+        # Drain the joined ffn_out partials to DDR
         for jg in range(n_join_dp):
-            rt.drain(Cdp_joined[jg].cons(), act, ffn_part_join_taps[jg],
-                     task_group=tg_ffn, wait=(jg == n_join_dp - 1))
+            rt.drain(ffn_out_joined[jg].cons(), act, ffn_out_join_taps[jg], task_group=tg_ffn, wait=(jg == n_join_dp - 1))
         rt.finish_task_group(tg_ffn)
 
         # ATTN phase deferred — will land in next step with MemTile gather.

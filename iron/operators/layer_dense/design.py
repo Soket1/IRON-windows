@@ -513,7 +513,7 @@ def my_layer_fused(
     # A MemTile has limited input DMA channels (<8), so an 8-way join on one
     # MemTile overflows. Gather in n_join groups (4 cols each) on separate
     # MemTiles → n_join drains (still frees 8-n_join MM2S vs per-col drains).
-    n_join        = 2
+    n_join        = 1 if cols == 4 else 2
     cols_per_join = cols // n_join                       # 4
     join_mem_cols = [1, 5]                               # free MemTile columns
     o_out_round_ty = np.ndarray[(cols_per_join * m_input_o,), dtype_vec]  # 8 bf16
@@ -567,11 +567,11 @@ def my_layer_fused(
         [L1_E_ty, L1_E_ty, L1_E_ty, np.int32],
     )
     # FFLM-style: o_out arrives via DDR round-trip (2 S2MM cap).
-    # anm_in_fifo carries o_out + inpL + gain (3 sequential fills).
-    anm_in_fifo  = ObjectFifo(L1_E_ty, name="anm_in",  depth=3)
+    # anm_in_fifo carries inpL + gain (2 sequential fills).
+    anm_in_fifo  = ObjectFifo(L1_E_ty, name="anm_in",  depth=2)
     # Staged through MemTile col 1 to free col 0's shim MM2S.
     anm_mem_fifo = anm_in_fifo.cons().forward(
-        name="anm_mem", depth=3, placement=Tile(col=1, row=1))
+        name="anm_mem", depth=2, placement=Tile(col=1, row=1))
     # ANM writes ffn_in directly into ffi_l3l2_fifo (no shim drain).
     # gate/up workers consume via ffi_mem_fifo forward. Saves 1 MM2S.
     anm_inpff_buf = Buffer(type=L1_E_ty, name="anm_inpff_buf")
@@ -726,48 +726,39 @@ def my_layer_fused(
             Inter.release(1)
             Bgu.release(1)
 
-    # col-0 variant: folded ANM (ADD+post-RMS) FIRST (sequenced by tg_anm
-    # before tg_gu), then the gate/up decomp-B loop. Frees the standalone ANM
-    # tile so the layer fits 32 core tiles (qkv8 + o_proj8 + gate_up8 + down8).
-    # FFLM-style on-chip o_out: assemble from o_out_anm forward fifos (no DDR).
-    def gate_up_anm_body(anm_in, anm_ffi, inpff, af, nf,
-                         Agu, Inter, gu_fn, sm_fn):
+    def anm_standalone_body(anm_in, ffi_out, oo_joined, oo_buf, o_asm_fn, inpff, af, nf):
         for _ in range_(0xFFFFFFFF):
+            # ── o_out assemble on-chip ──
+            for r in range_(tiles_per_col_o):
+                r_i32 = arith.index_cast(T.i32(), r)
+                chunk = oo_joined.acquire(1)
+                o_asm_fn(chunk, oo_buf, r_i32, 0, cols_per_join, m_input_o, e // cols)
+                oo_joined.release(1)
             # ── ANM (one shot per dispatch) ──
-            sub = anm_in.acquire(3)        # [o_out, inpL, gain]
-            o_out, inpL, gn = sub[0], sub[1], sub[2]
-            ffi = anm_ffi.acquire(1)
-            af(o_out, inpL, inpff, e)      # inpFF = o_out + inpL
+            sub = anm_in.acquire(2)        # [inpL, gain]
+            inpL, gn = sub[0], sub[1]
+            ffi = ffi_out.acquire(1)
+            af(oo_buf, inpL, inpff, e)     # inpFF = o_out + inpL
             nf(inpff, gn, ffi, e)          # ffn_in = rms(inpFF) * gain
-            anm_in.release(3)
-            # ── gate/up decomp-B (uses local ffi directly, bypassing Bgu) ──
-            ro = 0
-            for _ in range_(tiles_per_col_gu):
-                a_g = Agu.acquire(1)
-                gu_fn(m_input_gu, ro, a_g, ffi, 0)
-                Agu.release(1)
-                a_u = Agu.acquire(1)
-                gu_fn(m_input_gu, ro, a_u, ffi, 1)
-                Agu.release(1)
-                ro += m_input_gu
-            inter = Inter.acquire(1)
-            sm_fn(inter, inter_dim_per_col)
-            Inter.release(1)
-            anm_ffi.release(1)
+            anm_in.release(2)
+            ffi_out.release(1)
+
+    # Standalone ANM worker on a free tile
+    anm_worker = Worker(
+        anm_standalone_body,
+        [anm_mem_fifo.cons(), ffi_l3l2_fifo.prod(),
+         o_out_joined[0].cons(),
+         anm_oout_buf, o_out_assemble_fn,
+         anm_inpff_buf, add_fn, rms2_fn],
+        placement=Tile(col=4, row=4)
+    )
 
     gate_up_workers = [
-        Worker(gate_up_anm_body,
-               [anm_mem_fifo.cons(), ffi_l3l2_fifo.prod(),
-                anm_inpff_buf, add_fn, rms2_fn,
-                Agu_sub[0].cons(),
-                inter_fifos[0].prod(), gate_up_fn, silu_mul_fn],
-               placement=Tile(col=0, row=4))
-    ] + [
         Worker(gate_up_body,
                [Agu_sub[i].cons(), ffi_mem_fifo.cons(),
                 inter_fifos[i].prod(), gate_up_fn, silu_mul_fn],
                placement=Tile(col=i, row=4))
-        for i in range(1, cols)
+        for i in range(cols)
     ]
 
     # down-B weights split: W_down[:, c*K:(c+1)*K] per col, K=inter_dim_per_col.
@@ -1155,7 +1146,7 @@ def my_layer_fused(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
         rt.start(*qkv_workers, *skel_workers, *attn_workers, *o_proj_workers,
-                 *gate_up_workers, *down_workers)
+                 *gate_up_workers, *down_workers, anm_worker)
         # ── Phase 1: pre-RMS inputs (col 0's worker does the compute) ───────
         # No drain — pre_rms_col0 kernel writes normed into the bq_l3l2
         # fifo producer slot (broadcast via MemTile) AND into a static L1
@@ -1228,20 +1219,17 @@ def my_layer_fused(
 
         # ── Phase 5: O_proj GEMV (P0.4-R2-F1) ───────────────────────────────
         # FFLM-style: weights via MemTile split from n_shim_o sources,
-        # attn_out broadcast via forward. o_out joined and drained to DDR.
+        # attn_out broadcast via forward. o_out joined and kept ON-CHIP.
         tg_o = rt.task_group()
         for s in range(n_shim_o):
             rt.fill(ao_src_fifos[s].prod(), w_o, ao_src_taps[s], task_group=tg_o)
         rt.fill(bo_l3l2_fifo.prod(), act, attn_out_tap, task_group=tg_o)
-        for jg in range(n_join):
-            rt.drain(o_out_joined[jg].cons(), act, o_out_join_taps[jg], task_group=tg_o)
         rt.finish_task_group(tg_o)
 
-        # ── Phase 6: ANM (ADD + post-RMS), o_out → ffn_in (DDR round-trip) ──
+        # ── Phase 6: ANM (ADD + post-RMS), o_out → ffn_in (ON-CHIP dataflow) ──
         # ANM worker writes ffn_in directly into ffi_l3l2_fifo (no DDR drain).
         # gate/up workers consume via ffi_mem_fifo forward in tg_ffn.
         tg_anm = rt.task_group()
-        rt.fill(anm_in_fifo.prod(), act,   anm_oout_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), act,   anm_inpL_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), w_ffn, anm_gain_tap, task_group=tg_anm)
         rt.finish_task_group(tg_anm)
