@@ -543,3 +543,17 @@ extern "C" void dual_fused_dequant_gemv_silu_mul_bf16(
     // m_output = m_input_gu = 8 = VEC -> exactly one chunk, no tail.
     (void)chunks;
 }
+
+extern "C" void post_attn_o_out_assemble_bf16(
+        const bfloat16 *chunk, bfloat16 *out,
+        int32_t round_idx, int32_t group_base,
+        int32_t n_cols, int32_t m_rows, int32_t col_stride) {
+    for (int k = 0; k < n_cols; k++) {
+        int32_t col = group_base + k;
+        for (int j = 0; j < m_rows; j++) {
+            out[col * col_stride + round_idx * m_rows + j] =
+                chunk[k * m_rows + j];
+        }
+    }
+}
+

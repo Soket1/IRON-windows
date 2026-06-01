@@ -33,10 +33,12 @@ from ml_dtypes import bfloat16
 import argparse
 
 import aie.dialects.index as index
+from aie.dialects import arith
+from aie.extras import types as T
 from aie.dialects.aie import *
 from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Buffer, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2, Tile
 
@@ -165,6 +167,14 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32,
                          [L1_anm_ty, L1_anm_ty, L1_anm_ty, np.int32])
     norm_mul_fn = Kernel(f"{func_prefix}post_attn_rms_norm_bf16", kobj,
                          [L1_anm_ty, L1_anm_ty, L1_anm_ty, np.int32])
+
+    n_join        = 1
+    cols_per_join = cols // n_join                       # 4
+    o_out_assemble_fn = Kernel(f"{func_prefix}post_attn_o_out_assemble_bf16", kobj,
+                               [np.ndarray[(cols_per_join * m_input_o,), dtype_vec],
+                                L1_anm_ty,
+                                np.int32, np.int32, np.int32, np.int32, np.int32])
+
     # Monolithic SwiGLU gate_up_worker (v7 revert): single worker per col
     # processes both gate and up phases (writing to static left_buf and
     # right_buf in the kernel), then runs silu_mul. Used in conjunction
@@ -192,13 +202,26 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32,
     kqv_l3l2_fifo = ObjectFifo(L1_Bo_ty, name="kqv_L3L2", depth=1)
     kqv_mem_fifo  = kqv_l3l2_fifo.cons().forward(
         name="kqv_mem", depth=1, placement=Tile(col=0, row=1))
-    Co_fifos  = [ObjectFifo(L1_Co_ty,  name=f"Co_{i}",  depth=2) for i in range(cols)]
+
+    # FFLM-style on-chip O_proj -> ANM: join Co_fifos on MemTile
+    join_mem_cols = [1, 5]
+    o_out_round_ty = np.ndarray[(cols_per_join * m_input_o,), dtype_vec]
+    o_out_joined = [ObjectFifo(o_out_round_ty, name=f"o_out_joined_{jg}", depth=2)
+                    for jg in range(n_join)]
+    Co_sub = [None] * cols
+    for jg in range(n_join):
+        subs = o_out_joined[jg].prod().join(
+            [j * m_input_o for j in range(cols_per_join)],
+            obj_types=[L1_Co_ty] * cols_per_join,
+            names=[f"Co_{jg*cols_per_join + j}" for j in range(cols_per_join)],
+            placement=Tile(col=join_mem_cols[jg], row=1))
+        for j in range(cols_per_join):
+            Co_sub[jg * cols_per_join + j] = subs[j]
 
     # ANM phase FIFOs (leader, 1 worker).
-    # Single input FIFO of depth=3 (fits AIE2P's 2-input-DMA tile limit):
-    # runtime fills 3 entries in order [o_proj_out, inpL, gain_weight];
-    # worker acquires(3) and indexes sub[0], sub[1], sub[2].
-    anm_in_fifo = ObjectFifo(L1_anm_ty, name="anm_in", depth=3)
+    # Single input FIFO of depth=2 (only inpL + gain_weight from DDR):
+    anm_in_fifo = ObjectFifo(L1_anm_ty, name="anm_in", depth=2)
+    anm_oout_buf = Buffer(type=L1_anm_ty, name="anm_oout_buf")
     # ANM outputs TWO separate fifos now (was a depth=2 single fifo):
     #   anm_inpff_fifo  : drains to L3 io[inpff_save] -- host post-FFN ADD
     #   anm_ffi_l1l2_fifo: routes via MemTile to all SwiGLU workers
@@ -244,21 +267,22 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32,
                 Co.release(1)
             Bo.release(1)
 
-    def anm_body(in_fifo, inpff_out, ffi_out, af, nf):
+    def anm_body(anm_in, ffi_out, inpff_out, oo_joined, oo_buf, o_asm_fn, af, nf):
         for _ in range_(0xFFFFFFFF):
-            # Acquire 3 input slots at once: [o_proj_out, inpL, gain_weight].
-            sub = in_fifo.acquire(3)
-            s = sub[0]
-            l = sub[1]
-            g = sub[2]
-            # Acquire one slot in each of the two output fifos:
-            # inpff_out drains to L3 io[inpff_save] (host post-FFN ADD);
-            # ffi_out is forwarded via MemTile to all SwiGLU workers.
+            # ── o_out assemble on-chip ──
+            for r in range_(tiles_per_col_o):
+                r_i32 = arith.index_cast(T.i32(), r)
+                chunk = oo_joined.acquire(1)
+                o_asm_fn(chunk, oo_buf, r_i32, 0, cols_per_join, m_input_o, embed_i32 // cols)
+                oo_joined.release(1)
+            # ── ANM (one shot per dispatch) ──
+            sub = anm_in.acquire(2)        # [inpL, gain]
+            inpL, gn = sub[0], sub[1]
             inpff = inpff_out.acquire(1)
             ffi   = ffi_out.acquire(1)
-            af(s, l, inpff, embed_i32)
-            nf(inpff, g, ffi, embed_i32)
-            in_fifo.release(3)
+            af(oo_buf, inpL, inpff, embed_i32)     # inpFF = o_out + inpL
+            nf(inpff, gn, ffi, embed_i32)          # ffn_in = rms(inpFF) * gain
+            anm_in.release(2)
             inpff_out.release(1)
             ffi_out.release(1)
 
@@ -296,14 +320,16 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32,
     o_proj_workers = [
         Worker(o_proj_body,
                [Ao_fifos[i].cons(), kqv_mem_fifo.cons(),
-                Co_fifos[i].prod(), o_proj_fn])
+                Co_sub[i].prod(), o_proj_fn])
         for i in range(cols)
     ]
 
     anm_worker = Worker(anm_body,
                         [anm_in_fifo.cons(),
-                         anm_inpff_fifo.prod(),
                          anm_ffi_l1l2_fifo.prod(),
+                         anm_inpff_fifo.prod(),
+                         o_out_joined[0].cons(),
+                         anm_oout_buf, o_out_assemble_fn,
                          add_fn, norm_mul_fn])
 
     # Monolithic SwiGLU workers (1 per col): each consumes its own Agu
@@ -431,28 +457,20 @@ def my_post_attn_fused(dev, cols, embed_dim, hidden_dim, group_size=32,
 
         # ── Phase 1: O_proj ───────────────────────────────────────────────────
         # Reads kqv from input_bundle[0..E] via broadcast MemTile fifo (one
-        # shim S2MM, fanned out to all cols' workers). Writes per-col scratch
-        # slices into io_bundle[0..E].
+        # shim S2MM, fanned out to all cols' workers).
         tg_o = rt.task_group()
         # Per-col weights still need their own shim — each col has a unique slice.
         for i in range(cols):
             rt.fill(Ao_fifos[i].prod(), w_o, Ao_taps[i], task_group=tg_o)
         # Single broadcast fill for kqv — all cols' o_proj workers consume.
         rt.fill(kqv_l3l2_fifo.prod(), inputs, kqv_tap, task_group=tg_o)
-        for i in range(cols):
-            rt.drain(Co_fifos[i].cons(), io, Co_taps[i],
-                     task_group=tg_o, wait=True)
+        # No DDR drain for Co_sub — they are joined on MemTile and consumed on-chip
         rt.finish_task_group(tg_o)
-        # io[0..E] now holds assembled o_proj_out
 
         # ── Phase 2: ADD + RMSNorm + MUL (ANM worker, 1 tile) ─────────────────
-        # ANM consumes 3 inputs via anm_in_fifo (depth=3) and produces 2
-        # outputs:
-        #   anm_inpff_fifo  -> shim drain to io[inpff_save_offset] (host post-FFN ADD)
-        #   anm_ffi_l1l2_fifo -> MemTile -> ffi_mem_fifo (SwiGLU workers consume,
-        #                                                  no shim)
+        # ANM consumes on-chip o_out from o_out_joined, and 2 inputs from DDR
+        # (inpL, gain) via anm_in_fifo.
         tg_anm = rt.task_group()
-        rt.fill(anm_in_fifo.prod(), io,     scratch_in_tap, task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), inputs, inpL_tap,       task_group=tg_anm)
         rt.fill(anm_in_fifo.prod(), inputs, gain_tap,       task_group=tg_anm)
         rt.drain(anm_inpff_fifo.cons(), io, inpff_save_tap,
