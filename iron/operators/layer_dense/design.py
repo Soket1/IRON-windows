@@ -801,16 +801,15 @@ def my_layer_fused(
             Bgu.release(1)
 
     # FFLM-style folded ANM: col-0 gate/up worker does ANM (o_out assemble +
-    # ADD + post-RMS → ffn_in) FIRST, then runs gate/up/silu. This frees the
-    # standalone ANM tile so the layer fits the AIE2P 32-core grid
-    # (qkv8 + o_proj8 + gate_up8 + down8 = 32). o_out comes from BOTH
-    # cross-col join groups (cols 0-3 + cols 4-7) → full-E assembly.
+    # ADD + post-RMS → ffn_in) FIRST, then runs gate/up/silu using the SAME
+    # ffi buffer as gate/up activation (skip ffi_mem cons — col 0 produces
+    # ffn_in, no need to receive it back via broadcast). Saves 1 S2MM on
+    # tile_0_4 (was 5, now 4). o_out comes from BOTH cross-col join groups.
     def gate_up_anm_body(anm_in, ffi_out, oo_joined_0, oo_joined_1, oo_buf, o_asm_fn,
                          inpff, af, nf,
-                         Agu, Bgu, Inter, gu_fn, sm_fn):
+                         Agu, Inter, gu_fn, sm_fn):
         for _ in range_(0xFFFFFFFF):
             # ── o_out assemble on-chip from cross-col joins ──
-            # Each round: group 0 chunk (cols 0-3) + group 1 chunk (cols 4-7)
             for r in range_(tiles_per_col_o):
                 r_i32 = arith.index_cast(T.i32(), r)
                 chunk0 = oo_joined_0.acquire(1)
@@ -819,29 +818,27 @@ def my_layer_fused(
                 chunk1 = oo_joined_1.acquire(1)
                 o_asm_fn(chunk1, oo_buf, r_i32, cols_per_join, cols_per_join, m_input_o, e // cols)
                 oo_joined_1.release(1)
-            # ── ANM (one shot per dispatch): inpFF=o_out+inpL, ffn_in=rms*gain ──
-            sub = anm_in.acquire(2)        # [inpL, gain]
+            # ── ANM: produce ffn_in INTO ffi_out slot (broadcasted to cols 1-7) ──
+            sub = anm_in.acquire(2)
             inpL, gn = sub[0], sub[1]
             ffi = ffi_out.acquire(1)
             af(oo_buf, inpL, inpff, e)
             nf(inpff, gn, ffi, e)
             anm_in.release(2)
-            ffi_out.release(1)
-            # ── gate/up decomp-B (blocks on Bgu until tg_gu broadcasts ffn_in) ──
-            b = Bgu.acquire(1)
+            # ── gate/up decomp-B: use `ffi` directly as activation (no Bgu) ──
             ro = 0
             for _ in range_(tiles_per_col_gu):
                 a_g = Agu.acquire(1)
-                gu_fn(m_input_gu, ro, a_g, b, 0)
+                gu_fn(m_input_gu, ro, a_g, ffi, 0)
                 Agu.release(1)
                 a_u = Agu.acquire(1)
-                gu_fn(m_input_gu, ro, a_u, b, 1)
+                gu_fn(m_input_gu, ro, a_u, ffi, 1)
                 Agu.release(1)
                 ro += m_input_gu
             inter = Inter.acquire(1)
             sm_fn(inter, inter_dim_per_col)
             Inter.release(1)
-            Bgu.release(1)
+            ffi_out.release(1)  # release AFTER gate/up consumed `ffi`
 
     gate_up_workers = [
         Worker(gate_up_anm_body,
@@ -849,7 +846,7 @@ def my_layer_fused(
                 o_out_relay[0].cons(), o_out_relay[1].cons(),
                 anm_oout_buf, o_out_assemble_fn,
                 anm_inpff_buf, add_fn, rms2_fn,
-                Agu_sub[0].cons(), ffi_mem_fifo.cons(),
+                Agu_sub[0].cons(),
                 inter_fifos[0].prod(), gate_up_fn, silu_mul_fn],
                placement=Tile(col=0, row=4))
     ] + [
