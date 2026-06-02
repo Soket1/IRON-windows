@@ -386,17 +386,19 @@ def my_layer_fused(
     o_len   = cols_per_shim * packed_o_tile
     gu_len  = cols_per_shim_gu * packed_gu_tile
     dp_len  = cols_per_shim_dp * packed_dp_tile
-    ffn_len = gu_len + dp_len
 
     aqkv_src_ty = np.ndarray[(qkv_len,), dtype_packed]
     ao_src_ty   = np.ndarray[(o_len,), dtype_packed]
-    ffn_src_ty  = np.ndarray[(ffn_len,), dtype_packed]
+    agu_src_ty  = np.ndarray[(gu_len,), dtype_packed]
+    adp_src_ty  = np.ndarray[(dp_len,), dtype_packed]
 
     aqkv_src_fifos = [ObjectFifo(aqkv_src_ty, name=f"Aqkv_src_{s}", depth=2)
                       for s in range(2)]
     ao_src_fifos   = [ObjectFifo(ao_src_ty, name=f"Ao_src_{s}", depth=2)
                       for s in range(2)]
-    ffn_src_fifos  = [ObjectFifo(ffn_src_ty, name=f"Ffn_src_{s}", depth=2)
+    agu_src_fifos  = [ObjectFifo(agu_src_ty, name=f"Agu_src_{s}", depth=2)
+                      for s in range(2)]
+    adp_src_fifos  = [ObjectFifo(adp_src_ty, name=f"Adp_src_{s}", depth=2)
                       for s in range(2)]
 
     Aqkv_sub = [None] * cols
@@ -404,45 +406,60 @@ def my_layer_fused(
     Agu_sub  = [None] * cols
     Adp_sub  = [None] * cols
 
-    for s in range(2):
-        c_base = s * cols_per_shim
+    # Each weight stream split on a DEDICATED MemTile column to keep
+    # per-MemTile MM2S within the 6-channel cap. Layout for cols=8:
+    #   s=0: QKV→col 0, Ao→col 1, Agu→col 2, Adp→col 3 (each 4 MM2S)
+    #   s=1: QKV→col 4, Ao→col 5, Agu→col 6, Adp→col 7
+    qkv_mem_offset = 0
+    ao_mem_offset  = 1
+    agu_mem_offset = 2
+    adp_mem_offset = 3
+    cols_per_group = cols // 2
 
-        # 1. QKV splits (uses cols_per_shim=2 MM2S channels)
+    for s in range(2):
+        c_base = s * cols_per_group
+
+        # 1. QKV split — dedicated MemTile
         aqkv_subs = aqkv_src_fifos[s].cons().split(
             offsets=[j * packed_qkv_tile_bytes for j in range(cols_per_shim_qkv)],
             obj_types=[L1_Aq_ty] * cols_per_shim_qkv,
             names=[f"Aqkv_{c_base + j}" for j in range(cols_per_shim_qkv)],
-            placement=Tile(col=c_base + 0, row=1)
+            placement=Tile(col=c_base + qkv_mem_offset, row=1)
         )
 
-        # 2. O splits (uses 2 MM2S channels)
+        # 2. O_proj split — dedicated MemTile
         ao_subs = ao_src_fifos[s].cons().split(
             offsets=[j * packed_o_tile for j in range(cols_per_shim)],
             obj_types=[L1_Ao_ty] * cols_per_shim,
             names=[f"Ao_{c_base + j}" for j in range(cols_per_shim)],
-            placement=Tile(col=c_base + 1, row=1)
+            placement=Tile(col=c_base + ao_mem_offset, row=1)
         )
 
-        # 3. FFN splits (4 MM2S channels: 2 for SwiGLU, 2 for Down)
-        ffn_subs = ffn_src_fifos[s].cons().split(
-            offsets=([j * packed_gu_tile for j in range(cols_per_shim_gu)] +
-                     [gu_len + j * packed_dp_tile for j in range(cols_per_shim_dp)]),
-            obj_types=([L1_Agu_ty] * cols_per_shim_gu +
-                       [L1_Adp_ty] * cols_per_shim_dp),
-            names=([f"Agu_{c_base + j}" for j in range(cols_per_shim_gu)] +
-                   [f"Adp_{c_base + j}" for j in range(cols_per_shim_dp)]),
-            placement=Tile(col=c_base + 0, row=1)
+        # 3. Gate/Up split — dedicated MemTile
+        agu_subs = agu_src_fifos[s].cons().split(
+            offsets=[j * packed_gu_tile for j in range(cols_per_shim_gu)],
+            obj_types=[L1_Agu_ty] * cols_per_shim_gu,
+            names=[f"Agu_{c_base + j}" for j in range(cols_per_shim_gu)],
+            placement=Tile(col=c_base + agu_mem_offset, row=1)
         )
 
-        # Map splits to Aqkv_sub, Ao_sub, etc.
+        # 4. Down split — dedicated MemTile
+        adp_subs = adp_src_fifos[s].cons().split(
+            offsets=[j * packed_dp_tile for j in range(cols_per_shim_dp)],
+            obj_types=[L1_Adp_ty] * cols_per_shim_dp,
+            names=[f"Adp_{c_base + j}" for j in range(cols_per_shim_dp)],
+            placement=Tile(col=c_base + adp_mem_offset, row=1)
+        )
+
+        # Map splits to per-col sub-fifos
         for j in range(cols_per_shim_qkv):
             Aqkv_sub[c_base + j] = aqkv_subs[j]
         for j in range(cols_per_shim):
             Ao_sub[c_base + j] = ao_subs[j]
         for j in range(cols_per_shim_gu):
-            Agu_sub[c_base + j] = ffn_subs[j]
+            Agu_sub[c_base + j] = agu_subs[j]
         for j in range(cols_per_shim_dp):
-            Adp_sub[c_base + j] = ffn_subs[cols_per_shim_gu + j]
+            Adp_sub[c_base + j] = adp_subs[j]
 
     bq_l3l2_fifo = ObjectFifo(L1_Bq_ty, name="bq_L3L2", depth=1)
     # bq broadcast staged through MemTile col 3 (avoids overlap with QKV
@@ -586,8 +603,18 @@ def my_layer_fused(
         for j in range(cols_per_join):
             Co_sub[jg * cols_per_join + j] = subs[j]
 
-    # FFLM-style on-chip O_proj→ANM: o_out_joined[jg] is consumed directly by ANM
-    # compute tile (col 0 row 4) via 2 .cons() ports. No DDR drain → saves 2 shim MM2S.
+    # FFLM-style 2-stage on-chip O_proj→ANM join (her weight_multiplex_plan Step 3):
+    # Stage 1 above: per-group joins on join_mem_cols[0/1].
+    # Stage 2 here: forward o_out_joined[0/1] to col 0 MemTile via `.forward()`,
+    # which the ANM tile consumes through TWO separate input fifos but both
+    # sourced from the same MemTile (mem_tile_0_1) — still 2 S2MM on tile_0_4.
+    # NOTE: True single-stream collapse requires custom MLIR; defer to follow-up.
+    o_out_relay = [o_out_joined[jg].cons().forward(
+                       name=f"o_out_relay_{jg}", depth=2,
+                       placement=Tile(col=0, row=1))
+                   for jg in range(n_join)]
+
+
 
     def o_proj_body(Ao, Bo, Co, fn):
         for _ in range_(0xFFFFFFFF):
@@ -773,39 +800,64 @@ def my_layer_fused(
             Inter.release(1)
             Bgu.release(1)
 
-    def anm_standalone_body(anm_in, ffi_out, oo_joined, oo_buf, o_asm_fn, inpff, af, nf):
+    # FFLM-style folded ANM: col-0 gate/up worker does ANM (o_out assemble +
+    # ADD + post-RMS → ffn_in) FIRST, then runs gate/up/silu. This frees the
+    # standalone ANM tile so the layer fits the AIE2P 32-core grid
+    # (qkv8 + o_proj8 + gate_up8 + down8 = 32). o_out comes from BOTH
+    # cross-col join groups (cols 0-3 + cols 4-7) → full-E assembly.
+    def gate_up_anm_body(anm_in, ffi_out, oo_joined_0, oo_joined_1, oo_buf, o_asm_fn,
+                         inpff, af, nf,
+                         Agu, Bgu, Inter, gu_fn, sm_fn):
         for _ in range_(0xFFFFFFFF):
-            # ── o_out assemble on-chip ──
+            # ── o_out assemble on-chip from cross-col joins ──
+            # Each round: group 0 chunk (cols 0-3) + group 1 chunk (cols 4-7)
             for r in range_(tiles_per_col_o):
                 r_i32 = arith.index_cast(T.i32(), r)
-                chunk = oo_joined.acquire(1)
-                o_asm_fn(chunk, oo_buf, r_i32, 0, cols_per_join, m_input_o, e // cols)
-                oo_joined.release(1)
-            # ── ANM (one shot per dispatch) ──
+                chunk0 = oo_joined_0.acquire(1)
+                o_asm_fn(chunk0, oo_buf, r_i32, 0, cols_per_join, m_input_o, e // cols)
+                oo_joined_0.release(1)
+                chunk1 = oo_joined_1.acquire(1)
+                o_asm_fn(chunk1, oo_buf, r_i32, cols_per_join, cols_per_join, m_input_o, e // cols)
+                oo_joined_1.release(1)
+            # ── ANM (one shot per dispatch): inpFF=o_out+inpL, ffn_in=rms*gain ──
             sub = anm_in.acquire(2)        # [inpL, gain]
             inpL, gn = sub[0], sub[1]
             ffi = ffi_out.acquire(1)
-            af(oo_buf, inpL, inpff, e)     # inpFF = o_out + inpL
-            nf(inpff, gn, ffi, e)          # ffn_in = rms(inpFF) * gain
+            af(oo_buf, inpL, inpff, e)
+            nf(inpff, gn, ffi, e)
             anm_in.release(2)
             ffi_out.release(1)
-
-    # Standalone ANM worker on a free tile
-    anm_worker = Worker(
-        anm_standalone_body,
-        [anm_mem_fifo.cons(), ffi_l3l2_fifo.prod(),
-         o_out_joined[0].cons(),
-         anm_oout_buf, o_out_assemble_fn,
-         anm_inpff_buf, add_fn, rms2_fn],
-        placement=Tile(col=4, row=4)
-    )
+            # ── gate/up decomp-B (blocks on Bgu until tg_gu broadcasts ffn_in) ──
+            b = Bgu.acquire(1)
+            ro = 0
+            for _ in range_(tiles_per_col_gu):
+                a_g = Agu.acquire(1)
+                gu_fn(m_input_gu, ro, a_g, b, 0)
+                Agu.release(1)
+                a_u = Agu.acquire(1)
+                gu_fn(m_input_gu, ro, a_u, b, 1)
+                Agu.release(1)
+                ro += m_input_gu
+            inter = Inter.acquire(1)
+            sm_fn(inter, inter_dim_per_col)
+            Inter.release(1)
+            Bgu.release(1)
 
     gate_up_workers = [
+        Worker(gate_up_anm_body,
+               [anm_mem_fifo.cons(), ffi_l3l2_fifo.prod(),
+                o_out_relay[0].cons(), o_out_relay[1].cons(),
+                anm_oout_buf, o_out_assemble_fn,
+                anm_inpff_buf, add_fn, rms2_fn,
+                Agu_sub[0].cons(), ffi_mem_fifo.cons(),
+                inter_fifos[0].prod(), gate_up_fn, silu_mul_fn],
+               placement=Tile(col=0, row=4))
+    ] + [
         Worker(gate_up_body,
                [Agu_sub[i].cons(), ffi_mem_fifo.cons(),
                 inter_fifos[i].prod(), gate_up_fn, silu_mul_fn],
                placement=Tile(col=i, row=4))
-        for i in range(cols)
+        for i in range(1, cols)
     ]
 
     # down-B weights split: W_down[:, c*K:(c+1)*K] per col, K=inter_dim_per_col.
@@ -1183,7 +1235,7 @@ def my_layer_fused(
         L3_w_qkv, L3_w_o, L3_w_ffn, L3_kv, L3_act,
     ) as (w_qkv, w_o, w_ffn, kv, act):
         rt.start(*qkv_workers, *skel_workers, *attn_workers, *o_proj_workers,
-                 *gate_up_workers, *down_workers, anm_worker)
+                 *gate_up_workers, *down_workers)
         # ── Phase 1: pre-RMS inputs (col 0's worker does the compute) ───────
         # No drain — pre_rms_col0 kernel writes normed into the bq_l3l2
         # fifo producer slot (broadcast via MemTile) AND into a static L1
@@ -1238,23 +1290,29 @@ def my_layer_fused(
                 dma_start_task(task_o)
                 dma_await_task(task_o)
                 
-                # 3. FFN weights task (from w_ffn_op)
-                task_ffn = dma_configure_task_for(f"Ffn_src_{s}", issue_token=True)
-                with bds(task_ffn) as bd:
+                # 3. Gate/Up weights task (from w_ffn_op)
+                task_agu = dma_configure_task_for(f"Agu_src_{s}", issue_token=True)
+                with bds(task_agu) as bd:
                     with bd[0]:
                         shim_dma_bd(w_ffn_op,
                                     offset=agu_src_taps[s].offset,
                                     sizes=agu_src_taps[s].sizes,
                                     strides=agu_src_taps[s].strides)
                         EndOp()
-                    with bd[1]:
+                dma_start_task(task_agu)
+                dma_await_task(task_agu)
+
+                # 4. Down weights task (from w_ffn_op)
+                task_adp = dma_configure_task_for(f"Adp_src_{s}", issue_token=True)
+                with bds(task_adp) as bd:
+                    with bd[0]:
                         shim_dma_bd(w_ffn_op,
                                     offset=adp_src_taps[s].offset,
                                     sizes=adp_src_taps[s].sizes,
                                     strides=adp_src_taps[s].strides)
                         EndOp()
-                dma_start_task(task_ffn)
-                dma_await_task(task_ffn)
+                dma_start_task(task_adp)
+                dma_await_task(task_adp)
 
         rt.inline_ops(weight_fill_chain, [w_qkv, w_o, w_ffn])
 
@@ -1285,14 +1343,21 @@ def my_layer_fused(
             )
             rt.fill(ao_src_fifos[s].prod(), w_o, tap_dummy_o, task_group=tg_qkv)
 
-            # Dummy fill for Ffn_src
-            tap_dummy_ffn = TensorAccessPattern(
+            # Dummy fills for Agu_src and Adp_src (separate sources)
+            tap_dummy_agu = TensorAccessPattern(
                 tensor_dims=(1, bo2_bytes // 2),
                 offset=0,
-                sizes=[1, 1, 1, ffn_len // 2],
+                sizes=[1, 1, 1, gu_len // 2],
                 strides=[0, 0, 0, 1],
             )
-            rt.fill(ffn_src_fifos[s].prod(), w_ffn, tap_dummy_ffn, task_group=tg_qkv)
+            rt.fill(agu_src_fifos[s].prod(), w_ffn, tap_dummy_agu, task_group=tg_qkv)
+            tap_dummy_adp = TensorAccessPattern(
+                tensor_dims=(1, bo2_bytes // 2),
+                offset=0,
+                sizes=[1, 1, 1, dp_len // 2],
+                strides=[0, 0, 0, 1],
+            )
+            rt.fill(adp_src_fifos[s].prod(), w_ffn, tap_dummy_adp, task_group=tg_qkv)
         # Weights are loaded via consolidated weight_fill_chain in inline_ops.
         for i in range(cols):
             # Dummy drain to register the shim cons endpoint (creates the
