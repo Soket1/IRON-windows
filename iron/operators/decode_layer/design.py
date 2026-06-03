@@ -222,42 +222,43 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             [OW_f[c].cons(), AttnFull.cons(), OC_f[c].prod(), oproj],
             placement=Tile(col=pc, row=5)))
 
-    # Source taps. A/OW stream gemv_tiles/o_tiles tile-rows; each row carries the
-    # N columns' tile interleaved so the MemTile split fans them per-column.
-    # W DDR layout = per-col contiguous (col c at c*gemv_tiles*packed_tile); the
-    # 4D tap gathers row t across cols: [_, tiles, cols, tile] with col-stride =
-    # gemv_tiles*packed_tile, tile-stride = packed_tile.
-    # packed_tile (2304) and kv_col (2048) exceed the 1023 DMA-BD dim limit, so
-    # the innermost contiguous dim is factored into 2 sub-dims (both <=1023). The
-    # 4D tap budget holds [tiles, cols, pt//f, f]; tiles & cols carry the column-
-    # major gather, pt//f & f stream the contiguous tile.
-    # Factor a contiguous dim of n elems (elem_bytes each) into [n//f, f] so both
-    # are <=1023 AND the innermost f*elem_bytes is a multiple of 4 bytes (DMA BD
-    # requires 4-byte-multiple transfers). For uint8 (1B) f must be mult of 4;
-    # for bf16 (2B) f must be even.
-    def _factor(n, elem_bytes):
-        need = 4 // elem_bytes if elem_bytes < 4 else 1   # f multiple needed
-        for f in (4, 8, 16, 32, 64, 128, 256, 512):
-            if f % need == 0 and n % f == 0 and n // f <= 1023:
-                return n // f, f
-        return n, 1
-    pt_a, pf_a = _factor(packed_tile, 1)                  # uint8 weights
-    pt_o, pf_o = _factor(o_packed, 1)
-    kv_n, kv_f = _factor(kv_col, 2)                       # bf16
-    w_tap  = TensorAccessPattern(tensor_dims=(1, num_cols * gemv_tiles * packed_tile),
-        offset=0, sizes=[gemv_tiles, num_cols, pt_a, pf_a],
-        strides=[packed_tile, gemv_tiles * packed_tile, pf_a, 1])
-    ow_tap = TensorAccessPattern(tensor_dims=(1, num_cols * o_tiles * o_packed),
-        offset=0, sizes=[o_tiles, num_cols, pt_o, pf_o],
-        strides=[o_packed, o_tiles * o_packed, pf_o, 1])
-    xn, xf = _factor(K_gemv, 2)                           # bf16 input vector
+    # Weight/input source fills use inline_ops BD chains (layer_fused mechanism),
+    # NOT a single multi-dim rt.fill tap — a single tap cannot express the per-
+    # tile column-major split streaming within the AIE DMA-BD structural limits
+    # (innermost dim <=1023, OUTER dims <=64, 4-byte-multiple transfers). The
+    # shim_dma_bd tap factors the per-column weight region into 4 dims, all sized
+    # to fit. Sizes are in ELEMENTS (uint8 -> bytes, bf16 -> bytes//2).
+    from aie.dialects.aie import EndOp
+    from aie.dialects.aiex import (
+        dma_configure_task_for, bds, shim_dma_bd, dma_start_task, dma_await_task,
+    )
+
+    def _bd_tap(n_elems_per_col, col_stride_elems, offset=0):
+        """4D tap gathering num_cols column slices (each n_elems_per_col, at
+        col_stride_elems apart) for the MemTile split. Factor n into [a, b] with
+        a<=64 (outer wrap) and b<=1023 (inner), b*elem 4-byte-multiple."""
+        n = n_elems_per_col
+        a, b = 1, n
+        for f in (64, 32, 16, 8, 4, 2):           # outer factor a<=64
+            if n % f == 0 and n // f <= 1023:
+                a, b = f, n // f
+                break
+        # dims: [a (outer, <=64), num_cols (<=64), b (inner, <=1023)] + lead 1
+        return TensorAccessPattern(
+            tensor_dims=(1, num_cols * col_stride_elems), offset=offset,
+            sizes=[1, a, num_cols, b],
+            strides=[0, b, col_stride_elems, 1])
+
+    # per-column weight/chunk element counts (uint8 weights count as bytes)
+    a_per_col  = gemv_tiles * packed_tile          # A weights/col (bytes)
+    ow_per_col = o_tiles * o_packed                 # O weights/col (bytes)
+    w_tap  = _bd_tap(a_per_col,  a_per_col)
+    ow_tap = _bd_tap(ow_per_col, ow_per_col)
+    kv_tap = _bd_tap(kv_col,     ahs_elems)         # bf16 chunk/col
+    xn, xf = (K_gemv // 64, 64) if K_gemv % 64 == 0 else (K_gemv, 1)
     x_tap  = TensorAccessPattern(tensor_dims=(1, K_gemv), offset=0,
-        sizes=[1, 1, xn, xf], strides=[0, 0, xf, 1])
-    # K/V: gather num_cols column chunks (each at c*ahs_elems in DDR) into the
-    # contiguous source buffer (kv_col = seq_len*head_dim, factored to fit BD).
-    kv_tap = TensorAccessPattern(tensor_dims=(1, num_cols * ahs_elems),
-        offset=0, sizes=[1, num_cols, kv_n, kv_f],
-        strides=[0, ahs_elems, kv_f, 1])
+        sizes=[1, 1, xf, xn], strides=[0, 0, xn, 1])
+
     def oc_tap(c):
         return TensorAccessPattern(tensor_dims=(1, E), offset=c * o_slice,
             sizes=[1, 1, o_tiles, m_input], strides=[0, 0, m_input, 1])
@@ -266,24 +267,41 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     with rt.sequence(L3_W_ty, L3_X_ty, L3_K_ty, L3_V_ty, L3_OW_ty, L3_O_ty) as \
             (w, x, k, v, ow, o):
         rt.start(*workers)
-        # phase 1: GEMV inputs — A weights (1 split src) + B vector (1 fwd src)
-        tg1 = rt.task_group()
-        rt.fill(A_full.prod(), w, w_tap, task_group=tg1)
-        rt.fill(B_src.prod(), x, x_tap, task_group=tg1)
-        rt.finish_task_group(tg1)
-        # phase 2: attention inputs — K + V (1 split src each)
-        tg2 = rt.task_group()
-        rt.fill(K_full.prod(), k, kv_tap, task_group=tg2)
-        rt.fill(V_full.prod(), v, kv_tap, task_group=tg2)
-        rt.finish_task_group(tg2)
-        # phase 3: O_proj weights (1 split src)
-        tg3 = rt.task_group()
-        rt.fill(OW_full.prod(), ow, ow_tap, task_group=tg3)
-        rt.finish_task_group(tg3)
-        # phase 4: drain o_out per column
-        tg4 = rt.task_group()
+
+        # Weight/chunk sources filled via inline_ops BD chains (one BD each,
+        # factored taps). B vector via normal rt.fill (small, fits).
+        def fill_chain(w_rt, k_rt, v_rt, ow_rt):
+            for name, op, tap in (("A_src", w_rt.op, w_tap),
+                                  ("K_src", k_rt.op, kv_tap),
+                                  ("V_src", v_rt.op, kv_tap),
+                                  ("OW_src", ow_rt.op, ow_tap)):
+                task = dma_configure_task_for(name, issue_token=True)
+                with bds(task) as bd:
+                    with bd[0]:
+                        shim_dma_bd(op, offset=tap.offset, sizes=tap.sizes,
+                                    strides=tap.strides)
+                        EndOp()
+                dma_start_task(task)
+                dma_await_task(task)
+        # layer_fused pattern: a DUMMY rt.fill (simple 1D tap) registers each
+        # source's producer endpoint + its shim S2MM channel; the inline_ops BD
+        # chain then carries the REAL factored transfer on that same channel.
+        def _dummy(n):
+            return TensorAccessPattern(tensor_dims=(1, n), offset=0,
+                sizes=[1, 1, 1, min(n, 1020)], strides=[0, 0, 0, 1])
+        tg_w = rt.task_group()
+        rt.fill(A_full.prod(),  w,  _dummy(num_cols * a_per_col),  task_group=tg_w)
+        rt.fill(K_full.prod(),  k,  _dummy(num_cols * ahs_elems),  task_group=tg_w)
+        rt.fill(V_full.prod(),  v,  _dummy(num_cols * ahs_elems),  task_group=tg_w)
+        rt.fill(OW_full.prod(), ow, _dummy(num_cols * ow_per_col), task_group=tg_w)
+        rt.finish_task_group(tg_w)
+        rt.inline_ops(fill_chain, [w, k, v, ow])
+
+        # B vector + o_out drains in a task_group
+        tg = rt.task_group()
+        rt.fill(B_src.prod(), x, x_tap, task_group=tg)
         for c in range(num_cols):
-            rt.drain(OC_f[c].cons(), o, oc_tap(c), task_group=tg4, wait=True)
-        rt.finish_task_group(tg4)
+            rt.drain(OC_f[c].cons(), o, oc_tap(c), task_group=tg, wait=True)
+        rt.finish_task_group(tg)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
