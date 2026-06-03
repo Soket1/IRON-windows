@@ -19,10 +19,11 @@ from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1, NPU2
+from aie.iron.device import NPU1, NPU2, Tile
 
 
-def my_fused_dequant_matvec_v2(dev, cols, M, K, m_input, m_output=None, group_size=32):
+def my_fused_dequant_matvec_v2(dev, cols, M, K, m_input, m_output=None, group_size=32,
+                               col_offset=2, compute_row=2):
     if m_output is None:
         m_output = m_input
 
@@ -40,6 +41,13 @@ def my_fused_dequant_matvec_v2(dev, cols, M, K, m_input, m_output=None, group_si
     dtype_out = np.dtype[bfloat16]
 
     dev_ty = NPU1() if dev == "npu" else NPU2()
+
+    # FFLM puts its 4-col INT4 GEMV array on the CENTRAL columns (2-5) in a
+    # single core row, not left-packed at col 0. NPU2 compute tiles span
+    # cols 0-7 x rows 2-5 (verified via device.get_compute_tiles). col_offset
+    # shifts the array right to match FFLM geometry.
+    assert col_offset + cols <= 8, "compute array overflows 8 columns"
+    assert compute_row in (2, 3, 4, 5), "NPU2 compute rows are 2-5"
 
     num_groups_per_row = K // group_size
     packed_tile_bytes = m_input * K // 2 + m_input * num_groups_per_row * 2
@@ -101,6 +109,7 @@ def my_fused_dequant_matvec_v2(dev, cols, M, K, m_input, m_output=None, group_si
                 C_L1L3_fifos[i].prod(),
                 fused_matvec,
             ],
+            placement=Tile(col=i + col_offset, row=compute_row),
         )
         for i in range(cols)
     ]

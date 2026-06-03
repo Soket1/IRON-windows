@@ -31,17 +31,23 @@ from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1, NPU2
+from aie.iron.device import NPU1, NPU2, Tile
 
 
 def my_qkv_dense(dev, cols, embed_dim, kv_dim, group_size=32,
-                 m_input=2, func_prefix=""):
+                 m_input=2, func_prefix="", col_offset=2, compute_row=2):
     M = embed_dim + 2 * kv_dim             # stacked Q|K|V output rows
     K = embed_dim                          # shared contraction dim
     assert M % cols == 0
     assert embed_dim % group_size == 0
 
     dev_ty = NPU1() if dev == "npu" else NPU2()
+    # FFLM puts its 4-col GEMV array on the CENTRAL columns (2-5), not
+    # left-packed 0-3 — cols 0/7 hold passive LUT/helper tiles. NPU2 compute
+    # tiles span cols 0-7 x rows 2-5 (verified against device.get_compute_tiles).
+    # col_offset shifts the array right; compute_row pins the core row.
+    assert col_offset + cols <= 8, "compute array overflows 8 columns"
+    assert compute_row in (2, 3, 4, 5), "NPU2 compute rows are 2-5"
     dtype_packed = np.dtype[np.uint8]
     dtype_vec    = np.dtype[bfloat16]
 
@@ -84,7 +90,8 @@ def my_qkv_dense(dev, cols, embed_dim, kv_dim, group_size=32,
             B_fifo.release(1)
 
     workers = [Worker(core_body,
-                      [A_fifos[i].cons(), B_fifos[i].cons(), C_fifos[i].prod(), matvec])
+                      [A_fifos[i].cons(), B_fifos[i].cons(), C_fifos[i].prod(), matvec],
+                      placement=Tile(col=i + col_offset, row=compute_row))
                for i in range(cols)]
 
     A_taps = [TensorAccessPattern(
