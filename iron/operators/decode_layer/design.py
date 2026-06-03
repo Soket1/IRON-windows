@@ -233,28 +233,40 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         dma_configure_task_for, bds, shim_dma_bd, dma_start_task, dma_await_task,
     )
 
-    def _bd_tap(n_elems_per_col, col_stride_elems, offset=0):
-        """4D tap gathering num_cols column slices (each n_elems_per_col, at
-        col_stride_elems apart) for the MemTile split. Factor n into [a, b] with
-        a<=64 (outer wrap) and b<=1023 (inner), b*elem 4-byte-multiple."""
-        n = n_elems_per_col
-        a, b = 1, n
-        for f in (64, 32, 16, 8, 4, 2):           # outer factor a<=64
-            if n % f == 0 and n // f <= 1023:
-                a, b = f, n // f
+    def _factor4(n):
+        """Factor a contiguous region of n elements into 4 row-major dims
+        [d0,d1,d2,d3] with d0..d2 <= 64 (outer BD wrap) and d3 <= 1023 (inner),
+        product == n. Mirrors layer_fused's [16,64,18,32] factorization. Returns
+        (sizes, strides) for a row-major contiguous blob."""
+        # greedily peel inner dim <=1023, then up to 3 outer dims <=64
+        dims = []
+        rem = n
+        # inner d3: largest divisor <=1023 (prefer 4-byte-friendly)
+        for d in range(min(rem, 1020), 0, -1):
+            if rem % d == 0:
+                dims.append(d); rem //= d; break
+        # outer dims <=64
+        while rem > 1 and len(dims) < 4:
+            placed = False
+            for d in range(min(rem, 64), 1, -1):
+                if rem % d == 0:
+                    dims.append(d); rem //= d; placed = True; break
+            if not placed:
                 break
-        # dims: [a (outer, <=64), num_cols (<=64), b (inner, <=1023)] + lead 1
-        return TensorAccessPattern(
-            tensor_dims=(1, num_cols * col_stride_elems), offset=offset,
-            sizes=[1, a, num_cols, b],
-            strides=[0, b, col_stride_elems, 1])
+        if rem != 1:
+            dims.append(rem)
+        dims = (dims + [1, 1, 1, 1])[:4]
+        sizes = list(reversed(dims))              # [d0..d3], d3 inner
+        strides, acc = [0, 0, 0, 0], 1
+        for i in range(3, -1, -1):
+            strides[i] = acc; acc *= sizes[i]
+        return sizes, strides
 
-    # per-column weight/chunk element counts (uint8 weights count as bytes)
-    a_per_col  = gemv_tiles * packed_tile          # A weights/col (bytes)
-    ow_per_col = o_tiles * o_packed                 # O weights/col (bytes)
-    w_tap  = _bd_tap(a_per_col,  a_per_col)
-    ow_tap = _bd_tap(ow_per_col, ow_per_col)
-    kv_tap = _bd_tap(kv_col,     ahs_elems)         # bf16 chunk/col
+    a_per_col  = gemv_tiles * packed_tile          # A weights/col (bytes, u8)
+    ow_per_col = o_tiles * o_packed                 # O weights/col (bytes, u8)
+    a_sz,  a_st  = _factor4(a_per_col)
+    ow_sz, ow_st = _factor4(ow_per_col)
+    kv_sz, kv_st = _factor4(kv_col)                 # bf16 chunk/col
     xn, xf = (K_gemv // 64, 64) if K_gemv % 64 == 0 else (K_gemv, 1)
     x_tap  = TensorAccessPattern(tensor_dims=(1, K_gemv), offset=0,
         sizes=[1, 1, xf, xn], strides=[0, 0, xn, 1])
@@ -270,17 +282,23 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
 
         # Weight/chunk sources filled via inline_ops BD chains (one BD each,
         # factored taps). B vector via normal rt.fill (small, fits).
+        # Each source gets a BD chain of num_cols BDs (one per column slice),
+        # every BD a contiguous per-col blob factored into <=64/<=1023 dims.
         def fill_chain(w_rt, k_rt, v_rt, ow_rt):
-            for name, op, tap in (("A_src", w_rt.op, w_tap),
-                                  ("K_src", k_rt.op, kv_tap),
-                                  ("V_src", v_rt.op, kv_tap),
-                                  ("OW_src", ow_rt.op, ow_tap)):
+            streams = [
+                ("A_src",  w_rt.op,  a_per_col,  a_sz,  a_st),
+                ("K_src",  k_rt.op,  ahs_elems,  kv_sz, kv_st),   # DDR col stride = ahs_elems
+                ("V_src",  v_rt.op,  ahs_elems,  kv_sz, kv_st),
+                ("OW_src", ow_rt.op, ow_per_col, ow_sz, ow_st),
+            ]
+            for name, op, col_stride, sz, st in streams:
                 task = dma_configure_task_for(name, issue_token=True)
                 with bds(task) as bd:
-                    with bd[0]:
-                        shim_dma_bd(op, offset=tap.offset, sizes=tap.sizes,
-                                    strides=tap.strides)
-                        EndOp()
+                    for c in range(num_cols):
+                        with bd[c]:
+                            shim_dma_bd(op, offset=c * col_stride,
+                                        sizes=sz, strides=st)
+                            EndOp()
                 dma_start_task(task)
                 dma_await_task(task)
         # layer_fused pattern: a DUMMY rt.fill (simple 1D tap) registers each
