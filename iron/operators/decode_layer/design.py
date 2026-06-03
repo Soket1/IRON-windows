@@ -227,18 +227,37 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # W DDR layout = per-col contiguous (col c at c*gemv_tiles*packed_tile); the
     # 4D tap gathers row t across cols: [_, tiles, cols, tile] with col-stride =
     # gemv_tiles*packed_tile, tile-stride = packed_tile.
+    # packed_tile (2304) and kv_col (2048) exceed the 1023 DMA-BD dim limit, so
+    # the innermost contiguous dim is factored into 2 sub-dims (both <=1023). The
+    # 4D tap budget holds [tiles, cols, pt//f, f]; tiles & cols carry the column-
+    # major gather, pt//f & f stream the contiguous tile.
+    # Factor a contiguous dim of n elems (elem_bytes each) into [n//f, f] so both
+    # are <=1023 AND the innermost f*elem_bytes is a multiple of 4 bytes (DMA BD
+    # requires 4-byte-multiple transfers). For uint8 (1B) f must be mult of 4;
+    # for bf16 (2B) f must be even.
+    def _factor(n, elem_bytes):
+        need = 4 // elem_bytes if elem_bytes < 4 else 1   # f multiple needed
+        for f in (4, 8, 16, 32, 64, 128, 256, 512):
+            if f % need == 0 and n % f == 0 and n // f <= 1023:
+                return n // f, f
+        return n, 1
+    pt_a, pf_a = _factor(packed_tile, 1)                  # uint8 weights
+    pt_o, pf_o = _factor(o_packed, 1)
+    kv_n, kv_f = _factor(kv_col, 2)                       # bf16
     w_tap  = TensorAccessPattern(tensor_dims=(1, num_cols * gemv_tiles * packed_tile),
-        offset=0, sizes=[1, gemv_tiles, num_cols, packed_tile],
-        strides=[0, packed_tile, gemv_tiles * packed_tile, 1])
+        offset=0, sizes=[gemv_tiles, num_cols, pt_a, pf_a],
+        strides=[packed_tile, gemv_tiles * packed_tile, pf_a, 1])
     ow_tap = TensorAccessPattern(tensor_dims=(1, num_cols * o_tiles * o_packed),
-        offset=0, sizes=[1, o_tiles, num_cols, o_packed],
-        strides=[0, o_packed, o_tiles * o_packed, 1])
+        offset=0, sizes=[o_tiles, num_cols, pt_o, pf_o],
+        strides=[o_packed, o_tiles * o_packed, pf_o, 1])
+    xn, xf = _factor(K_gemv, 2)                           # bf16 input vector
     x_tap  = TensorAccessPattern(tensor_dims=(1, K_gemv), offset=0,
-        sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
+        sizes=[1, 1, xn, xf], strides=[0, 0, xf, 1])
     # K/V: gather num_cols column chunks (each at c*ahs_elems in DDR) into the
-    # contiguous source buffer (each kv_col = seq_len*head_dim).
+    # contiguous source buffer (kv_col = seq_len*head_dim, factored to fit BD).
     kv_tap = TensorAccessPattern(tensor_dims=(1, num_cols * ahs_elems),
-        offset=0, sizes=[1, 1, num_cols, kv_col], strides=[0, 0, ahs_elems, 1])
+        offset=0, sizes=[1, num_cols, kv_n, kv_f],
+        strides=[0, ahs_elems, kv_f, 1])
     def oc_tap(c):
         return TensorAccessPattern(tensor_dims=(1, E), offset=c * o_slice,
             sizes=[1, 1, o_tiles, m_input], strides=[0, 0, m_input, 1])
