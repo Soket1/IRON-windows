@@ -69,11 +69,18 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     ahs = int((seq_len * head_dim * DTYPE_SIZE + 63) / 64) * 64
     ahs_elems = ahs // DTYPE_SIZE
 
-    L3_W_ty  = np.ndarray[(num_cols * gemv_tiles * packed_tile,), u8]
+    # FFLM-style ONE weight BO (like FFLM's bo1 = all layer weights together):
+    # QKV/A region then O_proj region, contiguous in a single DDR buffer. This
+    # keeps the kernel at 5 data BOs (FFLM's MLIR_AIE ABI: bo0-4), with the
+    # weight BO holding all GEMV weights. Layout: [W (num_cols*a_per_col) |
+    # OW (num_cols*ow_per_col)] — A_src reads at 0, OW_src at the W-region end.
+    w_region  = num_cols * gemv_tiles * packed_tile          # all QKV weights
+    ow_region = num_cols * o_tiles * o_packed                # all O weights
+    ow_base   = w_region                                     # OW offset in the BO
+    L3_WT_ty = np.ndarray[(w_region + ow_region,), u8]       # single weight BO
     L3_X_ty  = np.ndarray[(K_gemv,), bf]
     L3_K_ty  = np.ndarray[(num_cols * ahs_elems,), bf]
     L3_V_ty  = np.ndarray[(num_cols * ahs_elems,), bf]
-    L3_OW_ty = np.ndarray[(num_cols * o_tiles * o_packed,), u8]
     L3_O_ty  = np.ndarray[(E,), bf]                  # final o_out (E)
 
     # Kernels (declared once)
@@ -276,27 +283,27 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             sizes=[1, 1, o_tiles, m_input], strides=[0, 0, m_input, 1])
 
     rt = Runtime()
-    with rt.sequence(L3_W_ty, L3_X_ty, L3_K_ty, L3_V_ty, L3_OW_ty, L3_O_ty) as \
-            (w, x, k, v, ow, o):
+    with rt.sequence(L3_WT_ty, L3_X_ty, L3_K_ty, L3_V_ty, L3_O_ty) as \
+            (wt, x, k, v, o):
         rt.start(*workers)
 
-        # Weight/chunk sources filled via inline_ops BD chains (one BD each,
-        # factored taps). B vector via normal rt.fill (small, fits).
-        # Each source gets a BD chain of num_cols BDs (one per column slice),
-        # every BD a contiguous per-col blob factored into <=64/<=1023 dims.
-        def fill_chain(w_rt, k_rt, v_rt, ow_rt):
+        # Weight/chunk sources filled via inline_ops BD chains. A and OW weights
+        # come from the SAME weight BO (wt) at offsets 0 and ow_base — FFLM packs
+        # all layer weights into one BO. Each source: num_cols BDs (per column).
+        def fill_chain(wt_rt, k_rt, v_rt):
+            wt_op = wt_rt.op
             streams = [
-                ("A_src",  w_rt.op,  a_per_col,  a_sz,  a_st),
-                ("K_src",  k_rt.op,  ahs_elems,  kv_sz, kv_st),   # DDR col stride = ahs_elems
-                ("V_src",  v_rt.op,  ahs_elems,  kv_sz, kv_st),
-                ("OW_src", ow_rt.op, ow_per_col, ow_sz, ow_st),
+                ("A_src",  wt_op,    a_per_col,  0,       a_sz,  a_st),
+                ("OW_src", wt_op,    ow_per_col, ow_base, ow_sz, ow_st),
+                ("K_src",  k_rt.op,  ahs_elems,  0,       kv_sz, kv_st),
+                ("V_src",  v_rt.op,  ahs_elems,  0,       kv_sz, kv_st),
             ]
-            for name, op, col_stride, sz, st in streams:
+            for name, op, col_stride, base, sz, st in streams:
                 task = dma_configure_task_for(name, issue_token=True)
                 with bds(task) as bd:
                     for c in range(num_cols):
                         with bd[c]:
-                            shim_dma_bd(op, offset=c * col_stride,
+                            shim_dma_bd(op, offset=base + c * col_stride,
                                         sizes=sz, strides=st)
                             EndOp()
                 dma_start_task(task)
@@ -308,12 +315,12 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             return TensorAccessPattern(tensor_dims=(1, n), offset=0,
                 sizes=[1, 1, 1, min(n, 1020)], strides=[0, 0, 0, 1])
         tg_w = rt.task_group()
-        rt.fill(A_full.prod(),  w,  _dummy(num_cols * a_per_col),  task_group=tg_w)
+        rt.fill(A_full.prod(),  wt, _dummy(num_cols * a_per_col),  task_group=tg_w)
+        rt.fill(OW_full.prod(), wt, _dummy(num_cols * ow_per_col), task_group=tg_w)
         rt.fill(K_full.prod(),  k,  _dummy(num_cols * ahs_elems),  task_group=tg_w)
         rt.fill(V_full.prod(),  v,  _dummy(num_cols * ahs_elems),  task_group=tg_w)
-        rt.fill(OW_full.prod(), ow, _dummy(num_cols * ow_per_col), task_group=tg_w)
         rt.finish_task_group(tg_w)
-        rt.inline_ops(fill_chain, [w, k, v, ow])
+        rt.inline_ops(fill_chain, [wt, k, v])
 
         # B vector + o_out drains in a task_group
         tg = rt.task_group()

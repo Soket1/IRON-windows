@@ -75,12 +75,14 @@ class AIEDecodeLayer(AIEOperatorBase):
         o_packed = m * E // 2 + m * groups * 2
         dts = 2
         ahs = int((self.seq_len * self.head_dim * dts + 63) / 64) * 64
-        self.add_buffer("W", nc * gemv_tiles * packed_tile, dtype=np.uint8)
+        w_region = nc * gemv_tiles * packed_tile
+        ow_region = nc * o_tiles * o_packed
+        # FFLM-style single weight BO (all GEMV weights): QKV region + O region.
+        self.add_buffer("WT", w_region + ow_region, dtype=np.uint8)
         self.add_buffer("X", E, dtype=bfloat16)
         self.add_buffer("Kc", nc * (ahs // dts), dtype=bfloat16)
         self.add_buffer("Vc", nc * (ahs // dts), dtype=bfloat16)
-        self.add_buffer("OW", nc * o_tiles * o_packed, dtype=np.uint8)
         self.add_buffer("O", E, dtype=bfloat16)
         self.add_kernel("decode_layer", self.xclbin_artifact,
                         self.xclbin_artifact.kernel_name, self.insts_artifact)
-        self.add_to_runlist("decode_layer", "W", "X", "Kc", "Vc", "OW", "O")
+        self.add_to_runlist("decode_layer", "WT", "X", "Kc", "Vc", "O")
