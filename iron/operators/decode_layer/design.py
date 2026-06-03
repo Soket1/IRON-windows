@@ -59,8 +59,11 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     L1_V_ty   = np.ndarray[(chunk_size * head_dim,), bf]
     L1_O_ty   = np.ndarray[(q_rows,), bf]            # attn out slice (512)
     L1_E_ty   = np.ndarray[(E,), bf]                 # full attn_out
-    L1_OW_ty  = np.ndarray[(o_packed,), u8]          # O_proj weight tile
-    L1_OC_ty  = np.ndarray[(o_slice,), bf]           # o_out slice
+    L1_OW_ty  = np.ndarray[(o_packed,), u8]          # O_proj weight tile (= packed_tile, K=E)
+    # O_proj reuses the QKV v2-gemv kernel symbol → its C arg must match L1_Q_ty
+    # (578). O_proj writes o_slice=512 rows into it (first 512 used). o_packed
+    # == packed_tile and L1_E_ty == L1_B_ty (both K=E=2048), so all 3 args match.
+    L1_OC_ty  = L1_Q_ty                               # o_out buffer (write first o_slice)
 
     DTYPE_SIZE = 2
     ahs = int((seq_len * head_dim * DTYPE_SIZE + 63) / 64) * 64
@@ -87,18 +90,48 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     v_accum = Kernel("flowkv_value_accum_bf16",     fkv,
                      [L1_I_ty, L1_V_ty, np.int32, np.int32, np.int32])
     v_norm  = Kernel("flowkv_value_normalize_bf16", fkv, [L1_O_ty, np.int32, np.int32])
-    # O_proj: v2 GEMV kernel (K=E). c_out += row_offset.
-    oproj = Kernel("fused_dequant_matvec_v2_bf16",
-                   f"fused_dequant_gemv_v2_{E}k_g{group_size}.o",
-                   [np.int32, np.int32, L1_OW_ty, L1_E_ty, L1_OC_ty])
+    # O_proj is the SAME v2 GEMV kernel (K=E=K_gemv) as QKV — reuse the `gemv`
+    # Kernel object (declaring it twice redefines the symbol). The kernel's
+    # buffer args are generic memrefs; OW/L1_E/OC match A/B/Q element types
+    # closely enough (uint8 weights, bf16 in, bf16 out) for the same symbol.
+    oproj = gemv
 
-    A_f = [ObjectFifo(L1_A_ty, name=f"A_{c}", depth=2) for c in range(num_cols)]
-    B_f = [ObjectFifo(L1_B_ty, name=f"B_{c}", depth=1) for c in range(num_cols)]
-    K_f = [ObjectFifo(L1_K_ty, name=f"K_{c}", depth=2) for c in range(num_cols)]
-    V_f = [ObjectFifo(L1_V_ty, name=f"V_{c}", depth=2) for c in range(num_cols)]
+    # FFLM-style MemTile weight/input delivery: each stream is ONE shim source
+    # → split (weights, fan-out to N tiles) or forward (broadcast B) at a MemTile
+    # on a FREE edge column, instead of N per-column shim fills (which exhaust the
+    # 16-S2MM shim fabric). Cuts shim S2MM from ~20 to ~5.
+    # Source-fifo element = each column's FULL per-stage region; split gives N
+    # per-column sub-fifos whose element = one worker-acquire tile. The worker
+    # acquires its sub-fifo tile-by-tile; the MemTile streams the column slice.
+    # Source-fifo element = ONE tile-row across all columns (num_cols * tile),
+    # NOT the whole weight buffer (that would need MBs of MemTile memory). The
+    # split fans the N column slices of one tile-row to N sub-fifos; the source
+    # streams gemv_tiles/o_tiles rows via the DDR tap. Sub-fifo element = one
+    # per-column tile, acquired tile-by-tile in the worker.
+    kv_col  = chunk_size * head_dim                     # K/V per column (1 chunk)
+
+    A_full = ObjectFifo(np.ndarray[(num_cols * packed_tile,), u8], name="A_src", depth=2)
+    A_f = A_full.cons().split(
+        offsets=[c * packed_tile for c in range(num_cols)], placement=Tile(col=0, row=1),
+        obj_types=[L1_A_ty for _ in range(num_cols)])
+    OW_full = ObjectFifo(np.ndarray[(num_cols * o_packed,), u8], name="OW_src", depth=2)
+    OW_f = OW_full.cons().split(
+        offsets=[c * o_packed for c in range(num_cols)], placement=Tile(col=1, row=1),
+        obj_types=[L1_OW_ty for _ in range(num_cols)])
+    K_full = ObjectFifo(np.ndarray[(num_cols * kv_col,), bf], name="K_src", depth=2)
+    K_f = K_full.cons().split(
+        offsets=[c * kv_col for c in range(num_cols)], placement=Tile(col=6, row=1),
+        obj_types=[L1_K_ty for _ in range(num_cols)])
+    V_full = ObjectFifo(np.ndarray[(num_cols * kv_col,), bf], name="V_src", depth=2)
+    V_f = V_full.cons().split(
+        offsets=[c * kv_col for c in range(num_cols)], placement=Tile(col=7, row=1),
+        obj_types=[L1_V_ty for _ in range(num_cols)])
+    # input vector B: one shim source, broadcast (forward) to all columns
+    B_src = ObjectFifo(L1_B_ty, name="B_src", depth=1)
+    B_bcast = B_src.cons().forward(name="B_bcast", depth=1, placement=Tile(col=3, row=1))
+
     Qi  = [ObjectFifo(L1_Q_ty, name=f"Qi_{c}", depth=2) for c in range(num_cols)]
     Ii  = [ObjectFifo(L1_I_ty, name=f"Ii_{c}", depth=2) for c in range(num_cols)]
-    OW_f = [ObjectFifo(L1_OW_ty, name=f"OW_{c}", depth=2) for c in range(num_cols)]
     OC_f = [ObjectFifo(L1_OC_ty, name=f"OC_{c}", depth=2) for c in range(num_cols)]
 
     # attn_out join: 4 value-stage O slices → full-E fifo at MemTile col_offset.
@@ -108,13 +141,20 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # Place join + broadcast MemTiles on the FREE edge columns (1 and 6), NOT on
     # the central compute columns 2-5 — layer_fused does exactly this (join col1,
     # broadcast col6) so MemTiles don't collide with the compute-column tiles.
+    # MemTile usage so far: A-split col0, OW-split col1, K-split col6, V-split
+    # col7, B-forward col3. Use the remaining free MemTile cols 4,5 for the
+    # attn_out join and broadcast (each MemTile is independent; compute tiles on
+    # cols 4,5 are on rows 2-5, the MemTile is row 1).
+    # join gathers 4 O slices → AttnFull (one ObjectFifoLinkOp). The 4 O_proj
+    # workers read AttnFull.cons() directly — auto-broadcast through the MemTile.
+    # (A separate .forward() would put AttnFull in TWO link ops, which AIECC
+    # rejects: 'objectfifo cannot be in more than one ObjectFifoLinkOp'. The
+    # gather_probe proved direct multi-consumer broadcast works.)
     AttnFull = ObjectFifo(L1_E_ty, name="AttnFull", depth=2)
     O_parts = AttnFull.prod().join(
         offsets=[c * q_rows for c in range(num_cols)],
-        placement=Tile(col=1, row=1),
+        placement=Tile(col=4, row=1),
         obj_types=[L1_O_ty for _ in range(num_cols)])
-    AttnBcast = AttnFull.cons().forward(
-        name="attn_bcast", depth=1, placement=Tile(col=6, row=1))
 
     rope_lut_data = np.zeros(head_dim, dtype=bfloat16)
     rope_lut_data[0::2] = bfloat16(1.0); rope_lut_data[1::2] = bfloat16(0.0)
@@ -135,7 +175,7 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                 rope_fn(q, lut, q, head_dim)
                 qf.release(1); bf_.release(1)
         workers.append(Worker(gemv_body,
-            [A_f[c].cons(), B_f[c].cons(), Qi[c].prod(), luts[c], gemv, rope],
+            [A_f[c].cons(), B_bcast.cons(), Qi[c].prod(), luts[c], gemv, rope],
             placement=Tile(col=pc, row=2)))
 
         def score_body(kf, qf, inf, init_fn, rope_fn, chunk_fn):
@@ -151,6 +191,7 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         workers.append(Worker(score_body,
             [K_f[c].cons(), Qi[c].cons(), Ii[c].prod(), s_init, s_rope, s_chunk],
             placement=Tile(col=pc, row=3)))
+        # (K_f[c]/V_f[c] are split sub-fifos; .cons() is their read endpoint)
 
         def value_body(vf, inf, of, init_fn, accum_fn, norm_fn):
             for _ in range_(0xFFFFFFFF):
@@ -178,23 +219,26 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                     ow.release(1)
                 ab.release(1); oc.release(1)
         workers.append(Worker(oproj_body,
-            [OW_f[c].cons(), AttnBcast.cons(), OC_f[c].prod(), oproj],
+            [OW_f[c].cons(), AttnFull.cons(), OC_f[c].prod(), oproj],
             placement=Tile(col=pc, row=5)))
 
-    # taps
-    def a_tap(c):
-        return TensorAccessPattern(tensor_dims=(1, num_cols * gemv_tiles * packed_tile),
-            offset=c * gemv_tiles * packed_tile,
-            sizes=[1, 1, 1, gemv_tiles * packed_tile], strides=[0, 0, 0, 1])
-    x_tap = TensorAccessPattern(tensor_dims=(1, K_gemv), offset=0,
+    # Source taps. A/OW stream gemv_tiles/o_tiles tile-rows; each row carries the
+    # N columns' tile interleaved so the MemTile split fans them per-column.
+    # W DDR layout = per-col contiguous (col c at c*gemv_tiles*packed_tile); the
+    # 4D tap gathers row t across cols: [_, tiles, cols, tile] with col-stride =
+    # gemv_tiles*packed_tile, tile-stride = packed_tile.
+    w_tap  = TensorAccessPattern(tensor_dims=(1, num_cols * gemv_tiles * packed_tile),
+        offset=0, sizes=[1, gemv_tiles, num_cols, packed_tile],
+        strides=[0, packed_tile, gemv_tiles * packed_tile, 1])
+    ow_tap = TensorAccessPattern(tensor_dims=(1, num_cols * o_tiles * o_packed),
+        offset=0, sizes=[1, o_tiles, num_cols, o_packed],
+        strides=[0, o_packed, o_tiles * o_packed, 1])
+    x_tap  = TensorAccessPattern(tensor_dims=(1, K_gemv), offset=0,
         sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
-    def kv_tap(c):
-        return TensorAccessPattern(tensor_dims=(num_cols * ahs_elems,),
-            offset=c * ahs_elems, sizes=[1, 1, 1, seq_len * head_dim], strides=[0, 0, 0, 1])
-    def ow_tap(c):
-        return TensorAccessPattern(tensor_dims=(1, num_cols * o_tiles * o_packed),
-            offset=c * o_tiles * o_packed,
-            sizes=[1, 1, 1, o_tiles * o_packed], strides=[0, 0, 0, 1])
+    # K/V: gather num_cols column chunks (each at c*ahs_elems in DDR) into the
+    # contiguous source buffer (each kv_col = seq_len*head_dim).
+    kv_tap = TensorAccessPattern(tensor_dims=(1, num_cols * ahs_elems),
+        offset=0, sizes=[1, 1, num_cols, kv_col], strides=[0, 0, ahs_elems, 1])
     def oc_tap(c):
         return TensorAccessPattern(tensor_dims=(1, E), offset=c * o_slice,
             sizes=[1, 1, o_tiles, m_input], strides=[0, 0, m_input, 1])
@@ -203,20 +247,21 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     with rt.sequence(L3_W_ty, L3_X_ty, L3_K_ty, L3_V_ty, L3_OW_ty, L3_O_ty) as \
             (w, x, k, v, ow, o):
         rt.start(*workers)
+        # phase 1: GEMV inputs — A weights (1 split src) + B vector (1 fwd src)
         tg1 = rt.task_group()
-        for c in range(num_cols):
-            rt.fill(A_f[c].prod(), w, a_tap(c), task_group=tg1)
-            rt.fill(B_f[c].prod(), x, x_tap, task_group=tg1)
+        rt.fill(A_full.prod(), w, w_tap, task_group=tg1)
+        rt.fill(B_src.prod(), x, x_tap, task_group=tg1)
         rt.finish_task_group(tg1)
+        # phase 2: attention inputs — K + V (1 split src each)
         tg2 = rt.task_group()
-        for c in range(num_cols):
-            rt.fill(K_f[c].prod(), k, kv_tap(c), task_group=tg2)
-            rt.fill(V_f[c].prod(), v, kv_tap(c), task_group=tg2)
+        rt.fill(K_full.prod(), k, kv_tap, task_group=tg2)
+        rt.fill(V_full.prod(), v, kv_tap, task_group=tg2)
         rt.finish_task_group(tg2)
+        # phase 3: O_proj weights (1 split src)
         tg3 = rt.task_group()
-        for c in range(num_cols):
-            rt.fill(OW_f[c].prod(), ow, ow_tap(c), task_group=tg3)
+        rt.fill(OW_full.prod(), ow, ow_tap, task_group=tg3)
         rt.finish_task_group(tg3)
+        # phase 4: drain o_out per column
         tg4 = rt.task_group()
         for c in range(num_cols):
             rt.drain(OC_f[c].cons(), o, oc_tap(c), task_group=tg4, wait=True)
