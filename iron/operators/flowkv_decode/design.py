@@ -11,7 +11,7 @@ from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import _for as range_
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1, NPU2
+from aie.iron.device import NPU1, NPU2, Tile
 
 """
 FlowKV Decode Attention Design.
@@ -64,7 +64,18 @@ def my_flowkv_decode(
     seq_len,
     chunk_size=32,
     num_cols=4,
+    col_offset=2,
+    score_row=2,
+    value_row=3,
 ):
+    # FFLM runs decode-attention on the CENTRAL columns (2-5), not left-packed
+    # 0..N-1. Each KV-group lane i is a vertical score->value pipeline inside
+    # one central column (col i+col_offset): score on score_row, value on
+    # value_row, chained on-chip via inter_fifos[i] (tile-to-tile, no DDR).
+    # NPU2 compute tiles span cols 0-7 x rows 2-5.
+    assert col_offset + num_cols <= 8, "attention array overflows 8 columns"
+    assert score_row in (2, 3, 4, 5) and value_row in (2, 3, 4, 5)
+    assert score_row != value_row, "score and value need distinct rows in-column"
     group_size = num_heads // num_kv_heads
     num_chunks = seq_len // chunk_size
     # Kernel object filename encodes HEAD_DIM (flowkv_{head_dim}d.o) and is
@@ -302,6 +313,7 @@ def my_flowkv_decode(
                 score_rope_q,
                 score_chunk,
             ],
+            placement=Tile(col=i + col_offset, row=score_row),
         )
         for i in range(num_cols)
     ]
@@ -317,6 +329,7 @@ def my_flowkv_decode(
                 value_accum_fn,
                 value_normalize,
             ],
+            placement=Tile(col=i + col_offset, row=value_row),
         )
         for i in range(num_cols)
     ]
