@@ -59,8 +59,16 @@ class AIESwiGLUProbe(AIEOperatorBase):
                 f"-DINTER_DIM_PER_COL={Hc}",
             ],
         )
+        # down uses the v2 GEMV kernel (K=Hc) — separate .o, c_out += row_offset.
+        down_kobj = KernelObjectArtifact.new(
+            f"fused_dequant_gemv_v2_{Hc}k_g{g}.o",
+            depends=[SourceArtifact.new(
+                self.context.base_dir / "aie_kernels" / "aie2p"
+                / "fused_dequant_gemv_v2.cc")],
+            extra_flags=[f"-DDIM_K={Hc}", f"-DGROUP_SIZE={g}"],
+        )
         xclbin_artifact = XclbinArtifact.new(f"{base}.xclbin",
-                                             depends=[mlir_artifact, kobj])
+                                             depends=[mlir_artifact, kobj, down_kobj])
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
         return xclbin_artifact, insts_artifact
 

@@ -48,7 +48,12 @@ def my_swiglu(dev, embed_dim=2048, hidden_per_col=512, group_size=32,
                      [np.int32, np.int32, L1_GUW_ty, L1_FFIN_ty, np.int32])
     silu = Kernel("layer_fused_silu_mul_bf16", "layer_fused_swiglu.o",
                   [L1_SILU_ty, np.int32])
-    down = Kernel("layer_fused_down_partial_bf16", "layer_fused_swiglu.o",
+    # down = INT4 GEMV Hc->E. Use the v2 kernel (c_out += row_offset, so one
+    # whole-E OUT buffer accumulates all tiles) — layer_fused_down_partial writes
+    # c_out[row] WITHOUT an output offset, so each tile would overwrite c[0..m].
+    # NOTE: v2 kernel = w=nibble*scale (NO -8 bias); CPU ref for down must match.
+    down = Kernel("fused_dequant_matvec_v2_bf16",
+                  f"fused_dequant_gemv_v2_{Hc}k_g{group_size}.o",
                   [np.int32, np.int32, L1_DNW_ty, L1_SILU_ty, L1_OUT_ty])
 
     GUW = ObjectFifo(L1_GUW_ty, name="GUW", depth=2)    # gate then up weights
