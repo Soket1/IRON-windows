@@ -18,11 +18,12 @@ from iron.common import (
 
 class AIEDecodeFront(AIEOperatorBase):
     def __init__(self, embed_dim=2048, K=2048, head_dim=64, group_size=32,
-                 m_input=2, context=None):
+                 attn_group=4, m_input=2, context=None):
         self.embed_dim = embed_dim
         self.K = K
         self.head_dim = head_dim
         self.group_size = group_size
+        self.attn_group = attn_group
         self.m_input = m_input
         self.xclbin_artifact = None
         self.insts_artifact = None
@@ -72,9 +73,12 @@ class AIEDecodeFront(AIEOperatorBase):
     def set_up_runtime(self):
         groups = self.K // self.group_size
         packed_tile = self.m_input * self.K // 2 + self.m_input * groups * 2
-        self.add_buffer("packed_weights", packed_tile, dtype=np.uint8)
+        q_rows = self.attn_group * self.head_dim
+        tiles = q_rows // self.m_input
+        q_buf_elems = self.attn_group * self.head_dim + self.head_dim + 2
+        self.add_buffer("packed_weights", tiles * packed_tile, dtype=np.uint8)
         self.add_buffer("vector", self.K, dtype=bfloat16)
-        self.add_buffer("output", self.m_input, dtype=bfloat16)
+        self.add_buffer("output", q_buf_elems, dtype=bfloat16)
         self.add_kernel("decode_front", self.xclbin_artifact,
                         self.xclbin_artifact.kernel_name, self.insts_artifact)
         self.add_to_runlist("decode_front", "packed_weights", "vector", "output")
