@@ -55,16 +55,28 @@ static_assert(HEAD_DIM % 32 == 0, "FlowKV: HEAD_DIM must be multiple of 32");
     static constexpr float HEAD_DIM_INV_SQRT = 0.0625f;            // 1/16
 #endif
 
+// MAX_Q_HEADS bounds the per-tile static softmax state. The score/value tiles
+// process num_q_heads query heads (one KV group) per dispatch; with num_cols=4
+// over 32 heads that is 8 heads/tile, but the legacy single-shape build used 4.
+// Default 4 keeps existing xclbins byte-identical; the IRON op passes
+// -DMAX_Q_HEADS=N to size the buffers for its head count. Overflowing these
+// statics (e.g. score_init(8) into a [4] array) silently corrupts adjacent
+// memory and produces large garbage output — must match the design's attn_group.
+#ifndef MAX_Q_HEADS
+#define MAX_Q_HEADS 4
+#endif
+static_assert(MAX_Q_HEADS >= 1, "FlowKV: MAX_Q_HEADS must be >= 1");
+
 // ---------------------------------------------------------------------------
 // Score tile: static softmax state (only used by score tile Worker)
 // ---------------------------------------------------------------------------
-static float score_running_max[4] __attribute__((aligned(64)));
-static float score_running_sum[4] __attribute__((aligned(64)));
+static float score_running_max[MAX_Q_HEADS] __attribute__((aligned(64)));
+static float score_running_sum[MAX_Q_HEADS] __attribute__((aligned(64)));
 
 // RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk).
 // Sized for HEAD_DIM at compile time so larger head dims don't overflow
 // the static buffer.
-static bfloat16 rotated_q[4 * HEAD_DIM] __attribute__((aligned(64)));
+static bfloat16 rotated_q[MAX_Q_HEADS * HEAD_DIM] __attribute__((aligned(64)));
 
 // Actual sequence length (number of filled KV positions).
 // Read from Q buffer element [num_q_heads*head_dim + head_dim] = angles[64].
@@ -83,10 +95,10 @@ static inline int32_t bf16_to_int(const bfloat16 * buf, int idx) {
 // ---------------------------------------------------------------------------
 // Value tile: accumulated output in f32 for precision (sized by HEAD_DIM).
 // ---------------------------------------------------------------------------
-static float value_accum[4 * HEAD_DIM] __attribute__((aligned(64)));
+static float value_accum[MAX_Q_HEADS * HEAD_DIM] __attribute__((aligned(64)));
 
 // Saved denominator from the last chunk (written by accum, read by normalize)
-static float saved_denom[4] __attribute__((aligned(64)));
+static float saved_denom[MAX_Q_HEADS] __attribute__((aligned(64)));
 
 extern "C" {
 

@@ -13,7 +13,8 @@ from iron.common import (
 
 class AIEDecodeLayer(AIEOperatorBase):
     def __init__(self, embed_dim=2048, head_dim=64, group_size=32, attn_group=8,
-                 seq_len=32, m_input=2, num_cols=4, context=None):
+                 seq_len=32, m_input=2, num_cols=4, output_first=False,
+                 context=None):
         self.embed_dim = embed_dim
         self.head_dim = head_dim
         self.group_size = group_size
@@ -21,6 +22,7 @@ class AIEDecodeLayer(AIEOperatorBase):
         self.seq_len = seq_len
         self.m_input = m_input
         self.num_cols = num_cols
+        self.output_first = output_first
         self.xclbin_artifact = None
         self.insts_artifact = None
         AIEOperatorBase.__init__(self, context=context)
@@ -28,13 +30,15 @@ class AIEDecodeLayer(AIEOperatorBase):
     def get_artifacts(self, prefix="decode_layer_"):
         operator_dir = Path(__file__).parent
         E, g = self.embed_dim, self.group_size
-        base = f"{prefix}e{E}_d{self.head_dim}_g{g}_s{self.seq_len}"
+        of = "_ofirst" if self.output_first else ""
+        base = f"{prefix}e{E}_d{self.head_dim}_g{g}_s{self.seq_len}{of}"
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
             import_path=operator_dir / "design.py",
             callback_fn="my_decode_layer",
             callback_args=[self.context.device_manager.device_type,
-                           E, self.head_dim, g, self.attn_group, self.seq_len],
+                           E, self.head_dim, g, self.attn_group, self.seq_len,
+                           self.output_first],
         )
         gemv_obj = KernelObjectArtifact.new(
             f"fused_dequant_gemv_v2_{E}k_g{g}.o",
@@ -50,10 +54,11 @@ class AIEDecodeLayer(AIEOperatorBase):
             extra_flags=["-DTWO_HALVES"],
         )
         flowkv_obj = KernelObjectArtifact.new(
-            f"flowkv_{self.head_dim}d.o",
+            f"flowkv_{self.head_dim}d_h{self.attn_group}.o",
             depends=[SourceArtifact.new(
                 self.context.base_dir / "aie_kernels" / "aie2p" / "flowkv.cc")],
-            extra_flags=[f"-DHEAD_DIM={self.head_dim}"],
+            extra_flags=[f"-DHEAD_DIM={self.head_dim}",
+                         f"-DMAX_Q_HEADS={self.attn_group}"],
         )
         # relay/ANM kernel (layer_fused_add) for the join→broadcast relay tile
         E = self.embed_dim

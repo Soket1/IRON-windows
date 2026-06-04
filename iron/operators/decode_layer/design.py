@@ -27,8 +27,9 @@ from aie.iron.device import NPU1, NPU2, Tile
 
 
 def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
-                    attn_group=8, seq_len=32, chunk_size=None,
-                    m_input=2, num_cols=4, col_offset=2, stub_oproj=False):
+                    attn_group=8, seq_len=32, output_first=False,
+                    chunk_size=None, m_input=2, num_cols=4, col_offset=2,
+                    stub_oproj=False):
     if chunk_size is None:
         chunk_size = seq_len
     dev_ty = NPU1() if dev == "npu" else NPU2()
@@ -88,7 +89,7 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                   f"fused_dequant_gemv_v2_{K_gemv}k_g{group_size}.o",
                   [np.int32, np.int32, L1_A_ty, L1_B_ty, L1_Q_ty])
     rope = Kernel("rope", "rope_th.o", [L1_Q_ty, L1_LUT_ty, L1_Q_ty, np.int32])
-    fkv = f"flowkv_{head_dim}d.o"
+    fkv = f"flowkv_{head_dim}d_h{attn_group}.o"
     s_init  = Kernel("flowkv_score_init_bf16",      fkv, [np.int32])
     s_rope  = Kernel("flowkv_score_rope_q_bf16",    fkv, [L1_Q_ty, np.int32, np.int32])
     s_chunk = Kernel("flowkv_score_chunk_bf16",     fkv,
@@ -107,28 +108,22 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     add_k = Kernel("layer_fused_add_bf16", "layer_fused_relay.o",
                    [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
 
-    # FFLM-style MemTile weight/input delivery: each stream is ONE shim source
-    # → split (weights, fan-out to N tiles) or forward (broadcast B) at a MemTile
-    # on a FREE edge column, instead of N per-column shim fills (which exhaust the
-    # 16-S2MM shim fabric). Cuts shim S2MM from ~20 to ~5.
-    # Source-fifo element = each column's FULL per-stage region; split gives N
-    # per-column sub-fifos whose element = one worker-acquire tile. The worker
-    # acquires its sub-fifo tile-by-tile; the MemTile streams the column slice.
-    # Source-fifo element = ONE tile-row across all columns (num_cols * tile),
-    # NOT the whole weight buffer (that would need MBs of MemTile memory). The
-    # split fans the N column slices of one tile-row to N sub-fifos; the source
-    # streams gemv_tiles/o_tiles rows via the DDR tap. Sub-fifo element = one
-    # per-column tile, acquired tile-by-tile in the worker.
+    # Weight/input delivery. A (QKV) and OW (O_proj) weights are PER-COLUMN
+    # CONTIGUOUS fills (the decode_front-proven pattern): each column's weight
+    # region is laid out contiguously in the WT BO and streamed into a per-
+    # column fifo whose element = one packed tile; IRON re-tiles the contiguous
+    # DDR region by the fifo element size. A .split() was WRONG here — its fifo
+    # element is one tile-row interleaved across columns ([col0_t | col1_t | ..]),
+    # which expects TILE-major DDR order, but the packing is COLUMN-major, so
+    # every column got scrambled tiles. Per-column contiguous matches the pack.
+    # K/V stay as .split() (each column has exactly 1 chunk, so column-major ==
+    # tile-major — no scramble) and B stays a broadcast (one vector to all cols).
+    # Shim budget (per column, 2-S2MM cap): cols 2-5 = A_f[c] + OW_f[c] = 2 S2MM;
+    # B-source on free col1 MemTile; K/V split sources on col6/col7 MemTiles.
     kv_col  = chunk_size * head_dim                     # K/V per column (1 chunk)
 
-    A_full = ObjectFifo(np.ndarray[(num_cols * packed_tile,), u8], name="A_src", depth=2)
-    A_f = A_full.cons().split(
-        offsets=[c * packed_tile for c in range(num_cols)], placement=Tile(col=0, row=1),
-        obj_types=[L1_A_ty for _ in range(num_cols)])
-    OW_full = ObjectFifo(np.ndarray[(num_cols * o_packed,), u8], name="OW_src", depth=2)
-    OW_f = OW_full.cons().split(
-        offsets=[c * o_packed for c in range(num_cols)], placement=Tile(col=1, row=1),
-        obj_types=[L1_OW_ty for _ in range(num_cols)])
+    A_f  = [ObjectFifo(L1_A_ty,  name=f"A_{c}",  depth=2) for c in range(num_cols)]
+    OW_f = [ObjectFifo(L1_OW_ty, name=f"OW_{c}", depth=2) for c in range(num_cols)]
     K_full = ObjectFifo(np.ndarray[(num_cols * kv_col,), bf], name="K_src", depth=2)
     K_f = K_full.cons().split(
         offsets=[c * kv_col for c in range(num_cols)], placement=Tile(col=6, row=1),
@@ -137,9 +132,11 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     V_f = V_full.cons().split(
         offsets=[c * kv_col for c in range(num_cols)], placement=Tile(col=7, row=1),
         obj_types=[L1_V_ty for _ in range(num_cols)])
-    # input vector B: one shim source, broadcast (forward) to all columns
+    # input vector B: one shim source, broadcast (forward) to all columns. The
+    # broadcast MemTile sits on free col1 (NOT col3 — col3 already carries
+    # A_f[1]+OW_f[1] = 2 S2MM, so a B source there would be the 3rd, over cap).
     B_src = ObjectFifo(L1_B_ty, name="B_src", depth=1)
-    B_bcast = B_src.cons().forward(name="B_bcast", depth=1, placement=Tile(col=3, row=1))
+    B_bcast = B_src.cons().forward(name="B_bcast", depth=1, placement=Tile(col=1, row=1))
 
     Qi  = [ObjectFifo(L1_Q_ty, name=f"Qi_{c}", depth=2) for c in range(num_cols)]
     Ii  = [ObjectFifo(L1_I_ty, name=f"Ii_{c}", depth=2) for c in range(num_cols)]
@@ -267,87 +264,64 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         [AttnFull.cons(), AttnBcast.prod(), add_k],
         placement=Tile(col=6, row=2)))
 
-    # Weight/input source fills use inline_ops BD chains (layer_fused mechanism),
-    # NOT a single multi-dim rt.fill tap — a single tap cannot express the per-
-    # tile column-major split streaming within the AIE DMA-BD structural limits
-    # (innermost dim <=1023, OUTER dims <=64, 4-byte-multiple transfers). The
-    # shim_dma_bd tap factors the per-column weight region into 4 dims, all sized
-    # to fit. Sizes are in ELEMENTS (uint8 -> bytes, bf16 -> bytes//2).
-    from aie.dialects.aie import EndOp
-    from aie.dialects.aiex import (
-        dma_configure_task_for, bds, shim_dma_bd, dma_start_task, dma_await_task,
-    )
-
-    def _factor4(n):
-        """Factor a contiguous region of n elements into 4 row-major dims
-        [d0,d1,d2,d3] with d0..d2 <= 64 (outer BD wrap) and d3 <= 1023 (inner),
-        product == n. Mirrors layer_fused's [16,64,18,32] factorization. Returns
-        (sizes, strides) for a row-major contiguous blob."""
-        # greedily peel inner dim <=1023, then up to 3 outer dims <=64
-        dims = []
-        rem = n
-        # inner d3: largest divisor <=1023 (prefer 4-byte-friendly)
-        for d in range(min(rem, 1020), 0, -1):
-            if rem % d == 0:
-                dims.append(d); rem //= d; break
-        # outer dims <=64
-        while rem > 1 and len(dims) < 4:
-            placed = False
-            for d in range(min(rem, 64), 1, -1):
-                if rem % d == 0:
-                    dims.append(d); rem //= d; placed = True; break
-            if not placed:
-                break
-        if rem != 1:
-            dims.append(rem)
-        dims = (dims + [1, 1, 1, 1])[:4]
-        sizes = list(reversed(dims))              # [d0..d3], d3 inner
-        strides, acc = [0, 0, 0, 0], 1
-        for i in range(3, -1, -1):
-            strides[i] = acc; acc *= sizes[i]
-        return sizes, strides
-
+    # Per-column contiguous taps (decode_front-proven). IRON auto-tiles a large
+    # contiguous inner dim down to the BD-1023 limit, so a flat [.. , inner] tap
+    # with inner >> 1023 is fine (decode_front's a_tap inner = 589824 works).
+    # No _factor4 / inline_ops needed — those were introduced for the (wrong)
+    # split delivery. A weights: column c at offset c*a_per_col. O weights:
+    # column c at ow_base + c*ow_per_col (same single WT BO).
     a_per_col  = gemv_tiles * packed_tile          # A weights/col (bytes, u8)
     ow_per_col = o_tiles * o_packed                 # O weights/col (bytes, u8)
-    a_sz,  a_st  = _factor4(a_per_col)
-    ow_sz, ow_st = _factor4(ow_per_col)
-    kv_sz, kv_st = _factor4(kv_col)                 # bf16 chunk/col
-    xn, xf = (K_gemv // 64, 64) if K_gemv % 64 == 0 else (K_gemv, 1)
-    x_tap  = TensorAccessPattern(tensor_dims=(1, K_gemv), offset=0,
-        sizes=[1, 1, xf, xn], strides=[0, 0, xn, 1])
+
+    def a_tap(c):
+        return TensorAccessPattern(
+            tensor_dims=(1, w_region + ow_region), offset=c * a_per_col,
+            sizes=[1, 1, 1, a_per_col], strides=[0, 0, 0, 1])
+
+    def ow_tap(c):
+        return TensorAccessPattern(
+            tensor_dims=(1, w_region + ow_region), offset=ow_base + c * ow_per_col,
+            sizes=[1, 1, 1, ow_per_col], strides=[0, 0, 0, 1])
+
+    x_tap = TensorAccessPattern(tensor_dims=(1, K_gemv), offset=0,
+        sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
+
+    # K/V split sources: ONE fill of the whole num_cols*ahs_elems contiguous
+    # region; the MemTile split fans the per-column kv_col slices on-chip.
+    def kv_src_tap():
+        return TensorAccessPattern(
+            tensor_dims=(num_cols * ahs_elems,), offset=0,
+            sizes=[1, 1, 1, num_cols * ahs_elems], strides=[0, 0, 0, 1])
 
     def oc_tap(c):
         return TensorAccessPattern(tensor_dims=(1, E), offset=c * o_slice,
             sizes=[1, 1, o_tiles, m_input], strides=[0, 0, m_input, 1])
 
     rt = Runtime()
-    with rt.sequence(L3_WT_ty, L3_X_ty, L3_K_ty, L3_V_ty, L3_O_ty) as \
-            (wt, x, k, v, o):
+    # output_first reorders the DDR BO list so the final O is bo0 (arg3) — the
+    # replay harness dumps bo0 to disk for off-line numeric validation. Default
+    # (committed) order keeps O last (matches the op.py runlist WT,X,K,V,O).
+    if output_first:
+        seq_tys = (L3_O_ty, L3_WT_ty, L3_X_ty, L3_K_ty, L3_V_ty)
+    else:
+        seq_tys = (L3_WT_ty, L3_X_ty, L3_K_ty, L3_V_ty, L3_O_ty)
+    with rt.sequence(*seq_tys) as seq_args:
+        if output_first:
+            o, wt, x, k, v = seq_args
+        else:
+            wt, x, k, v, o = seq_args
         rt.start(*workers)
 
-        # NORMAL rt.fill per split source (NOT inline_ops): a split source is ONE
-        # fill regardless of columns (the MemTile split fans it on-chip), so only
-        # 5 shim S2MM total — well within the 16 fabric. inline_ops was only
-        # needed for per-column shim fills, which the split makes unnecessary.
-        # Each source carries num_cols*per_col contiguous; the tap factors the
-        # contiguous region to fit the BD-1023 dim limit (4D, inner<=1023).
-        def _src_tap(per_col, sz, st, base=0):
-            # gather num_cols column regions (each per_col, contiguous) from DDR
-            # at `base`; factored dims sz/st keep each BD dim <=1023.
-            return TensorAccessPattern(
-                tensor_dims=(1, num_cols * per_col + base), offset=base,
-                sizes=[num_cols] + sz[1:], strides=[per_col] + st[1:])
-
+        # A/OW: per-column contiguous fills (cols 2-5: 2 S2MM each, within cap).
+        # K/V: one fill of the split source each (fanned on col6/col7 MemTiles).
+        # B: one broadcast fill (col1 MemTile). O: per-column drains.
         tg_w = rt.task_group()
-        rt.fill(A_full.prod(),  wt, _src_tap(a_per_col,  a_sz,  a_st),
-                task_group=tg_w)
-        rt.fill(OW_full.prod(), wt, _src_tap(ow_per_col, ow_sz, ow_st, ow_base),
-                task_group=tg_w)
-        rt.fill(K_full.prod(),  k,  _src_tap(ahs_elems,  kv_sz, kv_st),
-                task_group=tg_w)
-        rt.fill(V_full.prod(),  v,  _src_tap(ahs_elems,  kv_sz, kv_st),
-                task_group=tg_w)
-        rt.fill(B_src.prod(),   x,  x_tap, task_group=tg_w)
+        for c in range(num_cols):
+            rt.fill(A_f[c].prod(),  wt, a_tap(c),  task_group=tg_w)
+            rt.fill(OW_f[c].prod(), wt, ow_tap(c), task_group=tg_w)
+        rt.fill(K_full.prod(), k, kv_src_tap(), task_group=tg_w)
+        rt.fill(V_full.prod(), v, kv_src_tap(), task_group=tg_w)
+        rt.fill(B_src.prod(),  x, x_tap,        task_group=tg_w)
         for c in range(num_cols):
             rt.drain(OC_f[c].cons(), o, oc_tap(c), task_group=tg_w, wait=True)
         rt.finish_task_group(tg_w)
