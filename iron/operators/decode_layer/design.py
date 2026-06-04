@@ -168,12 +168,20 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     AttnB = AttnBcast.cons().forward(
         name="attn_bcast", depth=2, placement=Tile(col=5, row=1))
 
-    def relay_body(src, dst, copy_fn):
+    def relay_body(src, dst, zero, copy_fn):
         for _ in range_(0xFFFFFFFF):
             a = src.acquire(1)
             d = dst.acquire(1)
-            copy_fn(a, a, d, E)              # d = a + a (relay; becomes ANM later)
+            copy_fn(a, zero, d, E)          # d = a + 0 = a (true identity bridge:
+                                            # join-fifo can't also .forward(), so
+                                            # this tile relays attn_out unchanged
+                                            # from the join to the O_proj broadcast)
             src.release(1); dst.release(1)
+
+    # zero operand makes the relay add an exact identity copy (a+0). Passive
+    # Buffer (CDO-loaded, zero runtime DMA) — does not consume a shim channel.
+    zero_e = np.zeros(E, dtype=bfloat16)
+    zero_buf = Buffer(type=L1_E_ty, initial_value=zero_e, name="relay_zero")
 
     rope_lut_data = np.zeros(head_dim, dtype=bfloat16)
     rope_lut_data[0::2] = bfloat16(1.0); rope_lut_data[1::2] = bfloat16(0.0)
@@ -261,7 +269,7 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # relay worker: join (AttnFull) → relay → AttnBcast (which forwards to AttnB
     # broadcast). On a free compute tile outside the cols-2-5 band (col 6 row 2).
     workers.append(Worker(relay_body,
-        [AttnFull.cons(), AttnBcast.prod(), add_k],
+        [AttnFull.cons(), AttnBcast.prod(), zero_buf, add_k],
         placement=Tile(col=6, row=2)))
 
     # Per-column contiguous taps (decode_front-proven). IRON auto-tiles a large
