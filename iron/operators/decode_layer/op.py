@@ -55,8 +55,24 @@ class AIEDecodeLayer(AIEOperatorBase):
                 self.context.base_dir / "aie_kernels" / "aie2p" / "flowkv.cc")],
             extra_flags=[f"-DHEAD_DIM={self.head_dim}"],
         )
+        # relay/ANM kernel (layer_fused_add) for the join→broadcast relay tile
+        E = self.embed_dim
+        relay_obj = KernelObjectArtifact.new(
+            "layer_fused_relay.o",
+            depends=[SourceArtifact.new(
+                self.context.base_dir / "aie_kernels" / "aie2p" / "layer_fused.cc")],
+            extra_flags=[
+                f"-DEMBED_DIM={E}", f"-DHIDDEN_DIM={E*4}",
+                f"-DGROUP_SIZE={self.group_size}", f"-DHEAD_DIM={self.head_dim}",
+                f"-DNUM_HEADS={self.num_heads if hasattr(self,'num_heads') else 32}",
+                f"-DNUM_KV_HEADS=8", f"-DMAX_SEQ_LEN=2048",
+                f"-DNUM_AIE_COLUMNS={self.num_cols}",
+                f"-DM_OUTPUT_MAX={E}", f"-DINTER_DIM_PER_COL={E}",
+            ],
+        )
         xclbin_artifact = XclbinArtifact.new(
-            f"{base}.xclbin", depends=[mlir_artifact, gemv_obj, rope_obj, flowkv_obj])
+            f"{base}.xclbin",
+            depends=[mlir_artifact, gemv_obj, rope_obj, flowkv_obj, relay_obj])
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
         return xclbin_artifact, insts_artifact
 

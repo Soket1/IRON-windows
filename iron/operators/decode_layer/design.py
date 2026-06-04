@@ -28,7 +28,7 @@ from aie.iron.device import NPU1, NPU2, Tile
 
 def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                     attn_group=8, seq_len=32, chunk_size=None,
-                    m_input=2, num_cols=4, col_offset=2):
+                    m_input=2, num_cols=4, col_offset=2, stub_oproj=False):
     if chunk_size is None:
         chunk_size = seq_len
     dev_ty = NPU1() if dev == "npu" else NPU2()
@@ -102,6 +102,10 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # buffer args are generic memrefs; OW/L1_E/OC match A/B/Q element types
     # closely enough (uint8 weights, bf16 in, bf16 out) for the same symbol.
     oproj = gemv
+    # E→E relay copy kernel (layer_fused_add: d = a + a as relay stand-in; this
+    # tile becomes the ANM add+rms stage later). From layer_fused.cc.
+    add_k = Kernel("layer_fused_add_bf16", "layer_fused_relay.o",
+                   [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
 
     # FFLM-style MemTile weight/input delivery: each stream is ONE shim source
     # → split (weights, fan-out to N tiles) or forward (broadcast B) at a MemTile
@@ -152,16 +156,27 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # col7, B-forward col3. Use the remaining free MemTile cols 4,5 for the
     # attn_out join and broadcast (each MemTile is independent; compute tiles on
     # cols 4,5 are on rows 2-5, the MemTile is row 1).
-    # join gathers 4 O slices → AttnFull (one ObjectFifoLinkOp). The 4 O_proj
-    # workers read AttnFull.cons() directly — auto-broadcast through the MemTile.
-    # (A separate .forward() would put AttnFull in TWO link ops, which AIECC
-    # rejects: 'objectfifo cannot be in more than one ObjectFifoLinkOp'. The
-    # gather_probe proved direct multi-consumer broadcast works.)
-    AttnFull = ObjectFifo(L1_E_ty, name="AttnFull", depth=2)
+    # join→relay→broadcast: a join-fifo CANNOT also be .forward()'d (both put it
+    # in an ObjectFifoLinkOp → 'more than one link' AIECC error), AND a single
+    # fifo that is both join-target and read by N workers DEADLOCKS on NPU. So a
+    # RELAY worker sits between: it consumes the joined full-E (AttnFull) and
+    # produces it into AttnBcast, which forwards/broadcasts to the N O_proj
+    # workers. This relay tile is where ANM (add+rms) will live later.
+    AttnFull  = ObjectFifo(L1_E_ty, name="AttnFull",  depth=2)   # join target
+    AttnBcast = ObjectFifo(L1_E_ty, name="AttnBcast", depth=2)   # broadcast src
     O_parts = AttnFull.prod().join(
         offsets=[c * q_rows for c in range(num_cols)],
         placement=Tile(col=4, row=1),
         obj_types=[L1_O_ty for _ in range(num_cols)])
+    AttnB = AttnBcast.cons().forward(
+        name="attn_bcast", depth=2, placement=Tile(col=5, row=1))
+
+    def relay_body(src, dst, copy_fn):
+        for _ in range_(0xFFFFFFFF):
+            a = src.acquire(1)
+            d = dst.acquire(1)
+            copy_fn(a, a, d, E)              # d = a + a (relay; becomes ANM later)
+            src.release(1); dst.release(1)
 
     rope_lut_data = np.zeros(head_dim, dtype=bfloat16)
     rope_lut_data[0::2] = bfloat16(1.0); rope_lut_data[1::2] = bfloat16(0.0)
@@ -225,9 +240,32 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                              w, a_full, o)
                     ow.release(1)
                 ab.release(1); oc.release(1)
-        workers.append(Worker(oproj_body,
-            [OW_f[c].cons(), AttnFull.cons(), OC_f[c].prod(), oproj],
-            placement=Tile(col=pc, row=5)))
+
+        # DEADLOCK-ISOLATION stub: O_proj worker that ONLY consumes the joined
+        # attn_out and produces an output slice — NO OW weights, NO GEMV (just
+        # acquire/release both fifos). If this COMPLETES, the hang is in the
+        # O_proj GEMV / OW weight-fill path; if it still hangs, the join / attn
+        # broadcast is the culprit. No kernel call needed for the sync test.
+        def oproj_stub(ab, oc):
+            for _ in range_(0xFFFFFFFF):
+                ab.acquire(1)
+                oc.acquire(1)
+                ab.release(1); oc.release(1)
+
+        if stub_oproj:
+            workers.append(Worker(oproj_stub,
+                [AttnB.cons(), OC_f[c].prod()],
+                placement=Tile(col=pc, row=5)))
+        else:
+            workers.append(Worker(oproj_body,
+                [OW_f[c].cons(), AttnB.cons(), OC_f[c].prod(), oproj],
+                placement=Tile(col=pc, row=5)))
+
+    # relay worker: join (AttnFull) → relay → AttnBcast (which forwards to AttnB
+    # broadcast). On a free compute tile outside the cols-2-5 band (col 6 row 2).
+    workers.append(Worker(relay_body,
+        [AttnFull.cons(), AttnBcast.prod(), add_k],
+        placement=Tile(col=6, row=2)))
 
     # Weight/input source fills use inline_ops BD chains (layer_fused mechanism),
     # NOT a single multi-dim rt.fill tap — a single tap cannot express the per-
