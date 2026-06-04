@@ -47,6 +47,16 @@ class AIEDecodeLayer(AIEOperatorBase):
                 / "fused_dequant_gemv_v2.cc")],
             extra_flags=[f"-DDIM_K={E}", f"-DGROUP_SIZE={g}"],
         )
+        # O_proj: same source, renamed entry symbol so its C output arg can be
+        # typed o_slice (512) for the join instead of the QKV q-buffer (578).
+        oproj_obj = KernelObjectArtifact.new(
+            f"fused_dequant_gemv_v2_oproj_{E}k_g{g}.o",
+            depends=[SourceArtifact.new(
+                self.context.base_dir / "aie_kernels" / "aie2p"
+                / "fused_dequant_gemv_v2.cc")],
+            extra_flags=[f"-DDIM_K={E}", f"-DGROUP_SIZE={g}",
+                         "-Dfused_dequant_matvec_v2_bf16=oproj_matvec_v2_bf16"],
+        )
         rope_obj = KernelObjectArtifact.new(
             "rope_th.o",
             depends=[SourceArtifact.new(
@@ -77,7 +87,8 @@ class AIEDecodeLayer(AIEOperatorBase):
         )
         xclbin_artifact = XclbinArtifact.new(
             f"{base}.xclbin",
-            depends=[mlir_artifact, gemv_obj, rope_obj, flowkv_obj, relay_obj])
+            depends=[mlir_artifact, gemv_obj, oproj_obj, rope_obj, flowkv_obj,
+                     relay_obj])
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
         return xclbin_artifact, insts_artifact
 

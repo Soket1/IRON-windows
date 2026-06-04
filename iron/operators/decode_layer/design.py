@@ -29,7 +29,7 @@ from aie.iron.device import NPU1, NPU2, Tile
 def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                     attn_group=8, seq_len=32, output_first=False,
                     chunk_size=None, m_input=2, num_cols=4, col_offset=2,
-                    stub_oproj=False):
+                    stub_oproj=False, rms_gain_data=None):
     if chunk_size is None:
         chunk_size = seq_len
     dev_ty = NPU1() if dev == "npu" else NPU2()
@@ -79,7 +79,11 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     ow_region = num_cols * o_tiles * o_packed                # all O weights
     ow_base   = w_region                                     # OW offset in the BO
     L3_WT_ty = np.ndarray[(w_region + ow_region,), u8]       # single weight BO
-    L3_X_ty  = np.ndarray[(K_gemv,), bf]
+    # X is an input BUNDLE (FFLM-style: pack activations into one BO, not a 6th
+    # DDR arg — the 5-BO ABI is full). Layout: [Xqkv (E) | inpL (E)] where Xqkv
+    # is the (pre-normed) QKV GEMV activation and inpL is the residual the ANM
+    # adds to the O_proj output. RMS gain is a passive Buffer (per-layer const).
+    L3_X_ty  = np.ndarray[(2 * K_gemv,), bf]
     L3_K_ty  = np.ndarray[(num_cols * ahs_elems,), bf]
     L3_V_ty  = np.ndarray[(num_cols * ahs_elems,), bf]
     L3_O_ty  = np.ndarray[(E,), bf]                  # final o_out (E)
@@ -98,14 +102,21 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     v_accum = Kernel("flowkv_value_accum_bf16",     fkv,
                      [L1_I_ty, L1_V_ty, np.int32, np.int32, np.int32])
     v_norm  = Kernel("flowkv_value_normalize_bf16", fkv, [L1_O_ty, np.int32, np.int32])
-    # O_proj is the SAME v2 GEMV kernel (K=E=K_gemv) as QKV — reuse the `gemv`
-    # Kernel object (declaring it twice redefines the symbol). The kernel's
-    # buffer args are generic memrefs; OW/L1_E/OC match A/B/Q element types
-    # closely enough (uint8 weights, bf16 in, bf16 out) for the same symbol.
-    oproj = gemv
-    # E→E relay copy kernel (layer_fused_add: d = a + a as relay stand-in; this
-    # tile becomes the ANM add+rms stage later). From layer_fused.cc.
+    # O_proj is the v2 GEMV but with a DISTINCT symbol (compiled from the same
+    # source with -Dfused_dequant_matvec_v2_bf16=oproj_matvec_v2_bf16) so its C
+    # output arg can be typed L1_O_ty (o_slice=512) — matching the join endpoint
+    # — instead of the QKV q-buffer L1_Q_ty (578). Reusing the same symbol forces
+    # the 578 type and a memref mismatch at the join. Distinct symbol + distinct
+    # .o avoids the redefinition error while letting the types differ.
+    oproj = Kernel("oproj_matvec_v2_bf16",
+                   f"fused_dequant_gemv_v2_oproj_{K_gemv}k_g{group_size}.o",
+                   [np.int32, np.int32, L1_OW_ty, L1_E_ty, L1_O_ty])
+    # ANM kernels (layer_fused.cc, same .o): residual add (c=a+b) then weighted
+    # RMSNorm (out = in * invsqrt(mean(in^2)+1e-5) * gain). The relay tile uses
+    # add only (a+0 = copy); the post-O_proj ANM tile uses add then rms.
     add_k = Kernel("layer_fused_add_bf16", "layer_fused_relay.o",
+                   [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
+    rms_k = Kernel("layer_fused_rms_norm2_bf16", "layer_fused_relay.o",
                    [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
 
     # Weight/input delivery. A (QKV) and OW (O_proj) weights are PER-COLUMN
@@ -168,6 +179,20 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     AttnB = AttnBcast.cons().forward(
         name="attn_bcast", depth=2, placement=Tile(col=5, row=1))
 
+    # ANM stage (post-O_proj): the 4 O_proj output slices (o_slice each) are
+    # joined back to full-E on a free MemTile (col0), then a single ANM worker
+    # adds the residual inpL and applies weighted RMSNorm. RMS needs the whole-E
+    # sum-of-squares, so the join must assemble all 4 columns first (post_attn_
+    # fused does exactly this: O_proj -> join MemTile -> ANM tile). One consumer
+    # (the ANM worker) reads the join target, so NO relay is needed here.
+    OProjFull = ObjectFifo(L1_E_ty, name="OProjFull", depth=2)   # join target
+    Oproj_parts = OProjFull.prod().join(
+        offsets=[c * o_slice for c in range(num_cols)],
+        placement=Tile(col=0, row=1),
+        obj_types=[L1_O_ty for _ in range(num_cols)])
+    InpL  = ObjectFifo(L1_E_ty, name="InpL",  depth=2)   # residual (from X bundle)
+    FfnIn = ObjectFifo(L1_E_ty, name="FfnIn", depth=2)   # ANM output = ffn_in
+
     def relay_body(src, dst, zero, copy_fn):
         for _ in range_(0xFFFFFFFF):
             a = src.acquire(1)
@@ -182,6 +207,23 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # Buffer (CDO-loaded, zero runtime DMA) — does not consume a shim channel.
     zero_e = np.zeros(E, dtype=bfloat16)
     zero_buf = Buffer(type=L1_E_ty, initial_value=zero_e, name="relay_zero")
+
+    # ANM worker body: inpFF = o_out + inpL ; ffn_in = rms(inpFF) * gain.
+    # (anm_probe-proven: add into the output buffer, then rms in-place.)
+    def anm_body(oj, inpl, ffi, gain, add_fn, rms_fn):
+        for _ in range_(0xFFFFFFFF):
+            o = oj.acquire(1)
+            l = inpl.acquire(1)
+            r = ffi.acquire(1)
+            add_fn(o, l, r, E)              # r = o_out + inpL
+            rms_fn(r, gain, r, E)           # r = rms(r) * gain  (gain = passive)
+            oj.release(1); inpl.release(1); ffi.release(1)
+
+    # RMS gain is a per-layer constant → passive Buffer (CDO-loaded, zero DMA),
+    # like the RoPE LUT. Keeps the ANM tile at 2 S2MM (OProjFull + InpL).
+    if rms_gain_data is None:
+        rms_gain_data = np.ones(E, dtype=bfloat16)
+    gain_buf = Buffer(type=L1_E_ty, initial_value=rms_gain_data, name="rms_gain")
 
     rope_lut_data = np.zeros(head_dim, dtype=bfloat16)
     rope_lut_data[0::2] = bfloat16(1.0); rope_lut_data[1::2] = bfloat16(0.0)
@@ -263,7 +305,7 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                 placement=Tile(col=pc, row=5)))
         else:
             workers.append(Worker(oproj_body,
-                [OW_f[c].cons(), AttnB.cons(), OC_f[c].prod(), oproj],
+                [OW_f[c].cons(), AttnB.cons(), Oproj_parts[c].prod(), oproj],
                 placement=Tile(col=pc, row=5)))
 
     # relay worker: join (AttnFull) → relay → AttnBcast (which forwards to AttnB
@@ -271,6 +313,12 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     workers.append(Worker(relay_body,
         [AttnFull.cons(), AttnBcast.prod(), zero_buf, add_k],
         placement=Tile(col=6, row=2)))
+
+    # ANM worker: O_proj join (OProjFull) + residual inpL + passive gain →
+    # ffn_in. On a free compute tile (col 7 row 2), outside the cols-2-5 band.
+    workers.append(Worker(anm_body,
+        [OProjFull.cons(), InpL.cons(), FfnIn.prod(), gain_buf, add_k, rms_k],
+        placement=Tile(col=7, row=2)))
 
     # Per-column contiguous taps (decode_front-proven). IRON auto-tiles a large
     # contiguous inner dim down to the BD-1023 limit, so a flat [.. , inner] tap
@@ -291,7 +339,10 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             tensor_dims=(1, w_region + ow_region), offset=ow_base + c * ow_per_col,
             sizes=[1, 1, 1, ow_per_col], strides=[0, 0, 0, 1])
 
-    x_tap = TensorAccessPattern(tensor_dims=(1, K_gemv), offset=0,
+    # X bundle: Xqkv at offset 0, residual inpL at offset K_gemv (both E elems).
+    x_tap = TensorAccessPattern(tensor_dims=(1, 2 * K_gemv), offset=0,
+        sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
+    inpL_tap = TensorAccessPattern(tensor_dims=(1, 2 * K_gemv), offset=K_gemv,
         sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
 
     # K/V split sources: ONE fill of the whole num_cols*ahs_elems contiguous
@@ -301,9 +352,9 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             tensor_dims=(num_cols * ahs_elems,), offset=0,
             sizes=[1, 1, 1, num_cols * ahs_elems], strides=[0, 0, 0, 1])
 
-    def oc_tap(c):
-        return TensorAccessPattern(tensor_dims=(1, E), offset=c * o_slice,
-            sizes=[1, 1, o_tiles, m_input], strides=[0, 0, m_input, 1])
+    # ffn_in (ANM output) drain: full E, contiguous.
+    ffn_tap = TensorAccessPattern(tensor_dims=(1, E), offset=0,
+        sizes=[1, 1, 1, E], strides=[0, 0, 0, 1])
 
     rt = Runtime()
     # output_first reorders the DDR BO list so the final O is bo0 (arg3) — the
@@ -322,7 +373,8 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
 
         # A/OW: per-column contiguous fills (cols 2-5: 2 S2MM each, within cap).
         # K/V: one fill of the split source each (fanned on col6/col7 MemTiles).
-        # B: one broadcast fill (col1 MemTile). O: per-column drains.
+        # B: QKV activation = X bundle offset 0. InpL: residual = X bundle offset
+        # E (feeds the ANM tile). O: single full-E ffn_in drain (ANM output).
         tg_w = rt.task_group()
         for c in range(num_cols):
             rt.fill(A_f[c].prod(),  wt, a_tap(c),  task_group=tg_w)
@@ -330,8 +382,8 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         rt.fill(K_full.prod(), k, kv_src_tap(), task_group=tg_w)
         rt.fill(V_full.prod(), v, kv_src_tap(), task_group=tg_w)
         rt.fill(B_src.prod(),  x, x_tap,        task_group=tg_w)
-        for c in range(num_cols):
-            rt.drain(OC_f[c].cons(), o, oc_tap(c), task_group=tg_w, wait=True)
+        rt.fill(InpL.prod(),   x, inpL_tap,     task_group=tg_w)
+        rt.drain(FfnIn.cons(), o, ffn_tap, task_group=tg_w, wait=True)
         rt.finish_task_group(tg_w)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
