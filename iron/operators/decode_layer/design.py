@@ -325,46 +325,31 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             (wt, x, k, v, o):
         rt.start(*workers)
 
-        # Weight/chunk sources filled via inline_ops BD chains. A and OW weights
-        # come from the SAME weight BO (wt) at offsets 0 and ow_base — FFLM packs
-        # all layer weights into one BO. Each source: num_cols BDs (per column).
-        def fill_chain(wt_rt, k_rt, v_rt):
-            wt_op = wt_rt.op
-            streams = [
-                ("A_src",  wt_op,    a_per_col,  0,       a_sz,  a_st),
-                ("OW_src", wt_op,    ow_per_col, ow_base, ow_sz, ow_st),
-                ("K_src",  k_rt.op,  ahs_elems,  0,       kv_sz, kv_st),
-                ("V_src",  v_rt.op,  ahs_elems,  0,       kv_sz, kv_st),
-            ]
-            for name, op, col_stride, base, sz, st in streams:
-                task = dma_configure_task_for(name, issue_token=True)
-                with bds(task) as bd:
-                    for c in range(num_cols):
-                        with bd[c]:
-                            shim_dma_bd(op, offset=base + c * col_stride,
-                                        sizes=sz, strides=st)
-                            EndOp()
-                dma_start_task(task)
-                dma_await_task(task)
-        # layer_fused pattern: a DUMMY rt.fill (simple 1D tap) registers each
-        # source's producer endpoint + its shim S2MM channel; the inline_ops BD
-        # chain then carries the REAL factored transfer on that same channel.
-        def _dummy(n):
-            return TensorAccessPattern(tensor_dims=(1, n), offset=0,
-                sizes=[1, 1, 1, min(n, 1020)], strides=[0, 0, 0, 1])
-        tg_w = rt.task_group()
-        rt.fill(A_full.prod(),  wt, _dummy(num_cols * a_per_col),  task_group=tg_w)
-        rt.fill(OW_full.prod(), wt, _dummy(num_cols * ow_per_col), task_group=tg_w)
-        rt.fill(K_full.prod(),  k,  _dummy(num_cols * ahs_elems),  task_group=tg_w)
-        rt.fill(V_full.prod(),  v,  _dummy(num_cols * ahs_elems),  task_group=tg_w)
-        rt.finish_task_group(tg_w)
-        rt.inline_ops(fill_chain, [wt, k, v])
+        # NORMAL rt.fill per split source (NOT inline_ops): a split source is ONE
+        # fill regardless of columns (the MemTile split fans it on-chip), so only
+        # 5 shim S2MM total — well within the 16 fabric. inline_ops was only
+        # needed for per-column shim fills, which the split makes unnecessary.
+        # Each source carries num_cols*per_col contiguous; the tap factors the
+        # contiguous region to fit the BD-1023 dim limit (4D, inner<=1023).
+        def _src_tap(per_col, sz, st, base=0):
+            # gather num_cols column regions (each per_col, contiguous) from DDR
+            # at `base`; factored dims sz/st keep each BD dim <=1023.
+            return TensorAccessPattern(
+                tensor_dims=(1, num_cols * per_col + base), offset=base,
+                sizes=[num_cols] + sz[1:], strides=[per_col] + st[1:])
 
-        # B vector + o_out drains in a task_group
-        tg = rt.task_group()
-        rt.fill(B_src.prod(), x, x_tap, task_group=tg)
+        tg_w = rt.task_group()
+        rt.fill(A_full.prod(),  wt, _src_tap(a_per_col,  a_sz,  a_st),
+                task_group=tg_w)
+        rt.fill(OW_full.prod(), wt, _src_tap(ow_per_col, ow_sz, ow_st, ow_base),
+                task_group=tg_w)
+        rt.fill(K_full.prod(),  k,  _src_tap(ahs_elems,  kv_sz, kv_st),
+                task_group=tg_w)
+        rt.fill(V_full.prod(),  v,  _src_tap(ahs_elems,  kv_sz, kv_st),
+                task_group=tg_w)
+        rt.fill(B_src.prod(),   x,  x_tap, task_group=tg_w)
         for c in range(num_cols):
-            rt.drain(OC_f[c].cons(), o, oc_tap(c), task_group=tg, wait=True)
-        rt.finish_task_group(tg)
+            rt.drain(OC_f[c].cons(), o, oc_tap(c), task_group=tg_w, wait=True)
+        rt.finish_task_group(tg_w)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
