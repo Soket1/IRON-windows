@@ -163,7 +163,20 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     kv_col  = chunk_size * head_dim                     # K/V per column (1 chunk)
 
     A_f  = [ObjectFifo(L1_A_ty,  name=f"A_{c}",  depth=2) for c in range(num_cols)]
-    OW_f = [ObjectFifo(L1_OW_ty, name=f"OW_{c}", depth=2) for c in range(num_cols)]
+    # Row-5 weight stream. stub_ffn → OW only (O_proj). full FFN → D1.c MERGED
+    # weight fifo W_f carrying [O_proj | gate | up | down] tiles in order on ONE
+    # S2MM channel (FFLM bd-multiplex: one channel, N chained tiles). The fused
+    # worker acquires from W_f for every weight loop (oproj→gate→up→down). This
+    # collapses 2 S2MM (OW + GUWD) → 1, hitting the 2-S2MM core-tile cap. Valid
+    # because all weight tiles are byte-identical in size (o_packed==gu_packed==
+    # dn_packed) for this config (asserted below); the kernels differ but each
+    # consumes one same-sized packed tile per acquire.
+    if stub_ffn:
+        OW_f = [ObjectFifo(L1_OW_ty, name=f"OW_{c}", depth=2) for c in range(num_cols)]
+    else:
+        assert o_packed == gu_packed == dn_packed, \
+            "D1.c merged weight fifo needs uniform tile size (Hc==E config)"
+        W_f = [ObjectFifo(L1_OW_ty, name=f"W_{c}", depth=2) for c in range(num_cols)]
     K_full = ObjectFifo(np.ndarray[(num_cols * kv_col,), bf], name="K_src", depth=2)
     K_f = K_full.cons().split(
         offsets=[c * kv_col for c in range(num_cols)], placement=Tile(col=6, row=1),
@@ -200,13 +213,29 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # produces it into AttnBcast, which forwards/broadcasts to the N O_proj
     # workers. This relay tile is where ANM (add+rms) will live later.
     AttnFull  = ObjectFifo(L1_E_ty, name="AttnFull",  depth=2)   # join target
-    AttnBcast = ObjectFifo(L1_E_ty, name="AttnBcast", depth=2)   # broadcast src
     O_parts = AttnFull.prod().join(
         offsets=[c * q_rows for c in range(num_cols)],
         placement=Tile(col=4, row=1),
         obj_types=[L1_O_ty for _ in range(num_cols)])
-    AttnB = AttnBcast.cons().forward(
-        name="attn_bcast", depth=2, placement=Tile(col=5, row=1))
+    # Broadcast structure differs by mode:
+    #  - stub_ffn (diagnostic): a plain relay forwards attn-out → AttnB to the
+    #    O_proj-only row-5 workers (FFN absent, no ffn-in stream).
+    #  - full FFN (D1.b): the row-5 tile needs BOTH attn-out (O_proj phase) and
+    #    ffn-in (FFN phase), but a core tile has only 2 S2MM inputs and weights
+    #    take channels. So attn-out and ffn-in time-multiplex onto ONE broadcast
+    #    fifo: a MUX worker (generalized relay) produces them in order [attn,
+    #    ffn_in] into MergedBcast; the row-5 tile acquires it TWICE per iteration
+    #    (1st=attn, 2nd=ffn_in). An ObjectFifo has ONE producer, so the two
+    #    upstreams (AttnFull join + ANM ffn-in) MUST funnel through one MUX worker
+    #    (IRON asserts single producer). forward() = 1 S2MM per consumer tile.
+    if stub_ffn:
+        AttnBcast = ObjectFifo(L1_E_ty, name="AttnBcast", depth=2)
+        AttnB = AttnBcast.cons().forward(
+            name="attn_bcast", depth=2, placement=Tile(col=5, row=1))
+    else:
+        MergedBcast = ObjectFifo(L1_E_ty, name="MergedBcast", depth=2)  # mux out
+        MergedB = MergedBcast.cons().forward(
+            name="merged_bcast", depth=2, placement=Tile(col=5, row=1))
 
     # ANM stage (post-O_proj): the 4 O_proj output slices (o_slice each) are
     # joined back to full-E on a free MemTile (col0), then a single ANM worker
@@ -220,19 +249,40 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         placement=Tile(col=0, row=1),
         obj_types=[L1_O_ty for _ in range(num_cols)])
     InpL  = ObjectFifo(L1_E_ty, name="InpL",  depth=2)   # residual (from X bundle)
-    FfnIn = ObjectFifo(L1_E_ty, name="FfnIn", depth=2)   # ANM output = ffn_in
+    # ANM output = ffn_in. In stub mode it is drained directly; in full FFN mode
+    # it feeds the MUX worker (D1.b), which merges it with attn-out onto one
+    # broadcast. Same fifo object either way (single ANM producer).
+    FfnIn = ObjectFifo(L1_E_ty, name="FfnIn", depth=2)
     anm_dual = not stub_ffn
 
     if not stub_ffn:
         InpFF = ObjectFifo(L1_E_ty, name="InpFF", depth=2)  # FFN final residual
-        ffn_cols = [0, 1, 6, 7]
-        ffn_rows = [2, 2, 3, 3]
-        GUWD = [ObjectFifo(L1_GUW_ty, name=f"GUWD_{c}", depth=2) for c in range(num_cols)]
-        SILU = [ObjectFifo(L1_SILU_ty, name=f"SILU_{c}", depth=1) for c in range(num_cols)]
+        # D1 (FFLM center geometry): FFN runs on the SAME center cols 2-5 as the
+        # attention/O_proj workers — NOT scattered on edge cols 0,1,6,7. Each
+        # center col's O_proj worker (row 5) is FUSED with that col's FFN body
+        # (one tile = one worker → O_proj phase THEN FFN phase, time-multiplexed).
+        # This removes the edge-scatter cross-tile interference suspected of the
+        # ~11% deficit and matches fflm_routing_analysis.md §7 (all on cols 2-5).
+        # GUWD merged into W_f (D1.c) — gate/up/down tiles stream after the
+        # O_proj tiles on the same per-col weight fifo. No separate GUWD fifo.
+        # D1.a: SILU is a TILE-LOCAL scratch buffer, NOT an ObjectFifo. silu_mul
+        # writes it, down reads it — both on the SAME row-5 tile, so no DMA is
+        # needed. A self-fifo (prod+cons same tile) would burn 1 S2MM + 1 MM2S
+        # (core tile cap = 2+2); a Buffer burns ZERO DMA channels. Passed to the
+        # kernels directly like gain_buf/zero_buf (no acquire/release).
+        silu_zero = np.zeros(Hc, dtype=bfloat16)
+        SILU_buf = [Buffer(type=L1_SILU_ty, initial_value=silu_zero,
+                           name=f"silu_scratch_{c}") for c in range(num_cols)]
+        # FFN partial reduction: 4 E-partials join → 4E buffer on MemTile(6,1),
+        # the FFLM single-MemTile aggregator (fflm_routing_analysis.md §6). col6
+        # MemTile also hosts K_full split (4 outs); join adds 4 ins = 8 of 12 ch.
         PartsFull = ObjectFifo(L1_4E_ty, name="PartsFull", depth=1)
         Pp = PartsFull.prod().join(
-            offsets=[i*E for i in range(num_cols)], placement=Tile(col=3, row=1),
+            offsets=[i*E for i in range(num_cols)], placement=Tile(col=6, row=1),
             obj_types=[L1_E_ty for _ in range(num_cols)])
+        # FfnIn (ANM output) is consumed by the MUX worker (D1.b), NOT broadcast
+        # directly — the MUX funnels attn-out + ffn-in into one MergedBcast that
+        # forwards to all 4 row-5 tiles. No separate ffn broadcast fifo.
         FfnOut = ObjectFifo(L1_E_ty, name="FfnOut", depth=2)
 
     def relay_body(src, dst, zero, copy_fn):
@@ -241,6 +291,20 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             d = dst.acquire(1)
             copy_fn(a, zero, d, E)
             src.release(1); dst.release(1)
+
+    # D1.b MUX worker (full FFN): generalized relay that funnels TWO upstreams
+    # into one merged broadcast, in order [attn_out, ffn_in], per iteration. The
+    # row-5 tiles acquire MergedB twice — 1st=attn (O_proj), 2nd=ffn_in (FFN).
+    def mux_body(attn_src, ffn_src, merged_dst, zero, copy_fn):
+        for _ in range_(0xFFFFFFFF):
+            a = attn_src.acquire(1)            # phase 1: attn-out
+            d = merged_dst.acquire(1)
+            copy_fn(a, zero, d, E)
+            attn_src.release(1); merged_dst.release(1)
+            f = ffn_src.acquire(1)             # phase 2: ffn-in
+            d2 = merged_dst.acquire(1)
+            copy_fn(f, zero, d2, E)
+            ffn_src.release(1); merged_dst.release(1)
 
     zero_e = np.zeros(E, dtype=bfloat16)
     zero_buf = Buffer(type=L1_E_ty, initial_value=zero_e, name="relay_zero")
@@ -326,6 +390,48 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                     ow.release(1)
                 ab.release(1); oc.release(1)
 
+        # D1 FUSED row-5 worker: O_proj phase THEN FFN phase on the SAME tile
+        # (one tile = one worker; FFN can't be a separate worker on this tile).
+        # Phase 1 (O_proj): consume OW + merged-bcast(1st=attn) → Oproj_parts join.
+        # Phase 2 (FFN): consume GUWD + merged-bcast(2nd=ffn_in) → g/u/silu/down → Pp.
+        # SILU is a tile-local Buffer (D1.a). attn-out and ffn-in arrive on ONE
+        # merged broadcast (D1.b) acquired twice. This is the FFLM time-multiplex
+        # pattern (stages + streams share a tile sequentially in one iteration).
+        def oproj_ffn_body(wf, mb, oj, p, silu_scratch,
+                           oproj_fn, gate_up_fn, silu_fn, down_fn):
+            for _ in range_(0xFFFFFFFF):
+                # --- phase 1: O_proj (1st merged acquire = attn-out) ---
+                # weights from merged W_f: first o_tiles tiles = O_proj
+                a_full = mb.acquire(1)
+                o = oj.acquire(1)
+                for j in range_(o_tiles):
+                    w = wf.acquire(1)
+                    oproj_fn(m_input, index.casts(T.i32(), j) * m_input,
+                             w, a_full, o)
+                    wf.release(1)
+                mb.release(1); oj.release(1)
+                # --- phase 2: FFN (2nd merged acquire = ffn-in) ---
+                # weights continue on W_f: gate tiles, then up, then down
+                b = mb.acquire(1)
+                for j in range_(gu_tiles):  # gate → lf_left
+                    w = wf.acquire(1)
+                    gate_up_fn(m_input, index.casts(T.i32(), j) * m_input, w, b, 0)
+                    wf.release(1)
+                for j in range_(gu_tiles):  # up → lf_right
+                    w = wf.acquire(1)
+                    gate_up_fn(m_input, index.casts(T.i32(), j) * m_input, w, b, 1)
+                    wf.release(1)
+                mb.release(1)
+                # silu·mul writes the tile-local scratch (D1.a: Buffer, not fifo)
+                silu_fn(silu_scratch, Hc)
+                fo = p.acquire(1)
+                for j in range_(dn_tiles):  # down over silu (reads scratch)
+                    w = wf.acquire(1)
+                    down_fn(m_input, index.casts(T.i32(), j) * m_input,
+                            w, silu_scratch, fo)
+                    wf.release(1)
+                p.release(1)
+
         # DEADLOCK-ISOLATION stub: O_proj worker that ONLY consumes the joined
         # attn_out and produces an output slice — NO OW weights, NO GEMV (just
         # acquire/release both fifos). If this COMPLETES, the hang is in the
@@ -341,16 +447,33 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             workers.append(Worker(oproj_stub,
                 [AttnB.cons(), OC_f[c].prod()],
                 placement=Tile(col=pc, row=5)))
-        else:
+        elif stub_ffn:
             workers.append(Worker(oproj_body,
                 [OW_f[c].cons(), AttnB.cons(), Oproj_parts[c].prod(), oproj],
                 placement=Tile(col=pc, row=5)))
+        else:
+            # FFN enabled → fused O_proj+FFN on this center row-5 tile (D1).
+            # ONE merged weight fifo W_f (D1.c: O_proj|gate|up|down tiles), ONE
+            # merged broadcast MergedB (D1.b: attn-out then ffn-in, 2 acquires),
+            # SILU = tile-local Buffer (D1.a). Net: 2 S2MM (W_f + MergedB) +
+            # 2 MM2S (Oproj_parts + Pp) = exactly the core-tile cap.
+            workers.append(Worker(oproj_ffn_body,
+                [W_f[c].cons(), MergedB.cons(), Oproj_parts[c].prod(),
+                 Pp[c].prod(),
+                 SILU_buf[c],
+                 oproj, gate_up, silu_k, down],
+                placement=Tile(col=pc, row=5)))
 
-    # relay worker: join (AttnFull) → relay → AttnBcast (which forwards to AttnB
-    # broadcast). On a free compute tile outside the cols-2-5 band (col 6 row 2).
-    workers.append(Worker(relay_body,
-        [AttnFull.cons(), AttnBcast.prod(), zero_buf, add_k],
-        placement=Tile(col=6, row=2)))
+    # Tile(6,2): stub mode = plain relay (attn-out → AttnBcast → AttnB); full FFN
+    # mode = MUX worker (D1.b) funneling attn-out + ffn-in → MergedBcast.
+    if stub_ffn:
+        workers.append(Worker(relay_body,
+            [AttnFull.cons(), AttnBcast.prod(), zero_buf, add_k],
+            placement=Tile(col=6, row=2)))
+    else:
+        workers.append(Worker(mux_body,
+            [AttnFull.cons(), FfnIn.cons(), MergedBcast.prod(), zero_buf, add_k],
+            placement=Tile(col=6, row=2)))
 
     # ANM worker: O_proj join + residual inpL + passive gain. Dual output
     # (InpFF + FfnIn) when FFN enabled.
@@ -365,32 +488,9 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             placement=Tile(col=7, row=2)))
 
     if not stub_ffn:
-        # ──────────── FFN (SwiGLU) — one tile/col: gate→up→silu→down ──────────
-        def ffn_body(guwd, ffin, p, silu_p, silu_c, gate_up_fn, silu_fn, down_fn):
-            for _ in range_(0xFFFFFFFF):
-                b = ffin.acquire(1)
-                for j in range_(gu_tiles):  # gate → lf_left
-                    w = guwd.acquire(1)
-                    gate_up_fn(m_input, index.casts(T.i32(), j) * m_input, w, b, 0)
-                    guwd.release(1)
-                for j in range_(gu_tiles):  # up → lf_right
-                    w = guwd.acquire(1)
-                    gate_up_fn(m_input, index.casts(T.i32(), j) * m_input, w, b, 1)
-                    guwd.release(1)
-                ffin.release(1)
-                s = silu_p.acquire(1); silu_fn(s, Hc); silu_p.release(1)
-                sd = silu_c.acquire(1); o = p.acquire(1)
-                for j in range_(dn_tiles):  # down over silu
-                    w = guwd.acquire(1)
-                    down_fn(m_input, index.casts(T.i32(), j) * m_input, w, sd, o)
-                    guwd.release(1)
-                silu_c.release(1); p.release(1)
-
-        for i, c in enumerate(ffn_cols):
-            workers.append(Worker(ffn_body,
-                [GUWD[i].cons(), FfnIn.cons(), Pp[i].prod(),
-                 SILU[i].prod(), SILU[i].cons(), gate_up, silu_k, down],
-                placement=Tile(col=c, row=ffn_rows[i])))
+        # FFN now runs FUSED into the row-5 oproj_ffn_body on center cols 2-5
+        # (D1 — see the worker loop above). No separate edge FFN workers. Only
+        # the final reduction worker remains here.
 
         # FFLM-style reduce: MemTile-joined 4E partials + inpFF → ffn_out
         def reduce_body(parts_f, resid_f, out_f, red_fn):
@@ -474,8 +574,14 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         # E (feeds the ANM tile). O: single full-E ffn_in drain (ANM output).
         tg_main = rt.task_group()
         for c in range(num_cols):
-            rt.fill(A_f[c].prod(),  wt, a_tap(c),  task_group=tg_main)
-            rt.fill(OW_f[c].prod(), wt, ow_tap(c), task_group=tg_main)
+            rt.fill(A_f[c].prod(), wt, a_tap(c), task_group=tg_main)
+            # Row-5 weight stream: stub → OW only; full FFN → O_proj region into
+            # the merged W_f[c] (FFN gate/up/down region filled next in tg_ffn,
+            # same producer, FIFO order → O_proj tiles consumed first).
+            if stub_ffn:
+                rt.fill(OW_f[c].prod(), wt, ow_tap(c), task_group=tg_main)
+            else:
+                rt.fill(W_f[c].prod(), wt, ow_tap(c), task_group=tg_main)
         rt.fill(K_full.prod(), k, kv_src_tap(), task_group=tg_main)
         rt.fill(V_full.prod(), v, kv_src_tap(), task_group=tg_main)
         rt.fill(B_src.prod(),  x, x_tap,        task_group=tg_main)
@@ -487,9 +593,11 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             rt.drain(FfnIn.cons(), o, ffn_tap, task_group=tg_out, wait=True)
             rt.finish_task_group(tg_out)
         else:
+            # FFN weights (gate|up|down per col) into the SAME merged W_f[c],
+            # after the O_proj region filled in tg_main (D1.c bd-multiplex).
             tg_ffn = rt.task_group()
             for i in range(num_cols):
-                rt.fill(GUWD[i].prod(), wt, ffnw_tap(i), task_group=tg_ffn)
+                rt.fill(W_f[i].prod(), wt, ffnw_tap(i), task_group=tg_ffn)
             rt.drain(FfnOut.cons(), o, ffn_tap, task_group=tg_ffn, wait=True)
             rt.finish_task_group(tg_ffn)
 
