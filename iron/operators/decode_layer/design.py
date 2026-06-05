@@ -28,6 +28,7 @@ from aie.iron.device import NPU1, NPU2, Tile
 
 def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                     attn_group=8, seq_len=32, output_first=False,
+                    hidden_dim=8192, stub_ffn=False,
                     chunk_size=None, m_input=2, num_cols=4, col_offset=2,
                     stub_oproj=False, rms_gain_data=None):
     if chunk_size is None:
@@ -51,6 +52,16 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     o_packed = m_input * E // 2 + m_input * o_groups * 2
     o_tiles = o_slice // m_input
 
+    # FFN (SwiGLU) sizes — ffn_probe-proven
+    Hc = hidden_dim // num_cols                      # 2048
+    assert Hc * num_cols == hidden_dim
+    gu_groups = E // group_size
+    gu_packed = m_input * E // 2 + m_input * gu_groups * 2
+    gu_tiles = Hc // m_input
+    dn_groups = Hc // group_size
+    dn_packed = m_input * Hc // 2 + m_input * dn_groups * 2
+    dn_tiles = E // m_input
+
     L1_A_ty   = np.ndarray[(packed_tile,), u8]
     L1_B_ty   = np.ndarray[(K_gemv,), bf]
     L1_Q_ty   = np.ndarray[(q_buf_elems,), bf]
@@ -65,20 +76,25 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # (578). O_proj writes o_slice=512 rows into it (first 512 used). o_packed
     # == packed_tile and L1_E_ty == L1_B_ty (both K=E=2048), so all 3 args match.
     L1_OC_ty  = L1_Q_ty                               # o_out buffer (write first o_slice)
+    L1_GUW_ty = np.ndarray[(gu_packed,), u8]          # gate/up/down weight tile
+    L1_SILU_ty = np.ndarray[(Hc,), bf]                # silu(gate)*up per column
 
     DTYPE_SIZE = 2
     ahs = int((seq_len * head_dim * DTYPE_SIZE + 63) / 64) * 64
     ahs_elems = ahs // DTYPE_SIZE
 
-    # FFLM-style ONE weight BO (like FFLM's bo1 = all layer weights together):
-    # QKV/A region then O_proj region, contiguous in a single DDR buffer. This
-    # keeps the kernel at 5 data BOs (FFLM's MLIR_AIE ABI: bo0-4), with the
-    # weight BO holding all GEMV weights. Layout: [W (num_cols*a_per_col) |
-    # OW (num_cols*ow_per_col)] — A_src reads at 0, OW_src at the W-region end.
-    w_region  = num_cols * gemv_tiles * packed_tile          # all QKV weights
-    ow_region = num_cols * o_tiles * o_packed                # all O weights
-    ow_base   = w_region                                     # OW offset in the BO
-    L3_WT_ty = np.ndarray[(w_region + ow_region,), u8]       # single weight BO
+    # FFLM Q4NX weight order in ONE BO: [QKV | O | FFN]. FFN region = per-column
+    # [gate|up|down] CONTIGUOUS (one shim stream/col, 16-S2MM cap is global).
+    guw_per_col = 2 * gu_tiles * gu_packed              # gate then up tiles
+    dnw_per_col = dn_tiles * dn_packed
+    ffnw_per_col = guw_per_col + dnw_per_col            # [gate|up|down] per col
+    ffn_region  = num_cols * ffnw_per_col
+    w_region   = num_cols * gemv_tiles * packed_tile    # all QKV weights
+    ow_region  = num_cols * o_tiles * o_packed          # all O weights
+    ow_base    = w_region
+    ffn_base   = w_region + ow_region
+    WT_ELEMS   = w_region + ow_region + ffn_region
+    L3_WT_ty = np.ndarray[(WT_ELEMS,), u8]
     # X is an input BUNDLE (FFLM-style: pack activations into one BO, not a 6th
     # DDR arg — the 5-BO ABI is full). Layout: [Xqkv (E) | inpL (E)] where Xqkv
     # is the (pre-normed) QKV GEMV activation and inpL is the residual the ANM
@@ -118,6 +134,19 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                    [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
     rms_k = Kernel("layer_fused_rms_norm2_bf16", "layer_fused_relay.o",
                    [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
+    # FFN kernels: gate_up + silu from layer_fused_relay.o; down = v2 GEMV K=Hc
+    # with a distinct renamed symbol; reduce4 does fp32 accumulation of 4 partials
+    # + residual on a MemTile-joined 4E buffer (FFLM-style single-MemTile aggregation).
+    gate_up = Kernel("layer_fused_gate_up_bf16", "layer_fused_relay.o",
+                     [np.int32, np.int32, L1_GUW_ty, L1_E_ty, np.int32])
+    silu_k = Kernel("layer_fused_silu_mul_bf16", "layer_fused_relay.o",
+                    [L1_SILU_ty, np.int32])
+    down = Kernel("down_matvec_v2_bf16",
+                  f"fused_dequant_gemv_v2_down_{Hc}k_g{group_size}.o",
+                  [np.int32, np.int32, L1_GUW_ty, L1_SILU_ty, L1_E_ty])
+    L1_4E_ty = np.ndarray[(4 * E,), bf]
+    reduce4 = Kernel("layer_fused_reduce4_bf16", "layer_fused_relay.o",
+                     [L1_4E_ty, L1_E_ty, L1_E_ty, np.int32])
 
     # Weight/input delivery. A (QKV) and OW (O_proj) weights are PER-COLUMN
     # CONTIGUOUS fills (the decode_front-proven pattern): each column's weight
@@ -192,35 +221,44 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         obj_types=[L1_O_ty for _ in range(num_cols)])
     InpL  = ObjectFifo(L1_E_ty, name="InpL",  depth=2)   # residual (from X bundle)
     FfnIn = ObjectFifo(L1_E_ty, name="FfnIn", depth=2)   # ANM output = ffn_in
+    anm_dual = not stub_ffn
+
+    if not stub_ffn:
+        InpFF = ObjectFifo(L1_E_ty, name="InpFF", depth=2)  # FFN final residual
+        ffn_cols = [0, 1, 6, 7]
+        ffn_rows = [2, 2, 3, 3]
+        GUWD = [ObjectFifo(L1_GUW_ty, name=f"GUWD_{c}", depth=2) for c in range(num_cols)]
+        SILU = [ObjectFifo(L1_SILU_ty, name=f"SILU_{c}", depth=1) for c in range(num_cols)]
+        PartsFull = ObjectFifo(L1_4E_ty, name="PartsFull", depth=1)
+        Pp = PartsFull.prod().join(
+            offsets=[i*E for i in range(num_cols)], placement=Tile(col=3, row=1),
+            obj_types=[L1_E_ty for _ in range(num_cols)])
+        FfnOut = ObjectFifo(L1_E_ty, name="FfnOut", depth=2)
 
     def relay_body(src, dst, zero, copy_fn):
         for _ in range_(0xFFFFFFFF):
             a = src.acquire(1)
             d = dst.acquire(1)
-            copy_fn(a, zero, d, E)          # d = a + 0 = a (true identity bridge:
-                                            # join-fifo can't also .forward(), so
-                                            # this tile relays attn_out unchanged
-                                            # from the join to the O_proj broadcast)
+            copy_fn(a, zero, d, E)
             src.release(1); dst.release(1)
 
-    # zero operand makes the relay add an exact identity copy (a+0). Passive
-    # Buffer (CDO-loaded, zero runtime DMA) — does not consume a shim channel.
     zero_e = np.zeros(E, dtype=bfloat16)
     zero_buf = Buffer(type=L1_E_ty, initial_value=zero_e, name="relay_zero")
 
-    # ANM worker body: inpFF = o_out + inpL ; ffn_in = rms(inpFF) * gain.
-    # (anm_probe-proven: add into the output buffer, then rms in-place.)
-    def anm_body(oj, inpl, ffi, gain, add_fn, rms_fn):
-        for _ in range_(0xFFFFFFFF):
-            o = oj.acquire(1)
-            l = inpl.acquire(1)
-            r = ffi.acquire(1)
-            add_fn(o, l, r, E)              # r = o_out + inpL
-            rms_fn(r, gain, r, E)           # r = rms(r) * gain  (gain = passive)
-            oj.release(1); inpl.release(1); ffi.release(1)
+    if not anm_dual:
+        def anm_body(oj, inpl, ffi, gain, add_fn, rms_fn):
+            for _ in range_(0xFFFFFFFF):
+                o = oj.acquire(1); l = inpl.acquire(1); r = ffi.acquire(1)
+                add_fn(o, l, r, E); rms_fn(r, gain, r, E)
+                oj.release(1); inpl.release(1); ffi.release(1)
+    else:
+        def anm_body(oj, inpl, ffi, pf_out, gain, add_fn, rms_fn):
+            for _ in range_(0xFFFFFFFF):
+                o = oj.acquire(1); l = inpl.acquire(1)
+                r = ffi.acquire(1); pf = pf_out.acquire(1)
+                add_fn(o, l, pf, E); rms_fn(pf, gain, r, E)
+                oj.release(1); inpl.release(1); ffi.release(1); pf_out.release(1)
 
-    # RMS gain is a per-layer constant → passive Buffer (CDO-loaded, zero DMA),
-    # like the RoPE LUT. Keeps the ANM tile at 2 S2MM (OProjFull + InpL).
     if rms_gain_data is None:
         rms_gain_data = np.ones(E, dtype=bfloat16)
     gain_buf = Buffer(type=L1_E_ty, initial_value=rms_gain_data, name="rms_gain")
@@ -314,11 +352,62 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         [AttnFull.cons(), AttnBcast.prod(), zero_buf, add_k],
         placement=Tile(col=6, row=2)))
 
-    # ANM worker: O_proj join (OProjFull) + residual inpL + passive gain →
-    # ffn_in. On a free compute tile (col 7 row 2), outside the cols-2-5 band.
-    workers.append(Worker(anm_body,
-        [OProjFull.cons(), InpL.cons(), FfnIn.prod(), gain_buf, add_k, rms_k],
-        placement=Tile(col=7, row=2)))
+    # ANM worker: O_proj join + residual inpL + passive gain. Dual output
+    # (InpFF + FfnIn) when FFN enabled.
+    if not anm_dual:
+        workers.append(Worker(anm_body,
+            [OProjFull.cons(), InpL.cons(), FfnIn.prod(), gain_buf, add_k, rms_k],
+            placement=Tile(col=7, row=2)))
+    else:
+        workers.append(Worker(anm_body,
+            [OProjFull.cons(), InpL.cons(), FfnIn.prod(), InpFF.prod(),
+             gain_buf, add_k, rms_k],
+            placement=Tile(col=7, row=2)))
+
+    if not stub_ffn:
+        # ──────────── FFN (SwiGLU) — one tile/col: gate→up→silu→down ──────────
+        def ffn_body(guwd, ffin, p, silu_p, silu_c, gate_up_fn, silu_fn, down_fn):
+            for _ in range_(0xFFFFFFFF):
+                b = ffin.acquire(1)
+                for j in range_(gu_tiles):  # gate → lf_left
+                    w = guwd.acquire(1)
+                    gate_up_fn(m_input, index.casts(T.i32(), j) * m_input, w, b, 0)
+                    guwd.release(1)
+                for j in range_(gu_tiles):  # up → lf_right
+                    w = guwd.acquire(1)
+                    gate_up_fn(m_input, index.casts(T.i32(), j) * m_input, w, b, 1)
+                    guwd.release(1)
+                ffin.release(1)
+                s = silu_p.acquire(1); silu_fn(s, Hc); silu_p.release(1)
+                sd = silu_c.acquire(1); o = p.acquire(1)
+                for j in range_(dn_tiles):  # down over silu
+                    w = guwd.acquire(1)
+                    down_fn(m_input, index.casts(T.i32(), j) * m_input, w, sd, o)
+                    guwd.release(1)
+                silu_c.release(1); p.release(1)
+
+        for i, c in enumerate(ffn_cols):
+            workers.append(Worker(ffn_body,
+                [GUWD[i].cons(), FfnIn.cons(), Pp[i].prod(),
+                 SILU[i].prod(), SILU[i].cons(), gate_up, silu_k, down],
+                placement=Tile(col=c, row=ffn_rows[i])))
+
+        # FFLM-style reduce: MemTile-joined 4E partials + inpFF → ffn_out
+        def reduce_body(parts_f, resid_f, out_f, red_fn):
+            for _ in range_(0xFFFFFFFF):
+                p = parts_f.acquire(1); r = resid_f.acquire(1); o = out_f.acquire(1)
+                red_fn(p, r, o, E)
+                parts_f.release(1); resid_f.release(1); out_f.release(1)
+
+        import os as _os
+        if _os.environ.get("DECODE_DBG_DUMP_P0"):
+            _red = Kernel("layer_fused_dump_part_bf16", "layer_fused_relay.o",
+                          [L1_4E_ty, L1_E_ty, L1_E_ty, np.int32])
+        else:
+            _red = reduce4
+        workers.append(Worker(reduce_body,
+            [PartsFull.cons(), InpFF.cons(), FfnOut.prod(), _red],
+            placement=Tile(col=6, row=5)))
 
     # Per-column contiguous taps (decode_front-proven). IRON auto-tiles a large
     # contiguous inner dim down to the BD-1023 limit, so a flat [.. , inner] tap
@@ -331,19 +420,27 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
 
     def a_tap(c):
         return TensorAccessPattern(
-            tensor_dims=(1, w_region + ow_region), offset=c * a_per_col,
+            tensor_dims=(1, WT_ELEMS), offset=c * a_per_col,
             sizes=[1, 1, 1, a_per_col], strides=[0, 0, 0, 1])
 
     def ow_tap(c):
         return TensorAccessPattern(
-            tensor_dims=(1, w_region + ow_region), offset=ow_base + c * ow_per_col,
+            tensor_dims=(1, WT_ELEMS), offset=ow_base + c * ow_per_col,
             sizes=[1, 1, 1, ow_per_col], strides=[0, 0, 0, 1])
+
+    def ffnw_tap(i):
+        return TensorAccessPattern(
+            tensor_dims=(1, WT_ELEMS), offset=ffn_base + i * ffnw_per_col,
+            sizes=[1, 1, 1, ffnw_per_col], strides=[0, 0, 0, 1])
 
     # X bundle: Xqkv at offset 0, residual inpL at offset K_gemv (both E elems).
     x_tap = TensorAccessPattern(tensor_dims=(1, 2 * K_gemv), offset=0,
         sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
     inpL_tap = TensorAccessPattern(tensor_dims=(1, 2 * K_gemv), offset=K_gemv,
         sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
+
+    ffn_tap = TensorAccessPattern(tensor_dims=(1, E), offset=0,
+        sizes=[1, 1, 1, E], strides=[0, 0, 0, 1])
 
     # K/V split sources: ONE fill of the whole num_cols*ahs_elems contiguous
     # region; the MemTile split fans the per-column kv_col slices on-chip.
@@ -375,15 +472,25 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         # K/V: one fill of the split source each (fanned on col6/col7 MemTiles).
         # B: QKV activation = X bundle offset 0. InpL: residual = X bundle offset
         # E (feeds the ANM tile). O: single full-E ffn_in drain (ANM output).
-        tg_w = rt.task_group()
+        tg_main = rt.task_group()
         for c in range(num_cols):
-            rt.fill(A_f[c].prod(),  wt, a_tap(c),  task_group=tg_w)
-            rt.fill(OW_f[c].prod(), wt, ow_tap(c), task_group=tg_w)
-        rt.fill(K_full.prod(), k, kv_src_tap(), task_group=tg_w)
-        rt.fill(V_full.prod(), v, kv_src_tap(), task_group=tg_w)
-        rt.fill(B_src.prod(),  x, x_tap,        task_group=tg_w)
-        rt.fill(InpL.prod(),   x, inpL_tap,     task_group=tg_w)
-        rt.drain(FfnIn.cons(), o, ffn_tap, task_group=tg_w, wait=True)
-        rt.finish_task_group(tg_w)
+            rt.fill(A_f[c].prod(),  wt, a_tap(c),  task_group=tg_main)
+            rt.fill(OW_f[c].prod(), wt, ow_tap(c), task_group=tg_main)
+        rt.fill(K_full.prod(), k, kv_src_tap(), task_group=tg_main)
+        rt.fill(V_full.prod(), v, kv_src_tap(), task_group=tg_main)
+        rt.fill(B_src.prod(),  x, x_tap,        task_group=tg_main)
+        rt.fill(InpL.prod(),   x, inpL_tap,     task_group=tg_main)
+        rt.finish_task_group(tg_main)
+
+        if stub_ffn:
+            tg_out = rt.task_group()
+            rt.drain(FfnIn.cons(), o, ffn_tap, task_group=tg_out, wait=True)
+            rt.finish_task_group(tg_out)
+        else:
+            tg_ffn = rt.task_group()
+            for i in range(num_cols):
+                rt.fill(GUWD[i].prod(), wt, ffnw_tap(i), task_group=tg_ffn)
+            rt.drain(FfnOut.cons(), o, ffn_tap, task_group=tg_ffn, wait=True)
+            rt.finish_task_group(tg_ffn)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())

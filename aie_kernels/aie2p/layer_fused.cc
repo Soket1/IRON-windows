@@ -399,6 +399,47 @@ void layer_fused_add_bf16(
     }
 }
 
+// Reduce 4 concatenated per-column FFN partials [P0|P1|P2|P3] (each n elems)
+// plus a residual into one n-elem output: out = P0+P1+P2+P3+resid. FFLM-style
+// MemTile aggregation: the 4 down partials are joined on ONE MemTile into a 4n
+// buffer, then a single worker reduces them — avoids a cross-column add-tree
+// that would exhaust the MemTile routing budget.
+void layer_fused_reduce4_bf16(
+        const bfloat16 *parts, const bfloat16 *resid, bfloat16 *c, int32_t n) {
+    constexpr int VEC = 16;
+    int chunks = n / VEC;
+    AIE_PREPARE_FOR_PIPELINING
+    for (int i = 0; i < chunks; i++) {
+        // fp32 accumulation (upcast each bf16 partial) so summing 4 large
+        // partials + residual does not round at each pairwise add.
+        ::aie::accum<accfloat, VEC> acc;
+        acc.from_vector(::aie::load_v<VEC>(parts + i * VEC));
+        acc = ::aie::add(acc, ::aie::load_v<VEC>(parts + n + i * VEC));
+        acc = ::aie::add(acc, ::aie::load_v<VEC>(parts + 2 * n + i * VEC));
+        acc = ::aie::add(acc, ::aie::load_v<VEC>(parts + 3 * n + i * VEC));
+        acc = ::aie::add(acc, ::aie::load_v<VEC>(resid + i * VEC));
+        ::aie::store_v(c + i * VEC, acc.template to_vector<bfloat16>());
+    }
+    for (int i = chunks * VEC; i < n; i++) {
+        c[i] = (bfloat16)((float)parts[i] + (float)parts[n + i] +
+                          (float)parts[2 * n + i] + (float)parts[3 * n + i] +
+                          (float)resid[i]);
+    }
+}
+
+// DEBUG: dump one of the 4 joined partials. out = parts[which*n : (which+1)*n].
+// Used to isolate which partial the MemTile join delivers (single-dispatch test).
+void layer_fused_dump_part_bf16(
+        const bfloat16 *parts, const bfloat16 *resid, bfloat16 *c, int32_t n) {
+    (void)resid;
+    constexpr int VEC = 16;
+    int chunks = n / VEC;
+    // which partial is selected via the high bits of n is overkill; just dump P0.
+    for (int i = 0; i < chunks; i++)
+        ::aie::store_v(c + i * VEC, ::aie::load_v<VEC>(parts + i * VEC));
+    for (int i = chunks * VEC; i < n; i++) c[i] = parts[i];
+}
+
 // Weighted RMSNorm: output[i] = (input[i] / rms(input)) * gain[i], eps=1e-5.
 void layer_fused_rms_norm2_bf16(
         const bfloat16 *input, const bfloat16 *gain,
