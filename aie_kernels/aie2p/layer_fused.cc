@@ -785,6 +785,21 @@ void layer_fused_down_v2_static_bf16(
     }
 }
 
+// UNPAD helper (D2.2c): a_in points at a uniform 4608-byte weight-fifo element
+// that holds several unpadded down sub-tiles back-to-back (each = m rows,
+// K=INTER_DIM_PER_COL). Select sub-tile `sub_idx` by pointer arithmetic and run
+// the proven per-tile down GEMV. Lets ONE weight fifo carry unpadded down tiles
+// (1152 B) packed N-per-element, avoiding the 4× pad to the gate/up tile size.
+void layer_fused_down_v2_sub_bf16(uint32_t m, uint32_t row_offset,
+                                  uint32_t sub_idx,
+                                  const uint8_t *__restrict a_in,
+                                  bfloat16 *__restrict c_out) {
+    constexpr uint32_t G  = GROUP_SIZE;
+    constexpr uint32_t DK = INTER_DIM_PER_COL;
+    const uint32_t sub_bytes = m * DK / 2 + m * (DK / G) * 2;
+    layer_fused_down_v2_static_bf16(m, row_offset, a_in + sub_idx * sub_bytes, c_out);
+}
+
 }  // extern "C"
 
 #ifdef COMPILE_ATTN

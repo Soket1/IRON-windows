@@ -42,15 +42,21 @@ def my_decode_ffn16(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
     Hc16 = H // NT                                # 512 (per-tile gate/up out, down K)
     gu_tiles = Hc16 // m                          # 128
     dn_tiles = E // m                             # 512
-    # uniform weight-tile size = gate/up packed (K=E); down (K=Hc16) is padded up.
-    PACKED = m * E // 2 + m * (E // g) * 2        # 4608
-    DN_PACKED = m * Hc16 // 2 + m * (Hc16 // g) * 2  # 1152 (real down bytes)
-    WT_PER_TILE = gu_tiles + gu_tiles + dn_tiles  # 768
+    PACKED = m * E // 2 + m * (E // g) * 2        # 4608 (gate/up tile, K=E)
+    DN_PACKED = m * Hc16 // 2 + m * (Hc16 // g) * 2  # 1152 (down tile, K=Hc16)
+    # UNPAD (D2.2c): pack DN_SUB=4 down tiles per 4608 element (4×1152=4608) so
+    # the weight fifo element stays uniform WITHOUT padding. down loop slices.
+    DN_SUB = PACKED // DN_PACKED                  # 4
+    assert DN_SUB * DN_PACKED == PACKED
+    dn_elems = dn_tiles // DN_SUB                 # 128
+    assert dn_elems * DN_SUB == dn_tiles
+    WT_PER_TILE = gu_tiles + gu_tiles + dn_elems  # 384 (was 768 padded)
 
     L1_E_ty  = np.ndarray[(E,), bf]
     L1_4E_ty = np.ndarray[(4 * E,), bf]
-    L1_W_ty  = np.ndarray[(PACKED,), u8]          # one weight tile
-    L1_W4_ty = np.ndarray[(R * PACKED,), u8]      # one round = 4 rows' j-th tile
+    L1_W_ty  = np.ndarray[(PACKED,), u8]          # one element (gate/up tile, or 4 down)
+    L1_DW_ty = np.ndarray[(DN_PACKED,), u8]       # one down sub-tile (slice)
+    L1_W4_ty = np.ndarray[(R * PACKED,), u8]      # one round = 4 rows' j-th element
 
     L3_E_ty  = np.ndarray[(E,), bf]
     L3_D_ty  = np.ndarray[(64,), bf]
@@ -61,8 +67,8 @@ def my_decode_ffn16(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                      [np.int32, np.int32, L1_W_ty, L1_E_ty, np.int32])
     silu = Kernel("layer_fused_silu_mul_static_bf16", "layer_fused_relay.o",
                   [np.int32])
-    down = Kernel("layer_fused_down_v2_static_bf16", "layer_fused_relay.o",
-                  [np.int32, np.int32, L1_W_ty, L1_E_ty])
+    down = Kernel("layer_fused_down_v2_sub_bf16", "layer_fused_relay.o",
+                  [np.int32, np.int32, np.int32, L1_W_ty, L1_E_ty])
     reduce4 = Kernel("layer_fused_reduce4_bf16", "layer_fused_relay.o",
                      [L1_4E_ty, L1_E_ty, L1_E_ty, np.int32])
     add = Kernel("layer_fused_add_bf16", "layer_fused_relay.o",
@@ -127,9 +133,11 @@ def my_decode_ffn16(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
             bc.release(1)
             silu_fn(Hc16)
             o = pp.acquire(1)
-            for j in range_(dn_tiles):                 # down → full-E partial
-                w = wf.acquire(1)
-                down_fn(m, index.casts(T.i32(), j) * m, w, o)
+            for j in range_(dn_elems):                 # 128 elems × 4 sub-tiles
+                w = wf.acquire(1)                      # 4608 = 4 down sub-tiles
+                for k in range(DN_SUB):                # static unroll (python)
+                    ro = (index.casts(T.i32(), j) * DN_SUB + k) * m
+                    down_fn(m, ro, k, w, o)            # sub_idx=k, full element
                 wf.release(1)
             pp.release(1)
 
@@ -138,7 +146,7 @@ def my_decode_ffn16(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
     def copy_body(wf, bc, pp, add_fn, zero):
         for _ in range_(0xFFFFFFFF):
             b = bc.acquire(1)
-            for _j in range_(2 * gu_tiles + dn_tiles):
+            for _j in range_(2 * gu_tiles + dn_elems):
                 w = wf.acquire(1)
                 wf.release(1)
             o = pp.acquire(1)

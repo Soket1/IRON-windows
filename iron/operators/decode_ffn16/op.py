@@ -69,7 +69,9 @@ class AIEDecodeFFN16(AIEOperatorBase):
         gu_tiles = Hc16 // m
         dn_tiles = E // m
         PACKED = m * E // 2 + m * (E // g) * 2
-        wt_per_tile = gu_tiles + gu_tiles + dn_tiles
+        DN_PACKED = m * Hc16 // 2 + m * (Hc16 // g) * 2
+        dn_elems = dn_tiles // (PACKED // DN_PACKED)     # unpadded: 4 down/elem
+        wt_per_tile = gu_tiles + gu_tiles + dn_elems     # 384
         W_BYTES = nc * wt_per_tile * 4 * PACKED
         self.add_buffer("O", E, dtype=bfloat16)
         self.add_buffer("W", W_BYTES, dtype=np.uint8)
