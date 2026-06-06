@@ -606,21 +606,75 @@ void layer_fused_silu_mul_static_bf16(uint32_t m_output) {
     constexpr int VEC = 8;
     int chunks = (int)m_output / VEC;
     aie::vector<bfloat16, VEC> r05 = aie::broadcast<bfloat16, VEC>(0.5f);
-    aie::vector<bfloat16, VEC> r1  = aie::broadcast<bfloat16, VEC>(1.0f);
+    // D1.7 FIX: replaced aie::tanh (LUT-based, stateful on AIE2P — leaves the
+    // tanh-unit in an uncleaned state that corrupts silu output when running after
+    // O_proj+gate+up on the same tile) with sigmoid via aie::exp2 (stateless).
+    // silu(x) = x * sigmoid(x),  sigmoid(x) = 1/(1 + exp(-x))
+    //         = 1/(1 + exp2(-x * log2e)),  log2e ≈ 1.4426950408
+    // exp2<bfloat16>(float_vec) is stateless and verified working on AIE2P.
+    // -log2(e) as a scalar for float accumulation
+    aie::vector<bfloat16, VEC> r1     = aie::broadcast<bfloat16, VEC>(1.0f);
     AIE_PREPARE_FOR_PIPELINING
     for (int i = 0; i < chunks; i++) {
         aie::vector<bfloat16, VEC> l = aie::load_v<VEC>(lf_left_buf  + i * VEC);
         aie::vector<bfloat16, VEC> r = aie::load_v<VEC>(lf_right_buf + i * VEC);
-        auto half_x = aie::mul(l, r05);
-        auto tanh_h = aie::tanh<bfloat16>(half_x.template to_vector<float>());
-        auto t_p1   = aie::add(tanh_h, r1);
-        aie::vector<bfloat16, VEC> sig =
-            aie::mul(t_p1, r05).template to_vector<bfloat16>();
-        auto silu  = aie::mul(l, sig);
-        auto fused = aie::mul(silu.template to_vector<bfloat16>(), r);
-        aie::store_v(lf_silu_buf + i * VEC, fused.template to_vector<bfloat16>());
+        // exp(-gate) = exp2(-gate * log2e): use accum multiply so .to_vector<float>() works
+        // aie::mul(bf16, bf16) → accum<accfloat,VEC>; .to_vector<float>() available on accum
+        aie::vector<bfloat16, VEC> mlog2e = aie::broadcast<bfloat16, VEC>(-1.4426950408f);
+        aie::vector<bfloat16, VEC> exp_neg =
+            aie::exp2<bfloat16>(aie::mul(l, mlog2e).template to_vector<float>());
+        // sigmoid = 1 / (1 + exp(-gate)); aie::add(bf16,bf16) returns vector<bfloat16>
+        aie::vector<bfloat16, VEC> denom = aie::add(r1, exp_neg);
+        aie::vector<bfloat16, VEC> sig   = aie::inv(denom);
+        // silu(gate) = gate * sigmoid; fused = silu * up
+        aie::vector<bfloat16, VEC> silu  = aie::mul(l, sig).template to_vector<bfloat16>();
+        aie::vector<bfloat16, VEC> fused = aie::mul(silu, r).template to_vector<bfloat16>();
+        aie::store_v(lf_silu_buf + i * VEC, fused);
     }
     (void)chunks;
+}
+
+// D1.7 CANARY (env DECODE_DBG_CANARY): overwrite lf_silu_buf with a known
+// constant (1.0), ignoring gate/up/silu. Decisive test of whether down reads
+// lf_silu_buf correctly in the FULL live chain: if NPU down output == CPU
+// down(W_down, ones), down's runtime read is fine and the bug is upstream; if
+// not, the same-tile O_proj→gate→up sequence corrupts what down reads.
+void layer_fused_silu_canary_bf16(uint32_t m_output) {
+    constexpr int VEC = 8;
+    int chunks = (int)m_output / VEC;
+#if defined(CANARY_GATE)
+    // GATE-PASSTHROUGH: copy lf_left_buf (gate output) straight to lf_silu_buf.
+    for (int i = 0; i < chunks; i++)
+        aie::store_v(lf_silu_buf + i * VEC, aie::load_v<VEC>(lf_left_buf + i * VEC));
+    (void)chunks;
+#elif defined(CANARY_UP)
+    // UP-PASSTHROUGH: copy lf_right_buf (up output) to lf_silu_buf.
+    for (int i = 0; i < chunks; i++)
+        aie::store_v(lf_silu_buf + i * VEC, aie::load_v<VEC>(lf_right_buf + i * VEC));
+    (void)chunks;
+#elif defined(CANARY_MUL)
+    // MUL-ONLY: lf_left * lf_right, NO tanh/sigmoid. If PASS → tanh is the culprit.
+    // If FAIL → the load of lf_left or lf_right itself is the problem.
+    for (int i = 0; i < chunks; i++) {
+        aie::vector<bfloat16, VEC> l = aie::load_v<VEC>(lf_left_buf  + i * VEC);
+        aie::vector<bfloat16, VEC> r = aie::load_v<VEC>(lf_right_buf + i * VEC);
+        aie::store_v(lf_silu_buf + i * VEC,
+            aie::mul(l, r).template to_vector<bfloat16>());
+    }
+    (void)chunks;
+#elif defined(CANARY_RAMP)
+    // RAMP variant: realistic silu-range values [~-0.3 .. ~1.0], bf16, so down
+    // sees a wide dynamic range like real silu but DETERMINISTIC. If this PASSES
+    // too, down is input-insensitive and the bug is purely NPU-silu != CPU-silu.
+    for (int i = 0; i < (int)m_output; i++)
+        lf_silu_buf[i] = (bfloat16)(-0.3f + 1.3f * ((float)(i % 257) / 256.0f));
+    (void)chunks;
+#else
+    aie::vector<bfloat16, VEC> one = aie::broadcast<bfloat16, VEC>(1.0f);
+    for (int i = 0; i < chunks; i++)
+        aie::store_v(lf_silu_buf + i * VEC, one);
+    (void)chunks;
+#endif
 }
 
 // D1.7: down GEMV (v2 dequant: w = nibble*scale, NO -8 bias) reading the SwiGLU

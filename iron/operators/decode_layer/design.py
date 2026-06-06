@@ -145,6 +145,17 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # .bss statics (the D1 11% root cause). [[reference_fflm_tile_zero_static_l1]]
     silu_k = Kernel("layer_fused_silu_mul_static_bf16", "layer_fused_relay.o",
                     [np.int32])
+    # DECODE_DBG_CANARY: replace silu with a constant-1.0 writer to lf_silu_buf,
+    # to test down's runtime read of lf_silu_buf in the full chain (driver ref
+    # then uses silu=ones). Same signature [np.int32] as silu_k.
+    import os as _os_canary
+    if _os_canary.environ.get("DECODE_DBG_CANARY") or \
+       _os_canary.environ.get("DECODE_DBG_CANARY_RAMP") or \
+       _os_canary.environ.get("DECODE_DBG_CANARY_GATE") or \
+       _os_canary.environ.get("DECODE_DBG_CANARY_UP") or \
+       _os_canary.environ.get("DECODE_DBG_CANARY_MUL"):
+        silu_k = Kernel("layer_fused_silu_canary_bf16", "layer_fused_relay.o",
+                        [np.int32])
     down = Kernel("layer_fused_down_v2_static_bf16", "layer_fused_relay.o",
                   [np.int32, np.int32, L1_GUW_ty, L1_E_ty])
     L1_4E_ty = np.ndarray[(4 * E,), bf]

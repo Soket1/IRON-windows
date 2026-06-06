@@ -84,18 +84,28 @@ class AIEDecodeLayer(AIEOperatorBase):
         )
         # relay/ANM kernel (layer_fused_add) for the join→broadcast relay tile
         E = self.embed_dim
+        import os as _os_op
+        _relay_flags = [
+            f"-DEMBED_DIM={E}", f"-DHIDDEN_DIM={self.hidden_dim}",
+            f"-DGROUP_SIZE={g}", f"-DHEAD_DIM={self.head_dim}",
+            f"-DNUM_HEADS={self.num_heads if hasattr(self,'num_heads') else 32}",
+            f"-DNUM_KV_HEADS=8", f"-DMAX_SEQ_LEN=2048",
+            f"-DNUM_AIE_COLUMNS={nc}",
+            f"-DM_OUTPUT_MAX={max(Hc, E)}", f"-DINTER_DIM_PER_COL={E}",
+        ]
+        if _os_op.environ.get("DECODE_DBG_CANARY_RAMP"):
+            _relay_flags.append("-DCANARY_RAMP")
+        if _os_op.environ.get("DECODE_DBG_CANARY_GATE"):
+            _relay_flags.append("-DCANARY_GATE")
+        if _os_op.environ.get("DECODE_DBG_CANARY_UP"):
+            _relay_flags.append("-DCANARY_UP")
+        if _os_op.environ.get("DECODE_DBG_CANARY_MUL"):
+            _relay_flags.append("-DCANARY_MUL")
         relay_obj = KernelObjectArtifact.new(
             "layer_fused_relay.o",
             depends=[SourceArtifact.new(
                 self.context.base_dir / "aie_kernels" / "aie2p" / "layer_fused.cc")],
-            extra_flags=[
-                f"-DEMBED_DIM={E}", f"-DHIDDEN_DIM={self.hidden_dim}",
-                f"-DGROUP_SIZE={g}", f"-DHEAD_DIM={self.head_dim}",
-                f"-DNUM_HEADS={self.num_heads if hasattr(self,'num_heads') else 32}",
-                f"-DNUM_KV_HEADS=8", f"-DMAX_SEQ_LEN=2048",
-                f"-DNUM_AIE_COLUMNS={nc}",
-                f"-DM_OUTPUT_MAX={max(Hc, E)}", f"-DINTER_DIM_PER_COL={E}",
-            ],
+            extra_flags=_relay_flags,
         )
         xclbin_artifact = XclbinArtifact.new(
             f"{base}.xclbin",
