@@ -67,7 +67,7 @@ def my_decode_ffn16(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                      [np.int32, np.int32, L1_W_ty, L1_E_ty, np.int32])
     silu = Kernel("layer_fused_silu_mul_static_bf16", "layer_fused_relay.o",
                   [np.int32])
-    down = Kernel("layer_fused_down_v2_sub_bf16", "layer_fused_relay.o",
+    down = Kernel("layer_fused_down_v2_x4_bf16", "layer_fused_relay.o",
                   [np.int32, np.int32, np.int32, L1_W_ty, L1_E_ty])
     reduce4 = Kernel("layer_fused_reduce4_bf16", "layer_fused_relay.o",
                      [L1_4E_ty, L1_E_ty, L1_E_ty, np.int32])
@@ -135,9 +135,8 @@ def my_decode_ffn16(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
             o = pp.acquire(1)
             for j in range_(dn_elems):                 # 128 elems × 4 sub-tiles
                 w = wf.acquire(1)                      # 4608 = 4 down sub-tiles
-                for k in range(DN_SUB):                # static unroll (python)
-                    ro = (index.casts(T.i32(), j) * DN_SUB + k) * m
-                    down_fn(m, ro, k, w, o)            # sub_idx=k, full element
+                ro = index.casts(T.i32(), j) * DN_SUB * m   # base output row
+                down_fn(m, ro, DN_SUB, w, o)          # ONE call processes 4 sub-tiles
                 wf.release(1)
             pp.release(1)
 

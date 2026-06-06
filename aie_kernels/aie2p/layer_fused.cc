@@ -800,6 +800,19 @@ void layer_fused_down_v2_sub_bf16(uint32_t m, uint32_t row_offset,
     layer_fused_down_v2_static_bf16(m, row_offset, a_in + sub_idx * sub_bytes, c_out);
 }
 
+// UNPAD x4 (D2.4 perf): process ALL nsub down sub-tiles of a 4608-element in ONE
+// IRON kernel call (cuts func.call count ~4x vs down_v2_sub). c_out base;
+// sub-tile k writes rows [row_offset + k*m ..].
+void layer_fused_down_v2_x4_bf16(uint32_t m, uint32_t row_offset, uint32_t nsub,
+                                 const uint8_t *__restrict a_in,
+                                 bfloat16 *__restrict c_out) {
+    constexpr uint32_t G  = GROUP_SIZE;
+    constexpr uint32_t DK = INTER_DIM_PER_COL;
+    const uint32_t sub_bytes = m * DK / 2 + m * (DK / G) * 2;
+    for (uint32_t k = 0; k < nsub; k++)
+        layer_fused_down_v2_static_bf16(m, row_offset + k * m, a_in + k * sub_bytes, c_out);
+}
+
 }  // extern "C"
 
 #ifdef COMPILE_ATTN
