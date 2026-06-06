@@ -347,6 +347,13 @@ extern "C" void layer_fused_rope_apply_bf16(
 
 static bfloat16 lf_left_buf[M_OUTPUT_MAX]  __attribute__((aligned(64)));
 static bfloat16 lf_right_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
+// D1.7 (FFLM-faithful): SwiGLU intermediate as a FILE-SCOPE STATIC in THIS .o,
+// co-laid by the compiler with lf_left/lf_right (no overlap). Replaces the IRON
+// `Buffer` silu_scratch, whose L1 address (chosen by the IRON/MLIR allocator,
+// blind to this .o's .bss) overlapped lf_right_buf → down read a corrupted silu
+// → the ~11% deficit. FFLM keeps ALL stage intermediates register/static-local
+// in ONE monolithic .o; this mirrors that. [[reference_fflm_tile_zero_static_l1]]
+static bfloat16 lf_silu_buf[M_OUTPUT_MAX]  __attribute__((aligned(64)));
 
 extern "C" {
 
@@ -438,6 +445,32 @@ void layer_fused_dump_part_bf16(
     for (int i = 0; i < chunks; i++)
         ::aie::store_v(c + i * VEC, ::aie::load_v<VEC>(parts + i * VEC));
     for (int i = chunks * VEC; i < n; i++) c[i] = parts[i];
+}
+
+// DEBUG: distinct copy symbol so a SILU-scratch dump (in the fused row-5 worker)
+// can coexist with the P0 reduce-dump (which uses dump_part) without an MLIR
+// symbol redefinition. out = src[0:n]. Isolates gate/up/silu (before down).
+void layer_fused_dump_silu_bf16(
+        const bfloat16 *src, const bfloat16 *unused, bfloat16 *c, int32_t n) {
+    (void)unused;
+    constexpr int VEC = 16;
+    int chunks = n / VEC;
+    for (int i = 0; i < chunks; i++)
+        ::aie::store_v(c + i * VEC, ::aie::load_v<VEC>(src + i * VEC));
+    for (int i = chunks * VEC; i < n; i++) c[i] = src[i];
+}
+
+// DEBUG: copy O_proj output (o_slice elems) → partial, to isolate the O_proj
+// phase of the FUSED row-5 worker (distinct symbol so it can be typed for the
+// 512-elem O_proj buffer without colliding with the silu/part dump symbols).
+void layer_fused_dump_oproj_bf16(
+        const bfloat16 *src, const bfloat16 *unused, bfloat16 *c, int32_t n) {
+    (void)unused;
+    constexpr int VEC = 16;
+    int chunks = n / VEC;
+    for (int i = 0; i < chunks; i++)
+        ::aie::store_v(c + i * VEC, ::aie::load_v<VEC>(src + i * VEC));
+    for (int i = chunks * VEC; i < n; i++) c[i] = src[i];
 }
 
 // Weighted RMSNorm: output[i] = (input[i] / rms(input)) * gain[i], eps=1e-5.
@@ -564,6 +597,129 @@ void layer_fused_silu_mul_bf16(bfloat16 *c_out, uint32_t m_output) {
         aie::store_v(c_out + i * VEC, fused.template to_vector<bfloat16>());
     }
     (void)chunks;
+}
+
+// D1.7: SiLU*Mul writing to the file-scope static lf_silu_buf (no c_out pointer,
+// no IRON Buffer). Identical math to layer_fused_silu_mul_bf16. The down GEMV
+// below reads lf_silu_buf directly → silu intermediate never leaves this .o.
+void layer_fused_silu_mul_static_bf16(uint32_t m_output) {
+    constexpr int VEC = 8;
+    int chunks = (int)m_output / VEC;
+    aie::vector<bfloat16, VEC> r05 = aie::broadcast<bfloat16, VEC>(0.5f);
+    aie::vector<bfloat16, VEC> r1  = aie::broadcast<bfloat16, VEC>(1.0f);
+    AIE_PREPARE_FOR_PIPELINING
+    for (int i = 0; i < chunks; i++) {
+        aie::vector<bfloat16, VEC> l = aie::load_v<VEC>(lf_left_buf  + i * VEC);
+        aie::vector<bfloat16, VEC> r = aie::load_v<VEC>(lf_right_buf + i * VEC);
+        auto half_x = aie::mul(l, r05);
+        auto tanh_h = aie::tanh<bfloat16>(half_x.template to_vector<float>());
+        auto t_p1   = aie::add(tanh_h, r1);
+        aie::vector<bfloat16, VEC> sig =
+            aie::mul(t_p1, r05).template to_vector<bfloat16>();
+        auto silu  = aie::mul(l, sig);
+        auto fused = aie::mul(silu.template to_vector<bfloat16>(), r);
+        aie::store_v(lf_silu_buf + i * VEC, fused.template to_vector<bfloat16>());
+    }
+    (void)chunks;
+}
+
+// D1.7: down GEMV (v2 dequant: w = nibble*scale, NO -8 bias) reading the SwiGLU
+// activation from the file-scope static lf_silu_buf. This is a byte-exact copy
+// of fused_dequant_gemv_v2.cc's matvec body (NOT a reconstruction), with b_in
+// hardwired to lf_silu_buf, so the same-tile silu→down handoff stays inside one
+// .o with co-laid statics. K = INTER_DIM_PER_COL (= HIDDEN_DIM/cols = Hc; the
+// per-column down K, matching the -DDIM_K=Hc of the old down_matvec_v2_bf16).
+// c_out += row_offset.
+void layer_fused_down_v2_static_bf16(
+        uint32_t m, uint32_t row_offset,
+        const uint8_t *__restrict a_in, bfloat16 *__restrict c_out) {
+    constexpr uint32_t block_size = 32;
+    constexpr uint32_t G  = GROUP_SIZE;
+    constexpr uint32_t DK = INTER_DIM_PER_COL;
+    static_assert(G % block_size == 0, "group_size must be a multiple of block_size");
+    constexpr uint32_t blocks_per_group = G / block_size;
+    constexpr uint32_t groups_per_row = DK / G;
+    constexpr bool can_double_pump = (groups_per_row >= 2) && (groups_per_row % 2 == 0);
+    constexpr uint32_t pump_groups = can_double_pump ? 2 : 1;
+    constexpr uint32_t loop_iters = groups_per_row / pump_groups;
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    c_out += row_offset;
+
+    const uint4 *weights_packed = reinterpret_cast<const uint4 *>(a_in);
+    const uint8_t *scale_bytes = a_in + m * DK / 2;
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(scale_bytes);
+
+    for (uint32_t row = 0; row < m; row++) {
+        const uint4 *row_weights = weights_packed + row * DK / 2;
+        const bfloat16 *row_scales = scales + row * groups_per_row;
+        const bfloat16 *b_ptr = lf_silu_buf;             // <-- activation = static
+
+        aie::accum<accfloat, block_size> acc = aie::zeros<accfloat, block_size>();
+
+        if constexpr (can_double_pump && blocks_per_group == 1) {
+            AIE_LOOP_MIN_ITERATION_COUNT(loop_iters)
+            for (uint32_t g = 0; g < groups_per_row; g += 2)
+                AIE_PREPARE_FOR_PIPELINING
+                {
+                    bfloat16 sf_a = row_scales[g];
+                    aie::vector<bfloat16, block_size> sf_a_bc =
+                        aie::broadcast<bfloat16, block_size>(sf_a);
+                    aie::vector<uint4, block_size> I0_a =
+                        aie::load_v<block_size>(row_weights);
+                    row_weights += block_size / 2;
+                    bfloat16 sf_b = row_scales[g + 1];
+                    aie::vector<bfloat16, block_size> sf_b_bc =
+                        aie::broadcast<bfloat16, block_size>(sf_b);
+                    aie::vector<uint4, block_size> I0_b =
+                        aie::load_v<block_size>(row_weights);
+                    row_weights += block_size / 2;
+                    aie::vector<uint8, block_size> a8_a = aie::unpack(I0_a);
+                    aie::vector<uint16, block_size> a16_a = aie::unpack(a8_a);
+                    aie::vector<bfloat16, block_size> abf_a =
+                        aie::to_float<bfloat16>(a16_a, 0);
+                    aie::vector<bfloat16, block_size> w_a =
+                        aie::mul(abf_a, sf_a_bc).template to_vector<bfloat16>();
+                    aie::vector<uint8, block_size> a8_b = aie::unpack(I0_b);
+                    aie::vector<uint16, block_size> a16_b = aie::unpack(a8_b);
+                    aie::vector<bfloat16, block_size> abf_b =
+                        aie::to_float<bfloat16>(a16_b, 0);
+                    aie::vector<bfloat16, block_size> w_b =
+                        aie::mul(abf_b, sf_b_bc).template to_vector<bfloat16>();
+                    aie::vector<bfloat16, block_size> b_a = aie::load_v<block_size>(b_ptr);
+                    b_ptr += block_size;
+                    acc = aie::mac(acc, w_a, b_a);
+                    aie::vector<bfloat16, block_size> b_b = aie::load_v<block_size>(b_ptr);
+                    b_ptr += block_size;
+                    acc = aie::mac(acc, w_b, b_b);
+                }
+        } else {
+            AIE_LOOP_MIN_ITERATION_COUNT(loop_iters)
+            for (uint32_t g = 0; g < groups_per_row; g++)
+                AIE_PREPARE_FOR_PIPELINING
+                {
+                    bfloat16 sf = row_scales[g];
+                    aie::vector<bfloat16, block_size> sf_broadcast =
+                        aie::broadcast<bfloat16, block_size>(sf);
+                    AIE_LOOP_MIN_ITERATION_COUNT(blocks_per_group)
+                    for (uint32_t blk = 0; blk < blocks_per_group; blk++) {
+                        aie::vector<uint4, block_size> I0 = aie::load_v<block_size>(row_weights);
+                        row_weights += block_size / 2;
+                        aie::vector<uint8, block_size> as_int8 = aie::unpack(I0);
+                        aie::vector<uint16, block_size> as_int16 = aie::unpack(as_int8);
+                        aie::vector<bfloat16, block_size> as_bf16 =
+                            aie::to_float<bfloat16>(as_int16, 0);
+                        aie::vector<bfloat16, block_size> w_dequant =
+                            aie::mul(as_bf16, sf_broadcast).template to_vector<bfloat16>();
+                        aie::vector<bfloat16, block_size> b_vec = aie::load_v<block_size>(b_ptr);
+                        b_ptr += block_size;
+                        acc = aie::mac(acc, w_dequant, b_vec);
+                    }
+                }
+        }
+        *c_out = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+        c_out++;
+    }
 }
 
 }  // extern "C"

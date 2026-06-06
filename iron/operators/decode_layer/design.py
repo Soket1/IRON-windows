@@ -139,14 +139,24 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
     # + residual on a MemTile-joined 4E buffer (FFLM-style single-MemTile aggregation).
     gate_up = Kernel("layer_fused_gate_up_bf16", "layer_fused_relay.o",
                      [np.int32, np.int32, L1_GUW_ty, L1_E_ty, np.int32])
-    silu_k = Kernel("layer_fused_silu_mul_bf16", "layer_fused_relay.o",
-                    [L1_SILU_ty, np.int32])
-    down = Kernel("down_matvec_v2_bf16",
-                  f"fused_dequant_gemv_v2_down_{Hc}k_g{group_size}.o",
-                  [np.int32, np.int32, L1_GUW_ty, L1_SILU_ty, L1_E_ty])
+    # D1.7: silu writes the file-scope static lf_silu_buf (no c_out arg); down
+    # reads lf_silu_buf (no b_in arg). Both in layer_fused_relay.o → the silu
+    # intermediate never touches an IRON Buffer, so it can't overlap the kernel's
+    # .bss statics (the D1 11% root cause). [[reference_fflm_tile_zero_static_l1]]
+    silu_k = Kernel("layer_fused_silu_mul_static_bf16", "layer_fused_relay.o",
+                    [np.int32])
+    down = Kernel("layer_fused_down_v2_static_bf16", "layer_fused_relay.o",
+                  [np.int32, np.int32, L1_GUW_ty, L1_E_ty])
     L1_4E_ty = np.ndarray[(4 * E,), bf]
     reduce4 = Kernel("layer_fused_reduce4_bf16", "layer_fused_relay.o",
                      [L1_4E_ty, L1_E_ty, L1_E_ty, np.int32])
+    # DEBUG: env-gated dumps to re-isolate stages. OPROJ dump copies the fused
+    # tile's O_proj output (o_slice) into the partial. (SILU dump was retired in
+    # D1.7 — silu now writes a file-scope static, not a dumpable IRON Buffer.)
+    import os as _os_dbg
+    _dump_oproj = bool(_os_dbg.environ.get("DECODE_DBG_DUMP_OPROJ"))
+    oproj_dump_k = Kernel("layer_fused_dump_oproj_bf16", "layer_fused_relay.o",
+                          [L1_O_ty, L1_E_ty, L1_E_ty, np.int32])
 
     # Weight/input delivery. A (QKV) and OW (O_proj) weights are PER-COLUMN
     # CONTIGUOUS fills (the decode_front-proven pattern): each column's weight
@@ -265,14 +275,9 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         # ~11% deficit and matches fflm_routing_analysis.md §7 (all on cols 2-5).
         # GUWD merged into W_f (D1.c) — gate/up/down tiles stream after the
         # O_proj tiles on the same per-col weight fifo. No separate GUWD fifo.
-        # D1.a: SILU is a TILE-LOCAL scratch buffer, NOT an ObjectFifo. silu_mul
-        # writes it, down reads it — both on the SAME row-5 tile, so no DMA is
-        # needed. A self-fifo (prod+cons same tile) would burn 1 S2MM + 1 MM2S
-        # (core tile cap = 2+2); a Buffer burns ZERO DMA channels. Passed to the
-        # kernels directly like gain_buf/zero_buf (no acquire/release).
-        silu_zero = np.zeros(Hc, dtype=bfloat16)
-        SILU_buf = [Buffer(type=L1_SILU_ty, initial_value=silu_zero,
-                           name=f"silu_scratch_{c}") for c in range(num_cols)]
+        # D1.7: the SwiGLU intermediate is a file-scope STATIC (lf_silu_buf) in
+        # layer_fused_relay.o, written by silu and read by down on the same tile.
+        # No IRON Buffer → no L1 .bss overlap (the D1 11% root cause).
         # FFN partial reduction: 4 E-partials join → 4E buffer on MemTile(6,1),
         # the FFLM single-MemTile aggregator (fflm_routing_analysis.md §6). col6
         # MemTile also hosts K_full split (4 outs); join adds 4 ins = 8 of 12 ch.
@@ -397,8 +402,9 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         # SILU is a tile-local Buffer (D1.a). attn-out and ffn-in arrive on ONE
         # merged broadcast (D1.b) acquired twice. This is the FFLM time-multiplex
         # pattern (stages + streams share a tile sequentially in one iteration).
-        def oproj_ffn_body(wf, mb, oj, p, silu_scratch,
-                           oproj_fn, gate_up_fn, silu_fn, down_fn):
+        def oproj_ffn_body(wf, mb, oj, p,
+                           oproj_fn, gate_up_fn, silu_fn, down_fn,
+                           oproj_fn2):
             for _ in range_(0xFFFFFFFF):
                 # --- phase 1: O_proj (1st merged acquire = attn-out) ---
                 # weights from merged W_f: first o_tiles tiles = O_proj
@@ -409,6 +415,20 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                     oproj_fn(m_input, index.casts(T.i32(), j) * m_input,
                              w, a_full, o)
                     wf.release(1)
+                if _dump_oproj:
+                    # DEBUG: dump O_proj output (o_slice) of THIS fused tile into
+                    # the partial, to isolate the O_proj phase of the fused worker
+                    # (check_anm_iso used the separate oproj_body, not this one).
+                    # Drain the rest (broadcast 2nd acquire + all FFN weights) to
+                    # keep the streams aligned, then skip FFN compute.
+                    fo = p.acquire(1)
+                    oproj_fn2(o, fo, fo, o_slice)
+                    mb.release(1); oj.release(1)
+                    mb.acquire(1); mb.release(1)
+                    for j in range_(2 * gu_tiles + dn_tiles):
+                        w = wf.acquire(1); wf.release(1)
+                    p.release(1)
+                    continue
                 mb.release(1); oj.release(1)
                 # --- phase 2: FFN (2nd merged acquire = ffn-in) ---
                 # weights continue on W_f: gate tiles, then up, then down
@@ -422,13 +442,14 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
                     gate_up_fn(m_input, index.casts(T.i32(), j) * m_input, w, b, 1)
                     wf.release(1)
                 mb.release(1)
-                # silu·mul writes the tile-local scratch (D1.a: Buffer, not fifo)
-                silu_fn(silu_scratch, Hc)
+                # D1.7: silu·mul writes the file-scope static lf_silu_buf (no
+                # arg); down reads it directly. No IRON Buffer for the silu
+                # intermediate → no .bss overlap (the D1 11% root cause).
+                silu_fn(Hc)
                 fo = p.acquire(1)
-                for j in range_(dn_tiles):  # down over silu (reads scratch)
+                for j in range_(dn_tiles):  # down reads lf_silu_buf static
                     w = wf.acquire(1)
-                    down_fn(m_input, index.casts(T.i32(), j) * m_input,
-                            w, silu_scratch, fo)
+                    down_fn(m_input, index.casts(T.i32(), j) * m_input, w, fo)
                     wf.release(1)
                 p.release(1)
 
@@ -454,14 +475,13 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         else:
             # FFN enabled → fused O_proj+FFN on this center row-5 tile (D1).
             # ONE merged weight fifo W_f (D1.c: O_proj|gate|up|down tiles), ONE
-            # merged broadcast MergedB (D1.b: attn-out then ffn-in, 2 acquires),
-            # SILU = tile-local Buffer (D1.a). Net: 2 S2MM (W_f + MergedB) +
-            # 2 MM2S (Oproj_parts + Pp) = exactly the core-tile cap.
+            # merged broadcast MergedB (D1.b: attn-out then ffn-in, 2 acquires).
+            # SILU intermediate = file-scope static lf_silu_buf (D1.7, no IRON
+            # Buffer). Net: 2 S2MM (W_f + MergedB) + 2 MM2S (Oproj_parts + Pp).
             workers.append(Worker(oproj_ffn_body,
                 [W_f[c].cons(), MergedB.cons(), Oproj_parts[c].prod(),
                  Pp[c].prod(),
-                 SILU_buf[c],
-                 oproj, gate_up, silu_k, down],
+                 oproj, gate_up, silu_k, down, oproj_dump_k],
                 placement=Tile(col=pc, row=5)))
 
     # Tile(6,2): stub mode = plain relay (attn-out → AttnBcast → AttnB); full FFN
@@ -533,6 +553,27 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             tensor_dims=(1, WT_ELEMS), offset=ffn_base + i * ffnw_per_col,
             sizes=[1, 1, 1, ffnw_per_col], strides=[0, 0, 0, 1])
 
+    # D1.6 FIX: a single 6.75 MB FFN fill (3072 tiles) TRUNCATES — the down tiles
+    # (last 1024) never arrive, leaving down output rows = 0.0 (the ~11% deficit;
+    # gate/up = first 2048 tiles DO arrive, silu0 cosine 0.999 confirms). Split
+    # the per-col FFN fill into gate / up / down sub-fills (each ≤ the proven-OK
+    # ow-fill scale) into the SAME W_f producer, preserving FIFO order so the
+    # worker still acquires gate→up→down. Region layout per col: [gate|up|down].
+    guw_half = gu_tiles * gu_packed                    # gate-region = up-region (bytes)
+    def ffn_gate_tap(i):
+        return TensorAccessPattern(
+            tensor_dims=(1, WT_ELEMS), offset=ffn_base + i * ffnw_per_col,
+            sizes=[1, 1, 1, guw_half], strides=[0, 0, 0, 1])
+    def ffn_up_tap(i):
+        return TensorAccessPattern(
+            tensor_dims=(1, WT_ELEMS), offset=ffn_base + i * ffnw_per_col + guw_half,
+            sizes=[1, 1, 1, guw_half], strides=[0, 0, 0, 1])
+    def ffn_down_tap(i):
+        return TensorAccessPattern(
+            tensor_dims=(1, WT_ELEMS),
+            offset=ffn_base + i * ffnw_per_col + guw_per_col,
+            sizes=[1, 1, 1, dnw_per_col], strides=[0, 0, 0, 1])
+
     # X bundle: Xqkv at offset 0, residual inpL at offset K_gemv (both E elems).
     x_tap = TensorAccessPattern(tensor_dims=(1, 2 * K_gemv), offset=0,
         sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
@@ -593,8 +634,10 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             rt.drain(FfnIn.cons(), o, ffn_tap, task_group=tg_out, wait=True)
             rt.finish_task_group(tg_out)
         else:
-            # FFN weights (gate|up|down per col) into the SAME merged W_f[c],
-            # after the O_proj region filled in tg_main (D1.c bd-multiplex).
+            # FFN weights into the SAME merged W_f[c], after the O_proj region
+            # (tg_main). NOTE: splitting this into gate/up/down sub-fills did NOT
+            # change the result (fill truncation was DISPROVEN — IRON tiles the
+            # 6.75 MB fill correctly). Single per-col fill kept for simplicity.
             tg_ffn = rt.task_group()
             for i in range(num_cols):
                 rt.fill(W_f[i].prod(), wt, ffnw_tap(i), task_group=tg_ffn)
