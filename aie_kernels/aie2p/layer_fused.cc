@@ -813,6 +813,19 @@ void layer_fused_down_v2_x4_bf16(uint32_t m, uint32_t row_offset, uint32_t nsub,
         layer_fused_down_v2_static_bf16(m, row_offset + k * m, a_in + k * sub_bytes, c_out);
 }
 
+// BIG-ELEMENT x4 (D2.5 perf): process nsub gate/up tiles (K=EMBED_DIM, each m rows
+// = 4608B) from ONE big weight-fifo element. Lets independent per-tile fifos use
+// large DMA transfers (high BW) while still overlapping compute (per-tile prefetch).
+void layer_fused_gate_up_x4_bf16(uint32_t m, uint32_t row_offset, uint32_t nsub,
+                                 const uint8_t *__restrict a_in,
+                                 const bfloat16 *__restrict b_in, int phase) {
+    constexpr uint32_t G  = GROUP_SIZE;
+    constexpr uint32_t DK = EMBED_DIM;
+    const uint32_t sub_bytes = m * DK / 2 + m * (DK / G) * 2;
+    for (uint32_t k = 0; k < nsub; k++)
+        layer_fused_gate_up_bf16(m, row_offset + k * m, a_in + k * sub_bytes, b_in, phase);
+}
+
 }  // extern "C"
 
 #ifdef COMPILE_ATTN

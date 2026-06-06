@@ -39,26 +39,39 @@ def my_decode_ffn4d(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
     dn_elems = dn_tiles // DN_SUB                  # 128
     WT_PER_TILE = gu_tiles + gu_tiles + dn_elems   # 384
 
+    import os as _os
+    DBG_COPY = bool(_os.environ.get("DBG_FFN4D_COPY"))
+    DBG_RELAY = bool(_os.environ.get("DBG_FFN4D_RELAY"))
+    TPE = int(_os.environ.get("DBG_FFN4D_TPE", "1"))   # tiles per weight element
+    WELEM = TPE * PACKED
+    n_welems = (2 * gu_tiles + dn_elems) // TPE        # drained elements/tile (copy)
+
     L1_E_ty  = np.ndarray[(E,), bf]
     L1_4E_ty = np.ndarray[(4 * E,), bf]
     L1_W_ty  = np.ndarray[(PACKED,), u8]
+    L1_WBIG_ty = np.ndarray[(WELEM,), u8]
 
     L3_O_ty = np.ndarray[(E,), bf]
     L3_W_ty = np.ndarray[(R * WT_PER_TILE * PACKED,), u8]   # 4 tiles, contiguous
     L3_E_ty = np.ndarray[(E,), bf]
     L3_D_ty = np.ndarray[(64,), bf]
 
-    gate_up = Kernel("layer_fused_gate_up_bf16", "layer_fused_relay.o",
-                     [np.int32, np.int32, L1_W_ty, L1_E_ty, np.int32])
+    gate_up = Kernel("layer_fused_gate_up_x4_bf16", "layer_fused_relay.o",
+                     [np.int32, np.int32, np.int32, L1_WBIG_ty, L1_E_ty, np.int32])
     silu = Kernel("layer_fused_silu_mul_static_bf16", "layer_fused_relay.o", [np.int32])
     down = Kernel("layer_fused_down_v2_x4_bf16", "layer_fused_relay.o",
-                  [np.int32, np.int32, np.int32, L1_W_ty, L1_E_ty])
+                  [np.int32, np.int32, np.int32, L1_WBIG_ty, L1_E_ty])
     reduce4 = Kernel("layer_fused_reduce4_bf16", "layer_fused_relay.o",
                      [L1_4E_ty, L1_E_ty, L1_E_ty, np.int32])
     add = Kernel("layer_fused_add_bf16", "layer_fused_relay.o",
                  [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
     import os as _os
     DBG_COPY = bool(_os.environ.get("DBG_FFN4D_COPY"))
+    DBG_RELAY = bool(_os.environ.get("DBG_FFN4D_RELAY"))
+    TPE = int(_os.environ.get("DBG_FFN4D_TPE", "1"))   # tiles per weight element
+    WELEM = TPE * PACKED
+    n_welems = (2 * gu_tiles + dn_elems) // TPE        # drained elements/tile (copy)
+    L1_WBIG_ty = np.ndarray[(WELEM,), u8]
 
     _zn = [0]
     def mk_zero():
@@ -70,8 +83,19 @@ def my_decode_ffn4d(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
     Bsrc = ObjectFifo(L1_E_ty, name="Bsrc", depth=1)
     Bcol = Bsrc.cons().forward(name="Bcol", depth=2, placement=Tile(col=1, row=1))
 
-    # DIRECT per-tile weight fifos (no split): shim → tile, depth 2 ping-pong
-    Wd = [ObjectFifo(L1_W_ty, name=f"Wd_{r}", depth=2) for r in range(R)]
+    # DIRECT per-tile weight fifos (no split): shim → tile, depth 2 ping-pong.
+    # DBG_RELAY: shim → MemTile(col,1) relay → tile (independent per-tile fifo,
+    # NOT a split) — tests whether MemTile buffering restores BW while keeping
+    # the per-tile overlap that the lockstep split loses.
+    if DBG_RELAY:
+        Wsrc = [ObjectFifo(L1_WBIG_ty, name=f"Wsrc_{r}", depth=2) for r in range(R)]
+        Wd = [Wsrc[r].cons().forward(name=f"Wd_{r}", depth=2,
+                                     placement=Tile(col=col_offset, row=1))
+              for r in range(R)]
+        Wfill = Wsrc
+    else:
+        Wd = [ObjectFifo(L1_WBIG_ty, name=f"Wd_{r}", depth=2) for r in range(R)]
+        Wfill = Wd
 
     # 4 partials → reduce4 @ MemTile(6,1)
     PF = ObjectFifo(L1_4E_ty, name="PF", depth=1)
@@ -82,26 +106,33 @@ def my_decode_ffn4d(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
 
     workers = []
 
+    gu_be = gu_tiles // TPE          # big elements for gate (and up)
+    dn_be = dn_elems // TPE          # big elements for down
+
     def ffn_body(wf, bc, pp, gate_up_fn, silu_fn, down_fn):
         for _ in range_(0xFFFFFFFF):
             b = bc.acquire(1)
-            for j in range_(gu_tiles):
-                w = wf.acquire(1); gate_up_fn(m, index.casts(T.i32(), j)*m, w, b, 0); wf.release(1)
-            for j in range_(gu_tiles):
-                w = wf.acquire(1); gate_up_fn(m, index.casts(T.i32(), j)*m, w, b, 1); wf.release(1)
+            for j in range_(gu_be):                       # gate: TPE tiles/elem
+                w = wf.acquire(1)
+                gate_up_fn(m, index.casts(T.i32(), j)*TPE*m, TPE, w, b, 0)
+                wf.release(1)
+            for j in range_(gu_be):                       # up
+                w = wf.acquire(1)
+                gate_up_fn(m, index.casts(T.i32(), j)*TPE*m, TPE, w, b, 1)
+                wf.release(1)
             bc.release(1)
             silu_fn(Hc16)
             o = pp.acquire(1)
-            for j in range_(dn_elems):
+            for j in range_(dn_be):                       # down: TPE*DN_SUB sub/elem
                 w = wf.acquire(1)
-                down_fn(m, index.casts(T.i32(), j)*DN_SUB*m, DN_SUB, w, o)
+                down_fn(m, index.casts(T.i32(), j)*TPE*DN_SUB*m, TPE*DN_SUB, w, o)
                 wf.release(1)
             pp.release(1)
 
     def copy_body(wf, bc, pp, add_fn, zero):
         for _ in range_(0xFFFFFFFF):
             b = bc.acquire(1)
-            for _j in range_(2*gu_tiles + dn_elems):
+            for _j in range_(n_welems):                # drain WELEM-sized chunks
                 w = wf.acquire(1); wf.release(1)
             o = pp.acquire(1); add_fn(b, zero, o, E); bc.release(1); pp.release(1)
 
@@ -135,7 +166,7 @@ def my_decode_ffn4d(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
         rt.start(*workers)
         tg = rt.task_group()
         for r in range(R):
-            rt.fill(Wd[r].prod(), w, w_tap(r), task_group=tg)   # DIRECT shim→tile
+            rt.fill(Wfill[r].prod(), w, w_tap(r), task_group=tg)   # shim source
         rt.fill(Bsrc.prod(), x, e_tap, task_group=tg)
         rt.drain(Cout.cons(), o, e_tap, task_group=tg, wait=True)
         rt.finish_task_group(tg)
