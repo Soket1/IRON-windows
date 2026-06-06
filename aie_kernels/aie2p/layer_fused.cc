@@ -240,6 +240,10 @@ extern "C" void layer_fused_qkv_gemv_bf16(
 // cols 1-7).
 // ────────────────────────────────────────────────────────────────────────────
 
+// COMPILE_QKV_STATIC: col-0 static-activation variants (not used in decode_layer
+// which uses v2 GEMV instead). Guard to free 4 KB .bss (normed_static) — needed
+// when M_OUTPUT_MAX is large (e.g. m_input=4) and .bss would otherwise overflow.
+#ifdef COMPILE_QKV_STATIC
 static bfloat16 normed_static[EMBED_DIM] __attribute__((aligned(64)));
 
 // Col-0 pre-RMS variant: computes weighted RMSNorm into BOTH the static
@@ -276,8 +280,7 @@ extern "C" void layer_fused_pre_rms_col0_bf16(
 
 // Col-0 QKV variant: reads activation from the static L1 buffer (filled
 // by `layer_fused_pre_rms_col0_bf16` earlier in the same Worker iter)
-// instead of a fifo-routed bf16 pointer. Same kernel math as the
-// fifo-input variant — only the activation source differs.
+// instead of a fifo-routed bf16 pointer.
 extern "C" void layer_fused_qkv_gemv_static_bf16(
         uint32_t m, uint32_t row_offset,
         const uint8_t *a, bfloat16 *c) {
@@ -285,6 +288,7 @@ extern "C" void layer_fused_qkv_gemv_static_bf16(
         m, a + row_offset * (EMBED_DIM / 2 + EMBED_DIM / GROUP_SIZE * 2),
         normed_static, c);
 }
+#endif  // COMPILE_QKV_STATIC
 
 // ────────────────────────────────────────────────────────────────────────────
 // RoPE rotation (apply pre-computed sin/cos LUT from host).
@@ -353,7 +357,12 @@ static bfloat16 lf_right_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
 // blind to this .o's .bss) overlapped lf_right_buf → down read a corrupted silu
 // → the ~11% deficit. FFLM keeps ALL stage intermediates register/static-local
 // in ONE monolithic .o; this mirrors that. [[reference_fflm_tile_zero_static_l1]]
-static bfloat16 lf_silu_buf[M_OUTPUT_MAX]  __attribute__((aligned(64)));
+// lf_silu_buf reuses lf_left_buf (gate output): after gate writes lf_left, gate is
+// no longer needed before the next iteration, so silu can overwrite it safely.
+// This saves 4 KB of .bss — needed when m_input=4 pushes .bss close to the 12272B
+// AIE2P data-region limit (3×4096=12288 > 12272; 2×4096=8192 fits with room).
+// NOTE: lf_left_buf is aliased as lf_silu_buf; the name below is kept for clarity.
+#define lf_silu_buf lf_left_buf
 
 extern "C" {
 

@@ -13,7 +13,7 @@ from iron.common import (
 
 class AIEDecodeLayer(AIEOperatorBase):
     def __init__(self, embed_dim=2048, head_dim=64, group_size=32, attn_group=8,
-                 seq_len=32, m_input=2, num_cols=4, output_first=False,
+                 seq_len=32, m_input=4, num_cols=4, output_first=False,
                  hidden_dim=8192, stub_ffn=False, context=None):
         self.embed_dim = embed_dim
         self.head_dim = head_dim
@@ -42,7 +42,8 @@ class AIEDecodeLayer(AIEOperatorBase):
             callback_fn="my_decode_layer",
             callback_args=[self.context.device_manager.device_type,
                            E, self.head_dim, g, self.attn_group, self.seq_len,
-                           self.output_first, self.hidden_dim, self.stub_ffn],
+                           self.output_first, self.hidden_dim, self.stub_ffn,
+                           None, self.m_input],  # chunk_size=None, then m_input
         )
         gemv_obj = KernelObjectArtifact.new(
             f"fused_dequant_gemv_v2_{E}k_g{g}.o",

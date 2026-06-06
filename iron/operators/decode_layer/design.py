@@ -624,12 +624,14 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
         # K/V: one fill of the split source each (fanned on col6/col7 MemTiles).
         # B: QKV activation = X bundle offset 0. InpL: residual = X bundle offset
         # E (feeds the ANM tile). O: single full-E ffn_in drain (ANM output).
+        # NOTE (D2-P1, 2026-06-06): merging tg_main+tg_ffn into one task group did
+        # NOT change latency (5346 vs 5328 us) — insts byte-identical. tg phasing
+        # is a runtime-build barrier, not a DMA-schedule serializer; the NPU runs
+        # the same insts either way. The perf lever is per-tile execution density,
+        # not fill grouping ([[reference_dispatch_not_bottleneck]]). Reverted.
         tg_main = rt.task_group()
         for c in range(num_cols):
             rt.fill(A_f[c].prod(), wt, a_tap(c), task_group=tg_main)
-            # Row-5 weight stream: stub → OW only; full FFN → O_proj region into
-            # the merged W_f[c] (FFN gate/up/down region filled next in tg_ffn,
-            # same producer, FIFO order → O_proj tiles consumed first).
             if stub_ffn:
                 rt.fill(OW_f[c].prod(), wt, ow_tap(c), task_group=tg_main)
             else:
@@ -645,10 +647,6 @@ def my_decode_layer(dev, embed_dim=2048, head_dim=64, group_size=32,
             rt.drain(FfnIn.cons(), o, ffn_tap, task_group=tg_out, wait=True)
             rt.finish_task_group(tg_out)
         else:
-            # FFN weights into the SAME merged W_f[c], after the O_proj region
-            # (tg_main). NOTE: splitting this into gate/up/down sub-fills did NOT
-            # change the result (fill truncation was DISPROVEN — IRON tiles the
-            # 6.75 MB fill correctly). Single per-col fill kept for simplicity.
             tg_ffn = rt.task_group()
             for i in range(num_cols):
                 rt.fill(W_f[i].prod(), wt, ffnw_tap(i), task_group=tg_ffn)
