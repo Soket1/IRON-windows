@@ -68,10 +68,15 @@ class AIEDecodeBackReal(AIEOperatorBase):
         dn_elems = (E // m) // DN_SUB
         WT_PER_TILE = o_tiles + gu_tiles + gu_tiles + dn_elems
         W_BYTES = nc * WT_PER_TILE * R * PACKED
+        import os as _os
         self.add_buffer("O", E, dtype=bfloat16)
         self.add_buffer("W", W_BYTES, dtype=np.uint8)
         self.add_buffer("ATTN", E, dtype=bfloat16)
         self.add_buffer("HIN", E, dtype=bfloat16)
         self.add_kernel("decode_back_real", self.xclbin_artifact,
                         self.xclbin_artifact.kernel_name, self.insts_artifact)
-        self.add_to_runlist("decode_back_real", "O", "W", "ATTN", "HIN")
+        if bool(_os.environ.get("DBG_BR_DUMP0")):
+            self.add_buffer("DUMP", E, dtype=bfloat16)
+            self.add_to_runlist("decode_back_real", "O", "W", "ATTN", "HIN", "DUMP")
+        else:
+            self.add_to_runlist("decode_back_real", "O", "W", "ATTN", "HIN")

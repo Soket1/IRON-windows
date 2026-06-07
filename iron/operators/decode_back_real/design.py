@@ -106,6 +106,7 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
     Hin = ObjectFifo(L1_E_ty, name="Hin", depth=1)
     FFNfifo = ObjectFifo(L1_E_ty, name="FFNfifo", depth=2)
     Out = ObjectFifo(L1_E_ty, name="Out", depth=2)
+    Dump = ObjectFifo(L1_E_ty, name="Dump", depth=2)          # tile(0,0) down-partial -> bo4
 
     workers = []
 
@@ -124,14 +125,16 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
 
     def center_body(bc, wf, pp, zero, add_fn, gemv_fn, gate_up_fn, silu_fn, down_fn, scatter):
         _dbg_ffnin = bool(_os.environ.get("DBG_BR_FFNIN"))
+        _dbg_noo = bool(_os.environ.get("DBG_BR_NOO"))
         for _ in range_(0xFFFFFFFF):
             # phase1: O padded-reduce
             b = bc.acquire(1); p = pp.acquire(1)
             add_fn(zero, zero, p, E)               # zero the 2048 partial
             for j in range_(o_tiles):
                 w = wf.acquire(1)
-                gemv_fn(m, index.casts(T.i32(), j) * m + scatter, w, b, p)
-                wf.release(1)
+                if not _dbg_noo:
+                    gemv_fn(m, index.casts(T.i32(), j) * m + scatter, w, b, p)
+                wf.release(1)                       # DBG_NOO: drain weights, O=0 (no gemv)
             bc.release(1); pp.release(1)
             # phase2: FFN
             b2 = bc.acquire(1)
@@ -155,14 +158,48 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                     wf.release(1)
                 pp.release(1)
 
+    # tile(0,0) variant: also copies its phase2 down-partial to Dump (-> bo4)
+    def center_body_dump(bc, wf, pp, dmp, zero, add_fn, gemv_fn, gate_up_fn, silu_fn, down_fn, scatter):
+        _dbg_noo = bool(_os.environ.get("DBG_BR_NOO"))
+        for _ in range_(0xFFFFFFFF):
+            b = bc.acquire(1); p = pp.acquire(1)
+            add_fn(zero, zero, p, E)
+            for j in range_(o_tiles):
+                w = wf.acquire(1)
+                if not _dbg_noo:
+                    gemv_fn(m, index.casts(T.i32(), j) * m + scatter, w, b, p)
+                wf.release(1)
+            bc.release(1); pp.release(1)
+            b2 = bc.acquire(1)
+            for j in range_(gu_tiles):
+                w = wf.acquire(1); gate_up_fn(m, index.casts(T.i32(), j) * m, w, b2, 0); wf.release(1)
+            for j in range_(gu_tiles):
+                w = wf.acquire(1); gate_up_fn(m, index.casts(T.i32(), j) * m, w, b2, 1); wf.release(1)
+            bc.release(1)
+            silu_fn(Hc16)
+            p2 = pp.acquire(1)
+            for j in range_(dn_elems):
+                w = wf.acquire(1)
+                down_fn(m, index.casts(T.i32(), j) * DN_SUB * m, DN_SUB, w, p2)
+                wf.release(1)
+            d = dmp.acquire(1); add_fn(p2, zero, d, E); dmp.release(1)   # copy partial -> Dump
+            pp.release(1)
+
     for c in range(NC):
         for r in range(R):
             scatter = (c * R + r) * SL_O
-            workers.append(Worker(
-                center_body,
-                [BcB.cons(), Wf[c][r].cons(), PF_parts[c][r].prod(),
-                 mk_zero(), add, gemv, gate_up, silu, down, scatter],
-                placement=Tile(col=col_offset + c, row=2 + r)))
+            if c == 0 and r == 0 and bool(_os.environ.get("DBG_BR_DUMP0")):
+                workers.append(Worker(
+                    center_body_dump,
+                    [BcB.cons(), Wf[c][r].cons(), PF_parts[c][r].prod(), Dump.prod(),
+                     mk_zero(), add, gemv, gate_up, silu, down, scatter],
+                    placement=Tile(col=col_offset + c, row=2 + r)))
+            else:
+                workers.append(Worker(
+                    center_body,
+                    [BcB.cons(), Wf[c][r].cons(), PF_parts[c][r].prod(),
+                     mk_zero(), add, gemv, gate_up, silu, down, scatter],
+                    placement=Tile(col=col_offset + c, row=2 + r)))
 
     def colred_body(pf, fp, zero, red_fn):
         for _ in range_(0xFFFFFFFF):
@@ -210,15 +247,28 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                                    sizes=[1, 1, 1, wcol], strides=[0, 0, 0, 1])
 
     rt = Runtime()
-    # bo0=out, bo1=W, bo2=attn, bo3=h_in
-    with rt.sequence(L3_E_ty, L3_W_ty, L3_E_ty, L3_E_ty) as (o, w, attn, hin):
-        rt.start(*workers)
-        tg = rt.task_group()
-        for c in range(NC):
-            rt.fill(Wsrc[c].prod(), w, w_tap(c), task_group=tg)
-        rt.fill(Attn.prod(), attn, tap, task_group=tg)
-        rt.fill(Hin.prod(), hin, tap, task_group=tg)
-        rt.drain(Out.cons(), o, tap, task_group=tg, wait=True)
-        rt.finish_task_group(tg)
+    if bool(_os.environ.get("DBG_BR_DUMP0")):
+        # bo0=out, bo1=W, bo2=attn, bo3=h_in, bo4=dump(tile0 down-partial)
+        with rt.sequence(L3_E_ty, L3_W_ty, L3_E_ty, L3_E_ty, L3_E_ty) as (o, w, attn, hin, dmp):
+            rt.start(*workers)
+            tg = rt.task_group()
+            for c in range(NC):
+                rt.fill(Wsrc[c].prod(), w, w_tap(c), task_group=tg)
+            rt.fill(Attn.prod(), attn, tap, task_group=tg)
+            rt.fill(Hin.prod(), hin, tap, task_group=tg)
+            rt.drain(Dump.cons(), dmp, tap, task_group=tg)
+            rt.drain(Out.cons(), o, tap, task_group=tg, wait=True)
+            rt.finish_task_group(tg)
+    else:
+        # bo0=out, bo1=W, bo2=attn, bo3=h_in
+        with rt.sequence(L3_E_ty, L3_W_ty, L3_E_ty, L3_E_ty) as (o, w, attn, hin):
+            rt.start(*workers)
+            tg = rt.task_group()
+            for c in range(NC):
+                rt.fill(Wsrc[c].prod(), w, w_tap(c), task_group=tg)
+            rt.fill(Attn.prod(), attn, tap, task_group=tg)
+            rt.fill(Hin.prod(), hin, tap, task_group=tg)
+            rt.drain(Out.cons(), o, tap, task_group=tg, wait=True)
+            rt.finish_task_group(tg)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
