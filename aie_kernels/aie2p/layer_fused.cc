@@ -543,34 +543,44 @@ static void _lf_dual_gemv(uint32_t m, uint32_t row_offset,
     const uint4 *weights_packed = reinterpret_cast<const uint4 *>(a_in);
     const bfloat16 *scales =
         reinterpret_cast<const bfloat16 *>(a_in + m * DK / 2);
+    const aie::vector<bfloat16, block_size> offset =
+        aie::broadcast<bfloat16, block_size>(8.0f);
     for (uint32_t row = 0; row < m; row++) {
         const uint4 *w_row = weights_packed + row * DK / 2;
         const bfloat16 *s_row = scales + row * groups_per_row;
         const bfloat16 *b_ptr = b_in;
-        aie::accum<accfloat, block_size> acc = aie::zeros<accfloat, block_size>();
-        aie::vector<bfloat16, block_size> offset =
-            aie::broadcast<bfloat16, block_size>(8.0f);
-        for (uint32_t g = 0; g < groups_per_row; g++)
+        // D2.6: TWO independent accumulators + double-pump (2 groups/iter). The
+        // two mac chains (acc0/acc1) are independent → hide mac latency (II→1);
+        // two dequants per iter give ILP. groups_per_row is even (DK/G).
+        aie::accum<accfloat, block_size> acc0 = aie::zeros<accfloat, block_size>();
+        aie::accum<accfloat, block_size> acc1 = aie::zeros<accfloat, block_size>();
+        for (uint32_t g = 0; g < groups_per_row; g += 2)
             AIE_PREPARE_FOR_PIPELINING
             {
-                bfloat16 sf = s_row[g];
-                aie::vector<bfloat16, block_size> sf_bc =
-                    aie::broadcast<bfloat16, block_size>(sf);
-                aie::vector<uint4, block_size> I0 =
-                    aie::load_v<block_size>(w_row);
+                aie::vector<bfloat16, block_size> sf0_bc =
+                    aie::broadcast<bfloat16, block_size>(s_row[g]);
+                aie::vector<uint4, block_size> I0 = aie::load_v<block_size>(w_row);
                 w_row += block_size / 2;
-                aie::vector<uint8,  block_size> a8  = aie::unpack(I0);
-                aie::vector<uint16, block_size> a16 = aie::unpack(a8);
-                aie::vector<bfloat16, block_size> abf =
-                    aie::to_float<bfloat16>(a16, 0);
-                aie::vector<bfloat16, block_size> asgn = aie::sub(abf, offset);
-                aie::vector<bfloat16, block_size> w =
-                    aie::mul(asgn, sf_bc).template to_vector<bfloat16>();
-                aie::vector<bfloat16, block_size> bv =
-                    aie::load_v<block_size>(b_ptr);
+                aie::vector<bfloat16, block_size> sf1_bc =
+                    aie::broadcast<bfloat16, block_size>(s_row[g + 1]);
+                aie::vector<uint4, block_size> I1 = aie::load_v<block_size>(w_row);
+                w_row += block_size / 2;
+                aie::vector<bfloat16, block_size> abf0 =
+                    aie::to_float<bfloat16>(aie::unpack(aie::unpack(I0)), 0);
+                aie::vector<bfloat16, block_size> w0 =
+                    aie::mul(aie::sub(abf0, offset), sf0_bc).template to_vector<bfloat16>();
+                aie::vector<bfloat16, block_size> abf1 =
+                    aie::to_float<bfloat16>(aie::unpack(aie::unpack(I1)), 0);
+                aie::vector<bfloat16, block_size> w1 =
+                    aie::mul(aie::sub(abf1, offset), sf1_bc).template to_vector<bfloat16>();
+                aie::vector<bfloat16, block_size> bv0 = aie::load_v<block_size>(b_ptr);
                 b_ptr += block_size;
-                acc = aie::mac(acc, w, bv);
+                aie::vector<bfloat16, block_size> bv1 = aie::load_v<block_size>(b_ptr);
+                b_ptr += block_size;
+                acc0 = aie::mac(acc0, w0, bv0);
+                acc1 = aie::mac(acc1, w1, bv1);
             }
+        aie::accum<accfloat, block_size> acc = aie::add(acc0, acc1);
         dest[row_offset + row] = static_cast<bfloat16>(
             aie::reduce_add(acc.template to_vector<float>()));
     }
@@ -719,6 +729,7 @@ void layer_fused_down_v2_static_bf16(
         const bfloat16 *b_ptr = lf_silu_buf;             // <-- activation = static
 
         aie::accum<accfloat, block_size> acc = aie::zeros<accfloat, block_size>();
+        aie::accum<accfloat, block_size> acc_b = aie::zeros<accfloat, block_size>();
 
         if constexpr (can_double_pump && blocks_per_group == 1) {
             AIE_LOOP_MIN_ITERATION_COUNT(loop_iters)
@@ -751,10 +762,10 @@ void layer_fused_down_v2_static_bf16(
                         aie::mul(abf_b, sf_b_bc).template to_vector<bfloat16>();
                     aie::vector<bfloat16, block_size> b_a = aie::load_v<block_size>(b_ptr);
                     b_ptr += block_size;
-                    acc = aie::mac(acc, w_a, b_a);
+                    acc = aie::mac(acc, w_a, b_a);   // D2.6: two independent accs
                     aie::vector<bfloat16, block_size> b_b = aie::load_v<block_size>(b_ptr);
                     b_ptr += block_size;
-                    acc = aie::mac(acc, w_b, b_b);
+                    acc_b = aie::mac(acc_b, w_b, b_b);  // → hide mac latency
                 }
         } else {
             AIE_LOOP_MIN_ITERATION_COUNT(loop_iters)
@@ -780,10 +791,14 @@ void layer_fused_down_v2_static_bf16(
                     }
                 }
         }
-        *c_out = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+        aie::accum<accfloat, block_size> acc_sum = aie::add(acc, acc_b);
+        *c_out = static_cast<bfloat16>(aie::reduce_add(acc_sum.template to_vector<float>()));
         c_out++;
     }
 }
+// NOTE (D2.6): down already had double-pump; adding a 2nd independent acc gave
+// no speedup (1158→1169µs = noise) → down was not acc-latency-bound. acc_b kept
+// (harmless, =0 in the non-double-pump branch). gate/up's 2-acc DID help (−3%).
 
 // UNPAD helper (D2.2c): a_in points at a uniform 4608-byte weight-fifo element
 // that holds several unpadded down sub-tiles back-to-back (each = m rows,
