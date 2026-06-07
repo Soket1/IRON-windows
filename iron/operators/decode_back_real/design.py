@@ -167,6 +167,7 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
         _dbg_noo = bool(_os.environ.get("DBG_BR_NOO"))
         _dump_gate = bool(_os.environ.get("DBG_BR_DUMPGATE"))
         _dump_silu = bool(_os.environ.get("DBG_BR_DUMPSILU"))
+        _dump_silu_post = bool(_os.environ.get("DBG_BR_DUMPSILU_POST"))
         for _ in range_(0xFFFFFFFF):
             b = bc.acquire(1); p = pp.acquire(1)
             add_fn(zero, zero, p, E)
@@ -192,7 +193,9 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                 w = wf.acquire(1)
                 down_fn(m, index.casts(T.i32(), j) * DN_SUB * m, DN_SUB, w, p2)
                 wf.release(1)
-            if not _dump_gate and not _dump_silu:
+            if _dump_silu_post:
+                d = dmp.acquire(1); dump_left_fn(d, Hc16); dmp.release(1)   # lf_silu AFTER down loop
+            if not _dump_gate and not _dump_silu and not _dump_silu_post:
                 d = dmp.acquire(1); add_fn(p2, zero, d, E); dmp.release(1)  # down-partial
             pp.release(1)
 
