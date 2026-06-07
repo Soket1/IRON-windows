@@ -374,6 +374,17 @@ void layer_fused_o_proj_bf16(
         m, a + row_offset * (EMBED_DIM/2 + EMBED_DIM/GROUP_SIZE*2), b, c);
 }
 
+// O scatter: same -8-bias INT4 GEMV as o_proj, but the weight tile `a` is the
+// per-call fifo chunk (no weight row_offset) and the m outputs are written at
+// c[out_offset:] so a tile can pad its output slice into a full EMBED_DIM
+// partial that shares a reduce join. Kept in THIS .o (so a fused O+FFN tile does
+// not split GEMV across .o files, which would let their L1 statics overlap).
+void layer_fused_o_scatter_bf16(
+        uint32_t m, uint32_t out_offset,
+        const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
+    _qkv_gemv<32, GROUP_SIZE, EMBED_DIM>(m, a, b, c + out_offset);
+}
+
 // Down GEMV: INT4 H×E. silu_out (H bf16) → ffn_out slice. K = HIDDEN_DIM.
 void layer_fused_down_bf16(
         uint32_t m, uint32_t row_offset,
