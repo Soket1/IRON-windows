@@ -67,6 +67,8 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                  [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
     rms = Kernel("layer_fused_rms_norm_bf16", "layer_fused_relay.o",
                  [L1_E_ty, L1_E_ty, L1_E_ty, np.int32])
+    dump_left = Kernel("layer_fused_dump_left_bf16", "layer_fused_relay.o",
+                       [L1_E_ty, np.int32])
 
     _zn = [0]
     def mk_zero():
@@ -158,9 +160,13 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                     wf.release(1)
                 pp.release(1)
 
-    # tile(0,0) variant: also copies its phase2 down-partial to Dump (-> bo4)
-    def center_body_dump(bc, wf, pp, dmp, zero, add_fn, gemv_fn, gate_up_fn, silu_fn, down_fn, scatter):
+    # tile(0,0) variant: dumps an intermediate to Dump (-> bo4). DBG_BR_DUMPGATE:
+    # gate output (lf_left after gate loop). else: phase2 down-partial.
+    def center_body_dump(bc, wf, pp, dmp, zero, add_fn, gemv_fn, gate_up_fn, silu_fn,
+                         down_fn, dump_left_fn, scatter):
         _dbg_noo = bool(_os.environ.get("DBG_BR_NOO"))
+        _dump_gate = bool(_os.environ.get("DBG_BR_DUMPGATE"))
+        _dump_silu = bool(_os.environ.get("DBG_BR_DUMPSILU"))
         for _ in range_(0xFFFFFFFF):
             b = bc.acquire(1); p = pp.acquire(1)
             add_fn(zero, zero, p, E)
@@ -173,16 +179,21 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
             b2 = bc.acquire(1)
             for j in range_(gu_tiles):
                 w = wf.acquire(1); gate_up_fn(m, index.casts(T.i32(), j) * m, w, b2, 0); wf.release(1)
+            if _dump_gate:
+                d = dmp.acquire(1); dump_left_fn(d, Hc16); dmp.release(1)   # gate output (512)
             for j in range_(gu_tiles):
                 w = wf.acquire(1); gate_up_fn(m, index.casts(T.i32(), j) * m, w, b2, 1); wf.release(1)
             bc.release(1)
             silu_fn(Hc16)
+            if _dump_silu:
+                d = dmp.acquire(1); dump_left_fn(d, Hc16); dmp.release(1)   # silu out (lf_silu=lf_left)
             p2 = pp.acquire(1)
             for j in range_(dn_elems):
                 w = wf.acquire(1)
                 down_fn(m, index.casts(T.i32(), j) * DN_SUB * m, DN_SUB, w, p2)
                 wf.release(1)
-            d = dmp.acquire(1); add_fn(p2, zero, d, E); dmp.release(1)   # copy partial -> Dump
+            if not _dump_gate and not _dump_silu:
+                d = dmp.acquire(1); add_fn(p2, zero, d, E); dmp.release(1)  # down-partial
             pp.release(1)
 
     for c in range(NC):
@@ -192,7 +203,7 @@ def my_decode_back_real(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                 workers.append(Worker(
                     center_body_dump,
                     [BcB.cons(), Wf[c][r].cons(), PF_parts[c][r].prod(), Dump.prod(),
-                     mk_zero(), add, gemv, gate_up, silu, down, scatter],
+                     mk_zero(), add, gemv, gate_up, silu, down, dump_left, scatter],
                     placement=Tile(col=col_offset + c, row=2 + r)))
             else:
                 workers.append(Worker(

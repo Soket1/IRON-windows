@@ -362,6 +362,8 @@ static bfloat16 lf_right_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
 // This saves 4 KB of .bss — needed when m_input=4 pushes .bss close to the 12272B
 // AIE2P data-region limit (3×4096=12288 > 12272; 2×4096=8192 fits with room).
 // NOTE: lf_left_buf is aliased as lf_silu_buf; the name below is kept for clarity.
+// (Un-aliasing it does NOT fix the fused-back-half down rel 0.13 — verified — so
+// the down error is not a down-output ↔ silu-input overlap.)
 #define lf_silu_buf lf_left_buf
 
 extern "C" {
@@ -384,6 +386,13 @@ void layer_fused_o_scatter_bf16(
         const uint8_t *a, const bfloat16 *b, bfloat16 *c) {
     _qkv_gemv<32, GROUP_SIZE, EMBED_DIM>(m, a, b, c + out_offset);
 }
+
+// DEBUG: export the gate static lf_left_buf (gate output, valid after the gate
+// loop and before silu overwrites it) for off-chip inspection.
+void layer_fused_dump_left_bf16(bfloat16 *out, int32_t n) {
+    for (int32_t i = 0; i < n; i++) out[i] = lf_left_buf[i];
+}
+
 
 // Down GEMV: INT4 H×E. silu_out (H bf16) → ffn_out slice. K = HIDDEN_DIM.
 void layer_fused_down_bf16(
