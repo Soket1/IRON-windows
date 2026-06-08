@@ -597,13 +597,13 @@ static void _lf_dual_gemv(uint32_t m, uint32_t row_offset,
     constexpr uint32_t groups_per_row = DK / G;
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     bfloat16 *dest = (phase == 0) ? lf_left_buf : lf_right_buf;
-    const uint4 *weights_packed = reinterpret_cast<const uint4 *>(a_in);
+    // SIGNED int4 weights = (nibble-8) two's complement → signed unpack centers
+    // for free (no -8 sub, no double-unpack) → unroll compiles densely on peano.
+    const int4 *weights_packed = reinterpret_cast<const int4 *>(a_in);
     const bfloat16 *scales =
         reinterpret_cast<const bfloat16 *>(a_in + m * DK / 2);
-    const aie::vector<bfloat16, block_size> offset =
-        aie::broadcast<bfloat16, block_size>(8.0f);
     for (uint32_t row = 0; row < m; row++) {
-        const uint4 *w_row = weights_packed + row * DK / 2;
+        const int4 *w_row = weights_packed + row * DK / 2;
         const bfloat16 *s_row = scales + row * groups_per_row;
         const bfloat16 *b_ptr = b_in;
         // D2.6: TWO independent accumulators + double-pump (2 groups/iter). The
@@ -611,25 +611,21 @@ static void _lf_dual_gemv(uint32_t m, uint32_t row_offset,
         // two dequants per iter give ILP. groups_per_row is even (DK/G).
         aie::accum<accfloat, block_size> acc0 = aie::zeros<accfloat, block_size>();
         aie::accum<accfloat, block_size> acc1 = aie::zeros<accfloat, block_size>();
+        AIE_LOOP_UNROLL(8)
         for (uint32_t g = 0; g < groups_per_row; g += 2)
-            AIE_PREPARE_FOR_PIPELINING
             {
                 aie::vector<bfloat16, block_size> sf0_bc =
                     aie::broadcast<bfloat16, block_size>(s_row[g]);
-                aie::vector<uint4, block_size> I0 = aie::load_v<block_size>(w_row);
+                aie::vector<int4, block_size> I0 = aie::load_v<block_size>(w_row);
                 w_row += block_size / 2;
                 aie::vector<bfloat16, block_size> sf1_bc =
                     aie::broadcast<bfloat16, block_size>(s_row[g + 1]);
-                aie::vector<uint4, block_size> I1 = aie::load_v<block_size>(w_row);
+                aie::vector<int4, block_size> I1 = aie::load_v<block_size>(w_row);
                 w_row += block_size / 2;
-                aie::vector<bfloat16, block_size> abf0 =
-                    aie::to_float<bfloat16>(aie::unpack(aie::unpack(I0)), 0);
                 aie::vector<bfloat16, block_size> w0 =
-                    aie::mul(aie::sub(abf0, offset), sf0_bc).template to_vector<bfloat16>();
-                aie::vector<bfloat16, block_size> abf1 =
-                    aie::to_float<bfloat16>(aie::unpack(aie::unpack(I1)), 0);
+                    aie::mul(aie::to_float<bfloat16>(aie::unpack(I0), 0), sf0_bc).template to_vector<bfloat16>();
                 aie::vector<bfloat16, block_size> w1 =
-                    aie::mul(aie::sub(abf1, offset), sf1_bc).template to_vector<bfloat16>();
+                    aie::mul(aie::to_float<bfloat16>(aie::unpack(I1), 0), sf1_bc).template to_vector<bfloat16>();
                 aie::vector<bfloat16, block_size> bv0 = aie::load_v<block_size>(b_ptr);
                 b_ptr += block_size;
                 aie::vector<bfloat16, block_size> bv1 = aie::load_v<block_size>(b_ptr);
