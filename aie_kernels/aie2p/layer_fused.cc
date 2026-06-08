@@ -890,8 +890,9 @@ void layer_fused_ffn_mono_bf16(
         reinterpret_cast<const bfloat16 *>(down_w + m * E / 2);
     const bfloat16 r1 = (bfloat16)1.0f;
 
+    // silu(g)*u in registers for the m hidden rows of this chunk.
+    bfloat16 sval[16];
     for (uint32_t r = 0; r < m; r++) {
-        // silu(g)*u in registers: sigmoid(g)=1/(1+exp2(-g*log2e))
         ::aie::vector<bfloat16, 8> gv = ::aie::broadcast<bfloat16, 8>(gtmp[r]);
         ::aie::vector<float, 8> neg =
             ::aie::mul(gv, ::aie::broadcast<bfloat16, 8>((bfloat16)(-1.4426950408f)))
@@ -900,26 +901,29 @@ void layer_fused_ffn_mono_bf16(
         ::aie::vector<bfloat16, 8> denom = ::aie::add(e, ::aie::broadcast<bfloat16, 8>(r1));
         ::aie::vector<bfloat16, 8> sig = ::aie::inv(denom);
         bfloat16 silu_r = (bfloat16)((float)gtmp[r] * (float)sig[0]);
-        bfloat16 sval = (bfloat16)((float)silu_r * (float)utmp[r]);
-        ::aie::vector<bfloat16, BS> s_bc = ::aie::broadcast<bfloat16, BS>(sval);
+        sval[r] = (bfloat16)((float)silu_r * (float)utmp[r]);
+    }
 
-        const uint4 *dw = dw_base + r * (E / 2);          // r-th down column nibbles
-        for (uint32_t g = 0; g < gpr; g++)
-            AIE_PREPARE_FOR_PIPELINING {
-                ::aie::vector<bfloat16, BS> sf = ::aie::load_v<BS>(down_scl + g * BS);
-                ::aie::vector<uint4, BS> I = ::aie::load_v<BS>(dw);
-                dw += BS / 2;
+    // down SAXPY, OUTPUT-GROUP outer / hidden inner: load+store down_acc ONCE per
+    // output group (m hidden accumulated in an fp32 accum) -> m× fewer down_acc
+    // RMW than hidden-outer + no per-step bf16 rounding.
+    for (uint32_t gg = 0; gg < gpr; gg++)
+        AIE_PREPARE_FOR_PIPELINING {
+            ::aie::vector<bfloat16, BS> sf = ::aie::load_v<BS>(down_scl + gg * BS);
+            ::aie::accum<accfloat, BS> acc;
+            acc.from_vector(::aie::load_v<BS>(down_acc + gg * BS));
+            for (uint32_t r = 0; r < m; r++) {
+                ::aie::vector<uint4, BS> I =
+                    ::aie::load_v<BS>(dw_base + r * (E / 2) + gg * (BS / 2));
                 ::aie::vector<uint8, BS> a8 = ::aie::unpack(I);
                 ::aie::vector<uint16, BS> a16 = ::aie::unpack(a8);
                 ::aie::vector<bfloat16, BS> abf = ::aie::to_float<bfloat16>(a16, 0);
                 ::aie::vector<bfloat16, BS> wv =
-                    ::aie::mul(abf, sf).template to_vector<bfloat16>();      // dequant (no bias)
-                ::aie::vector<bfloat16, BS> wsv =
-                    ::aie::mul(wv, s_bc).template to_vector<bfloat16>();     // * silu
-                ::aie::vector<bfloat16, BS> av = ::aie::load_v<BS>(down_acc + g * BS);
-                ::aie::store_v(down_acc + g * BS, ::aie::add(av, wsv));
+                    ::aie::mul(abf, sf).template to_vector<bfloat16>();          // dequant (no bias)
+                acc = ::aie::mac(acc, wv, ::aie::broadcast<bfloat16, BS>(sval[r]));  // += wv*silu
             }
-    }
+            ::aie::store_v(down_acc + gg * BS, acc.template to_vector<bfloat16>());
+        }
 }
 
 // BIG-ELEMENT x4 (D2.5 perf): process nsub gate/up tiles (K=EMBED_DIM, each m rows
