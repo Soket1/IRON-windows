@@ -214,6 +214,45 @@ static void _qkv_gemv(uint32_t m,
     }
 }
 
+// SIGNED-int4 GEMV (#12 density). Weights stored as signed int4 = (nibble-8) in
+// two's complement, so the -8 centering is FREE via a signed unpack — no bf16
+// `aie::sub` in the hot loop. Removing the sub (1) keeps full bf16 precision
+// (centered products, unlike the bias-fold cancellation), and (2) unblocks
+// AIE_LOOP_UNROLL on peano (the sub was the unroll-miscompile trigger). This is
+// the reference kernel's `unpacksign0` approach. Used for gate/up (which carry
+// the -8 bias); down stays unsigned (bias 0).
+template <uint32_t block_size, uint32_t G, uint32_t DK>
+static void _qkv_gemv_s4(uint32_t m, const uint8_t *__restrict a_in,
+                         const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
+    constexpr uint32_t gpr = DK / G;
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const int4 *weights = reinterpret_cast<const int4 *>(a_in);
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(a_in + m * DK / 2);
+    for (uint32_t row = 0; row < m; row++) {
+        const int4 *w_row = weights + row * DK / 2;
+        const bfloat16 *s_row = scales + row * gpr;
+        const bfloat16 *b_ptr = b_in;
+        aie::accum<accfloat, block_size> acc = aie::zeros<accfloat, block_size>();
+        AIE_LOOP_MIN_ITERATION_COUNT(gpr / 2)
+        AIE_LOOP_UNROLL(8)
+        for (uint32_t g = 0; g < gpr; g += 2) {
+            aie::vector<bfloat16, block_size> sfa = aie::broadcast<bfloat16, block_size>(s_row[g]);
+            aie::vector<int4, block_size> Ia = aie::load_v<block_size>(w_row); w_row += block_size / 2;
+            aie::vector<bfloat16, block_size> sfb = aie::broadcast<bfloat16, block_size>(s_row[g + 1]);
+            aie::vector<int4, block_size> Ib = aie::load_v<block_size>(w_row); w_row += block_size / 2;
+            aie::vector<bfloat16, block_size> wa =
+                aie::mul(aie::to_float<bfloat16>(aie::unpack(Ia), 0), sfa).template to_vector<bfloat16>();
+            aie::vector<bfloat16, block_size> wb =
+                aie::mul(aie::to_float<bfloat16>(aie::unpack(Ib), 0), sfb).template to_vector<bfloat16>();
+            aie::vector<bfloat16, block_size> ba = aie::load_v<block_size>(b_ptr); b_ptr += block_size;
+            acc = aie::mac(acc, wa, ba);
+            aie::vector<bfloat16, block_size> bb = aie::load_v<block_size>(b_ptr); b_ptr += block_size;
+            acc = aie::mac(acc, wb, bb);
+        }
+        c_out[row] = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+    }
+}
+
 // Q/K/V projection entry. Same K (input embed_dim); m varies with output:
 //   Q: m = NUM_HEADS  * HEAD_DIM / num_aie_columns
 //   K: m = NUM_KV_HEADS * HEAD_DIM / num_aie_columns
@@ -875,9 +914,9 @@ void layer_fused_ffn_mono_bf16(
 
     bfloat16 gtmp[16];
     bfloat16 utmp[16];
-    // gate & up: full-E GEMV with -8 bias, m rows each -> register temporaries
-    _qkv_gemv<32, G, E>(m, gate_w, x, gtmp);
-    _qkv_gemv<32, G, E>(m, up_w, x, utmp);
+    // gate & up: signed-int4 GEMV (centered weights, no sub, unrolled dense)
+    _qkv_gemv_s4<32, G, E>(m, gate_w, x, gtmp);
+    _qkv_gemv_s4<32, G, E>(m, up_w, x, utmp);
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     const uint4 *dw_base = reinterpret_cast<const uint4 *>(down_w);
