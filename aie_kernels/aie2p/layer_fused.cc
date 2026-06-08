@@ -160,18 +160,16 @@ static void _qkv_gemv(uint32_t m,
                     w_row += block_size / 2;
 
                     aie::vector<uint8,  block_size> a8_a  = aie::unpack(I0_a);
-                    aie::vector<uint16, block_size> a16_a = aie::unpack(a8_a);
                     aie::vector<bfloat16, block_size> abf_a =
-                        aie::to_float<bfloat16>(a16_a, 0);
+                        aie::to_float<bfloat16>(a8_a, 0);          // single unpack (uint4->uint8->bf16)
                     aie::vector<bfloat16, block_size> asgn_a =
                         aie::sub(abf_a, offset);
                     aie::vector<bfloat16, block_size> w_a =
                         aie::mul(asgn_a, sf_a_bc).template to_vector<bfloat16>();
 
                     aie::vector<uint8,  block_size> a8_b  = aie::unpack(I0_b);
-                    aie::vector<uint16, block_size> a16_b = aie::unpack(a8_b);
                     aie::vector<bfloat16, block_size> abf_b =
-                        aie::to_float<bfloat16>(a16_b, 0);
+                        aie::to_float<bfloat16>(a8_b, 0);
                     aie::vector<bfloat16, block_size> asgn_b =
                         aie::sub(abf_b, offset);
                     aie::vector<bfloat16, block_size> w_b =
