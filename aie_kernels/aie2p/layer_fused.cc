@@ -848,6 +848,80 @@ void layer_fused_down_v2_x4_bf16(uint32_t m, uint32_t row_offset, uint32_t nsub,
         layer_fused_down_v2_static_bf16(m, row_offset + k * m, a_in + k * sub_bytes, c_out);
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// MONOLITHIC register-resident FFN (#12 / fix #11.1b): one function, NO L1
+// intermediate statics (no lf_left/lf_right/lf_silu). Hidden-outer: for each of
+// `m` hidden rows compute gate & up (full E GEMV, -8 bias) into m-element
+// register temporaries, silu*up in registers, then SAXPY-accumulate the down
+// column (dequant, NO bias) scaled by that silu value into down_acc[0:E].
+// down_acc (the output fifo) is the only L1 working set; the gate/up/silu
+// intermediates never touch L1. Weight layout per call (m hidden rows), one
+// contiguous buffer gud_w = [ gate: m rows K=E ][ up: m rows K=E ][ down: m
+// hidden-cols K=E ], each block = m*E/2 nibble bytes + m*(E/G) bf16 scales.
+// Caller zeroes down_acc before the first chunk; chunks accumulate.
+// ────────────────────────────────────────────────────────────────────────────
+void layer_fused_ffn_mono_bf16(
+        uint32_t m,
+        const uint8_t *__restrict gud_w,
+        const bfloat16 *__restrict x,
+        bfloat16 *__restrict down_acc) {
+    constexpr uint32_t BS = 32;
+    constexpr uint32_t E  = EMBED_DIM;
+    constexpr uint32_t G  = GROUP_SIZE;
+    constexpr uint32_t gpr = E / G;                // groups per row (64)
+
+    const uint32_t PK = m * E / 2 + m * (E / G) * 2;
+    const uint8_t *gate_w = gud_w;
+    const uint8_t *up_w   = gud_w + PK;
+    const uint8_t *down_w = gud_w + 2 * PK;
+
+    bfloat16 gtmp[16];
+    bfloat16 utmp[16];
+    // gate & up: full-E GEMV with -8 bias, m rows each -> register temporaries
+    _qkv_gemv<32, G, E>(m, gate_w, x, gtmp);
+    _qkv_gemv<32, G, E>(m, up_w, x, utmp);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint4 *dw_base = reinterpret_cast<const uint4 *>(down_w);
+    // down scales are PER-OUTPUT (E values, one per output row), shared by all m
+    // hidden rows of this chunk (they fall in one hidden quant-group). Layout:
+    // down block = [m*E/2 nibble bytes][E bf16 per-output scales].
+    const bfloat16 *down_scl =
+        reinterpret_cast<const bfloat16 *>(down_w + m * E / 2);
+    const bfloat16 r1 = (bfloat16)1.0f;
+
+    for (uint32_t r = 0; r < m; r++) {
+        // silu(g)*u in registers: sigmoid(g)=1/(1+exp2(-g*log2e))
+        ::aie::vector<bfloat16, 8> gv = ::aie::broadcast<bfloat16, 8>(gtmp[r]);
+        ::aie::vector<float, 8> neg =
+            ::aie::mul(gv, ::aie::broadcast<bfloat16, 8>((bfloat16)(-1.4426950408f)))
+                .template to_vector<float>();
+        ::aie::vector<bfloat16, 8> e = ::aie::exp2<bfloat16>(neg);
+        ::aie::vector<bfloat16, 8> denom = ::aie::add(e, ::aie::broadcast<bfloat16, 8>(r1));
+        ::aie::vector<bfloat16, 8> sig = ::aie::inv(denom);
+        bfloat16 silu_r = (bfloat16)((float)gtmp[r] * (float)sig[0]);
+        bfloat16 sval = (bfloat16)((float)silu_r * (float)utmp[r]);
+        ::aie::vector<bfloat16, BS> s_bc = ::aie::broadcast<bfloat16, BS>(sval);
+
+        const uint4 *dw = dw_base + r * (E / 2);          // r-th down column nibbles
+        for (uint32_t g = 0; g < gpr; g++)
+            AIE_PREPARE_FOR_PIPELINING {
+                ::aie::vector<bfloat16, BS> sf = ::aie::load_v<BS>(down_scl + g * BS);
+                ::aie::vector<uint4, BS> I = ::aie::load_v<BS>(dw);
+                dw += BS / 2;
+                ::aie::vector<uint8, BS> a8 = ::aie::unpack(I);
+                ::aie::vector<uint16, BS> a16 = ::aie::unpack(a8);
+                ::aie::vector<bfloat16, BS> abf = ::aie::to_float<bfloat16>(a16, 0);
+                ::aie::vector<bfloat16, BS> wv =
+                    ::aie::mul(abf, sf).template to_vector<bfloat16>();      // dequant (no bias)
+                ::aie::vector<bfloat16, BS> wsv =
+                    ::aie::mul(wv, s_bc).template to_vector<bfloat16>();     // * silu
+                ::aie::vector<bfloat16, BS> av = ::aie::load_v<BS>(down_acc + g * BS);
+                ::aie::store_v(down_acc + g * BS, ::aie::add(av, wsv));
+            }
+    }
+}
+
 // BIG-ELEMENT x4 (D2.5 perf): process nsub gate/up tiles (K=EMBED_DIM, each m rows
 // = 4608B) from ONE big weight-fifo element. Lets independent per-tile fifos use
 // large DMA transfers (high BW) while still overlapping compute (per-tile prefetch).
