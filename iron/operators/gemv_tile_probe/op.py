@@ -43,6 +43,12 @@ class AIEGemvTileProbe(AIEOperatorBase):
             "-DHEAD_DIM=64", "-DNUM_HEADS=32", "-DNUM_KV_HEADS=8",
             "-DMAX_SEQ_LEN=2048", "-DNUM_AIE_COLUMNS=16", f"-DM_OUTPUT_MAX={self.M_OUT}",
         ]
+        # #30 peano scheduling experiment: extra -mllvm flags via env (e.g.
+        # GEMV_MLLVM="-enable-pipeliner -pipeliner-max-stages=4"). Each token is
+        # passed as `-mllvm <token>` to the kernel clang.
+        import os as _os
+        for _tok in _os.environ.get("GEMV_MLLVM", "").split():
+            relay_flags += ["-mllvm", _tok]
         relay_obj = KernelObjectArtifact.new(
             "layer_fused_relay.o",
             depends=[SourceArtifact.new(
