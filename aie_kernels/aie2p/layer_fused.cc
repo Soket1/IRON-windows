@@ -244,9 +244,40 @@ static void _gemv_bcast(const uint8_t *__restrict w,
     aie::store_v(out, acc.template to_vector<bfloat16>());
 }
 
+// 64-WIDE-DEQUANT broadcast GEMV (#30). One unpack+to_float feeds TWO mac
+// columns: load 2 adjacent column-major weight columns as int4[2N] (= N bytes),
+// unpack/convert once over 2N, extract the two N-halves, mac each against its
+// own broadcast x lane. Halves unpack/conv cost per mac (1.0 → 0.5), targeting
+// FFLM's vconv 0.55 / vunpack 0.48. G must be even (it is: GROUP_SIZE=32).
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_bcast_w2(const uint8_t *__restrict w,
+                           const bfloat16 *__restrict x, bfloat16 *__restrict out) {
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(w + K * N / 2);
+    aie::accum<accfloat, N> acc = aie::zeros<accfloat, N>();
+    for (uint32_t kg = 0; kg < K / G; kg++) {
+        const bfloat16 *xchunk = x + kg * G;
+        aie::accum<accfloat, N> gacc = aie::zeros<accfloat, N>();
+        AIE_LOOP_UNROLL(8)
+        for (uint32_t j = 0; j < G; j += 2) {
+            // columns (kg*G+j) and (kg*G+j+1) are adjacent: 2N nibbles = N bytes
+            const int4 *wp = reinterpret_cast<const int4 *>(w + (kg * G + j) * (N / 2));
+            aie::vector<int4, 2 * N> w2 = aie::load_v<2 * N>(wp);
+            aie::vector<bfloat16, 2 * N> wbf2 = aie::to_float<bfloat16>(aie::unpack(w2), 0);
+            aie::vector<bfloat16, N> w_lo = wbf2.template extract<N>(0);
+            aie::vector<bfloat16, N> w_hi = wbf2.template extract<N>(1);
+            gacc = aie::mac(gacc, w_lo, aie::broadcast<bfloat16, N>(xchunk[j]));
+            gacc = aie::mac(gacc, w_hi, aie::broadcast<bfloat16, N>(xchunk[j + 1]));
+        }
+        aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
+        acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
+    }
+    aie::store_v(out, acc.template to_vector<bfloat16>());
+}
+
 extern "C" void layer_fused_gemv_bcast_bf16(const uint8_t *ws,
                                             const bfloat16 *x, bfloat16 *out) {
-    _gemv_bcast<32, GROUP_SIZE, EMBED_DIM>(ws, x, out);
+    _gemv_bcast_w2<32, GROUP_SIZE, EMBED_DIM>(ws, x, out);  // 64-wide: unpack/mac 1.0->0.5
 }
 
 // SIGNED-int4 GEMV (#12 density). Weights stored as signed int4 = (nibble-8) in
