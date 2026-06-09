@@ -333,6 +333,37 @@ static void _gemv_dot_tile(const uint8_t *__restrict w,
     }
 }
 
+// FLOOR variant (#30 A-decision): same mac+broadcast structure and MAC count, but
+// NO per-iter dequant — one resident bf16 weight vector reused. Isolates the
+// irreducible mac+bcast cost; (bcast_tile − floor_tile) = dequant cost (unpack +
+// vconv, vconv dominant). Tells whether attacking vconv (A) is worth it.
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_floor(const uint8_t *__restrict w,
+                        const bfloat16 *__restrict x, bfloat16 *__restrict out) {
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(w + K * N / 2);
+    aie::vector<bfloat16, N> wbf = aie::load_v<N>(scales);   // resident weight, no dequant
+    aie::accum<accfloat, N> acc = aie::zeros<accfloat, N>();
+    for (uint32_t kg = 0; kg < K / G; kg++) {
+        const bfloat16 *xchunk = x + kg * G;
+        aie::accum<accfloat, N> gacc = aie::zeros<accfloat, N>();
+        AIE_LOOP_UNROLL(8)
+        for (uint32_t j = 0; j < G; j++)
+            gacc = aie::mac(gacc, wbf, aie::broadcast<bfloat16, N>(xchunk[j]));
+        aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
+        acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
+    }
+    aie::store_v(out, acc.template to_vector<bfloat16>());
+}
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_floor_tile(const uint8_t *__restrict w,
+                             const bfloat16 *__restrict x,
+                             bfloat16 *__restrict out, uint32_t m_out) {
+    const uint32_t blk = K * N / 2 + N * (K / G) * 2;
+    for (uint32_t mo = 0; mo < m_out; mo += N)
+        _gemv_floor<N, G, K>(w + (mo / N) * blk, x, out + mo);
+}
+
 // Weights for M_OUTPUT_MAX outputs don't fit one tile's L1 (must stream); for a
 // pure COMPUTE-bound A/B we keep one resident 32-output block and REPEAT its GEMV
 // TILE_REPEAT times → same total MAC count as a 32*TILE_REPEAT-output tile, no DMA.
@@ -348,6 +379,11 @@ extern "C" void layer_fused_gemv_dot_tile_bf16(const uint8_t *ws,
                                                const bfloat16 *x, bfloat16 *out) {
     for (int r = 0; r < TILE_REPEAT; r++)
         _gemv_dot_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);
+}
+extern "C" void layer_fused_gemv_floor_tile_bf16(const uint8_t *ws,
+                                                 const bfloat16 *x, bfloat16 *out) {
+    for (int r = 0; r < TILE_REPEAT; r++)
+        _gemv_floor_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);
 }
 
 // SIGNED-int4 GEMV (#12 density). Weights stored as signed int4 = (nibble-8) in
