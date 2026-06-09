@@ -214,6 +214,41 @@ static void _qkv_gemv(uint32_t m,
     }
 }
 
+// BROADCAST / outer-product GEMV PROBE (#30). FFLM structure: activation x held
+// in registers, vextbcst per lane, MAC against weight COLUMN vectors into N
+// parallel output accumulators; per-group scale applied ONCE on the accumulator
+// (amortized over G macs → vmul/vmac ~1/G ≈ 0.03, vs our dot-product's 1.0).
+// out[0:N] = Σ_k W[0:N,k]*x[k], scale[n,kg] per output per group, signed int4
+// weights stored COLUMN-MAJOR (W[:,k] = N nibbles contiguous). N = block_size.
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_bcast(const uint8_t *__restrict w,
+                        const bfloat16 *__restrict x, bfloat16 *__restrict out) {
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(w + K * N / 2);  // packed after weights
+    aie::accum<accfloat, N> acc = aie::zeros<accfloat, N>();
+    for (uint32_t kg = 0; kg < K / G; kg++) {
+        const bfloat16 *xchunk = x + kg * G;
+        aie::accum<accfloat, N> gacc = aie::zeros<accfloat, N>();
+        AIE_LOOP_UNROLL(8)
+        for (uint32_t j = 0; j < G; j++) {
+            // explicit byte offset: column (kg*G+j) is N nibbles = N/2 bytes wide
+            const int4 *wcolp = reinterpret_cast<const int4 *>(w + (kg * G + j) * (N / 2));
+            aie::vector<int4, N> wcol = aie::load_v<N>(wcolp);
+            aie::vector<bfloat16, N> wbf = aie::to_float<bfloat16>(aie::unpack(wcol), 0);
+            aie::vector<bfloat16, N> xkb = aie::broadcast<bfloat16, N>(xchunk[j]);  // scalar bcast (probe)
+            gacc = aie::mac(gacc, wbf, xkb);
+        }
+        aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);  // per-output scale, this group
+        acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);   // amortized scale
+    }
+    aie::store_v(out, acc.template to_vector<bfloat16>());
+}
+
+extern "C" void layer_fused_gemv_bcast_bf16(const uint8_t *ws,
+                                            const bfloat16 *x, bfloat16 *out) {
+    _gemv_bcast<32, GROUP_SIZE, EMBED_DIM>(ws, x, out);
+}
+
 // SIGNED-int4 GEMV (#12 density). Weights stored as signed int4 = (nibble-8) in
 // two's complement, so the -8 centering is FREE via a signed unpack — no bf16
 // `aie::sub` in the hot loop. Removing the sub (1) keeps full bf16 precision
