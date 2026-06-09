@@ -258,8 +258,14 @@ static void _gemv_bcast_w2(const uint8_t *__restrict w,
     for (uint32_t kg = 0; kg < K / G; kg++) {
         // register-resident activation chunk → lane-extract broadcast (vextbcst)
         aie::vector<bfloat16, G> xv = aie::load_v<G>(x + kg * G);
-        aie::accum<accfloat, N> gacc = aie::zeros<accfloat, N>();
-        AIE_LOOP_UNROLL(8)
+        aie::accum<accfloat, N> g0 = aie::zeros<accfloat, N>();
+        aie::accum<accfloat, N> g1 = aie::zeros<accfloat, N>();
+        // rolled + post-RA pipeliner: the pre-RA pipeliner spills the 2nd
+        // accumulator (AIE2P has only 5 accfloat banks); pipeline(disable) routes
+        // to the post-RA scheduler which does not spill → 172µs vs 180 single-acc /
+        // 201-205 dual-acc-with-unroll. (Pipeliner can't fully SWP this loop:
+        // recurrence MII=22 (the mac chain) exceeds MAX_II=32's useful window.)
+        AIE_PREPARE_FOR_POSTPIPELINING
         for (uint32_t j = 0; j < G; j += 2) {
             // columns (kg*G+j) and (kg*G+j+1) are adjacent: 2N nibbles = N bytes
             const int4 *wp = reinterpret_cast<const int4 *>(w + (kg * G + j) * (N / 2));
@@ -267,9 +273,10 @@ static void _gemv_bcast_w2(const uint8_t *__restrict w,
             aie::vector<bfloat16, 2 * N> wbf2 = aie::to_float<bfloat16>(aie::unpack(w2), 0);
             aie::vector<bfloat16, N> w_lo = wbf2.template extract<N>(0);
             aie::vector<bfloat16, N> w_hi = wbf2.template extract<N>(1);
-            gacc = aie::mac(gacc, w_lo, aie::broadcast<bfloat16, N>(xv[j]));
-            gacc = aie::mac(gacc, w_hi, aie::broadcast<bfloat16, N>(xv[j + 1]));
+            g0 = aie::mac(g0, w_lo, aie::broadcast<bfloat16, N>(xv[j]));
+            g1 = aie::mac(g1, w_hi, aie::broadcast<bfloat16, N>(xv[j + 1]));
         }
+        aie::accum<accfloat, N> gacc = aie::add(g0, g1);
         aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
         acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
     }
