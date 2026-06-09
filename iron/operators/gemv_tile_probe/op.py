@@ -24,7 +24,9 @@ class AIEGemvTileProbe(AIEOperatorBase):
     def sym(self):
         return {"bcast": "layer_fused_gemv_bcast_tile_bf16",
                 "dot": "layer_fused_gemv_dot_tile_bf16",
-                "floor": "layer_fused_gemv_floor_tile_bf16"}[self.kernel]
+                "floor": "layer_fused_gemv_floor_tile_bf16",
+                "floor_reg": "layer_fused_gemv_floor_reg_tile_bf16",
+                "floor_reg2": "layer_fused_gemv_floor_reg2_tile_bf16"}[self.kernel]
 
     def get_artifacts(self, prefix="gemv_tile_"):
         operator_dir = Path(__file__).parent

@@ -256,7 +256,8 @@ static void _gemv_bcast_w2(const uint8_t *__restrict w,
     const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(w + K * N / 2);
     aie::accum<accfloat, N> acc = aie::zeros<accfloat, N>();
     for (uint32_t kg = 0; kg < K / G; kg++) {
-        const bfloat16 *xchunk = x + kg * G;
+        // register-resident activation chunk → lane-extract broadcast (vextbcst)
+        aie::vector<bfloat16, G> xv = aie::load_v<G>(x + kg * G);
         aie::accum<accfloat, N> gacc = aie::zeros<accfloat, N>();
         AIE_LOOP_UNROLL(8)
         for (uint32_t j = 0; j < G; j += 2) {
@@ -266,8 +267,8 @@ static void _gemv_bcast_w2(const uint8_t *__restrict w,
             aie::vector<bfloat16, 2 * N> wbf2 = aie::to_float<bfloat16>(aie::unpack(w2), 0);
             aie::vector<bfloat16, N> w_lo = wbf2.template extract<N>(0);
             aie::vector<bfloat16, N> w_hi = wbf2.template extract<N>(1);
-            gacc = aie::mac(gacc, w_lo, aie::broadcast<bfloat16, N>(xchunk[j]));
-            gacc = aie::mac(gacc, w_hi, aie::broadcast<bfloat16, N>(xchunk[j + 1]));
+            gacc = aie::mac(gacc, w_lo, aie::broadcast<bfloat16, N>(xv[j]));
+            gacc = aie::mac(gacc, w_hi, aie::broadcast<bfloat16, N>(xv[j + 1]));
         }
         aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
         acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
@@ -364,6 +365,70 @@ static void _gemv_floor_tile(const uint8_t *__restrict w,
         _gemv_floor<N, G, K>(w + (mo / N) * blk, x, out + mo);
 }
 
+// FLOOR + register-resident activation (#30 floor-attack step 1). Load the G-chunk
+// into a vector register once, then broadcast from a LANE (vector_elem_ref → emits
+// vextbcst) instead of a scalar memory read. Tests whether register residence lets
+// the broadcast co-issue with the mac and lowers the mac+bcast floor.
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_floor_reg(const uint8_t *__restrict w,
+                            const bfloat16 *__restrict x, bfloat16 *__restrict out) {
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(w + K * N / 2);
+    aie::vector<bfloat16, N> wbf = aie::load_v<N>(scales);
+    aie::accum<accfloat, N> acc = aie::zeros<accfloat, N>();
+    for (uint32_t kg = 0; kg < K / G; kg++) {
+        aie::vector<bfloat16, G> xv = aie::load_v<G>(x + kg * G);  // resident activation
+        aie::accum<accfloat, N> gacc = aie::zeros<accfloat, N>();
+        AIE_LOOP_UNROLL(8)
+        for (uint32_t j = 0; j < G; j++)
+            gacc = aie::mac(gacc, wbf, aie::broadcast<bfloat16, N>(xv[j]));  // lane bcst
+        aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
+        acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
+    }
+    aie::store_v(out, acc.template to_vector<bfloat16>());
+}
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_floor_reg_tile(const uint8_t *__restrict w,
+                                 const bfloat16 *__restrict x,
+                                 bfloat16 *__restrict out, uint32_t m_out) {
+    const uint32_t blk = K * N / 2 + N * (K / G) * 2;
+    for (uint32_t mo = 0; mo < m_out; mo += N)
+        _gemv_floor_reg<N, G, K>(w + (mo / N) * blk, x, out + mo);
+}
+
+// FLOOR + register activation + 2 INDEPENDENT accumulators (#30 floor-attack step 2).
+// All-into-one gacc serializes the macs (dependency chain through the accumulator),
+// blocking vextbcst co-issue. Two partial accumulators (even/odd k) break the chain
+// → independent mac streams → scheduler can co-issue the next broadcast with the
+// current mac. Sum the partials at the end. (Floor: scale dropped; timing only.)
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_floor_reg2(const uint8_t *__restrict w,
+                             const bfloat16 *__restrict x, bfloat16 *__restrict out) {
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(w + K * N / 2);
+    aie::vector<bfloat16, N> wbf = aie::load_v<N>(scales);
+    aie::accum<accfloat, N> acc0 = aie::zeros<accfloat, N>();
+    aie::accum<accfloat, N> acc1 = aie::zeros<accfloat, N>();
+    for (uint32_t kg = 0; kg < K / G; kg++) {
+        aie::vector<bfloat16, G> xv = aie::load_v<G>(x + kg * G);
+        AIE_LOOP_UNROLL(8)
+        for (uint32_t j = 0; j < G; j += 2) {
+            acc0 = aie::mac(acc0, wbf, aie::broadcast<bfloat16, N>(xv[j]));
+            acc1 = aie::mac(acc1, wbf, aie::broadcast<bfloat16, N>(xv[j + 1]));
+        }
+    }
+    aie::accum<accfloat, N> acc = aie::add(acc0, acc1);
+    aie::store_v(out, acc.template to_vector<bfloat16>());
+}
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_floor_reg2_tile(const uint8_t *__restrict w,
+                                  const bfloat16 *__restrict x,
+                                  bfloat16 *__restrict out, uint32_t m_out) {
+    const uint32_t blk = K * N / 2 + N * (K / G) * 2;
+    for (uint32_t mo = 0; mo < m_out; mo += N)
+        _gemv_floor_reg2<N, G, K>(w + (mo / N) * blk, x, out + mo);
+}
+
 // Weights for M_OUTPUT_MAX outputs don't fit one tile's L1 (must stream); for a
 // pure COMPUTE-bound A/B we keep one resident 32-output block and REPEAT its GEMV
 // TILE_REPEAT times → same total MAC count as a 32*TILE_REPEAT-output tile, no DMA.
@@ -384,6 +449,16 @@ extern "C" void layer_fused_gemv_floor_tile_bf16(const uint8_t *ws,
                                                  const bfloat16 *x, bfloat16 *out) {
     for (int r = 0; r < TILE_REPEAT; r++)
         _gemv_floor_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);
+}
+extern "C" void layer_fused_gemv_floor_reg_tile_bf16(const uint8_t *ws,
+                                                     const bfloat16 *x, bfloat16 *out) {
+    for (int r = 0; r < TILE_REPEAT; r++)
+        _gemv_floor_reg_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);
+}
+extern "C" void layer_fused_gemv_floor_reg2_tile_bf16(const uint8_t *ws,
+                                                      const bfloat16 *x, bfloat16 *out) {
+    for (int r = 0; r < TILE_REPEAT; r++)
+        _gemv_floor_reg2_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);
 }
 
 // SIGNED-int4 GEMV (#12 density). Weights stored as signed int4 = (nibble-8) in
