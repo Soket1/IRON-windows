@@ -461,6 +461,18 @@ extern "C" void layer_fused_gemv_floor_reg2_tile_bf16(const uint8_t *ws,
         _gemv_floor_reg2_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);
 }
 
+// STREAMING-probe blocks (#30 (B) realize): each call processes ONE 32-output
+// weight block arriving from a fifo (real weight-DMA, weights NOT resident), writes
+// out[blk*32 .. blk*32+32]. Tests whether the bcast compute win survives streaming.
+extern "C" void layer_fused_gemv_bcast_blk_bf16(const uint8_t *ws,
+                                                const bfloat16 *x, bfloat16 *out) {
+    _gemv_bcast_w2<32, GROUP_SIZE, EMBED_DIM>(ws, x, out);   // column-major block
+}
+extern "C" void layer_fused_gemv_dot_blk_bf16(const uint8_t *ws,
+                                              const bfloat16 *x, bfloat16 *out) {
+    _gemv_dot_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);  // row-major 32 rows
+}
+
 // SIGNED-int4 GEMV (#12 density). Weights stored as signed int4 = (nibble-8) in
 // two's complement, so the -8 centering is FREE via a signed unpack — no bf16
 // `aie::sub` in the hot loop. Removing the sub (1) keeps full bf16 precision
