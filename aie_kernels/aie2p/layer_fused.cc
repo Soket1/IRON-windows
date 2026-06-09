@@ -280,6 +280,76 @@ extern "C" void layer_fused_gemv_bcast_bf16(const uint8_t *ws,
     _gemv_bcast_w2<32, GROUP_SIZE, EMBED_DIM>(ws, x, out);  // 64-wide: unpack/mac 1.0->0.5
 }
 
+// #30 (B) TILE-SIZED probes: real per-tile FFN workload (M_OUT outputs over K) so
+// the kernel is COMPUTE-bound (not dispatch-floor-bound like the N=32 probe).
+// Both produce out[M_OUT] from the same logical GEMV; differ only in algorithm +
+// weight layout, for an apples-to-apples compute-bound A/B.
+
+// BROADCAST tile: M_OUT/N passes of the 64-wide outer-product. Weights column-major
+// per N-block: block b = (K*N/2 weight bytes + N*(K/G)*2 scale bytes), contiguous.
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_bcast_tile(const uint8_t *__restrict w,
+                             const bfloat16 *__restrict x,
+                             bfloat16 *__restrict out, uint32_t m_out) {
+    const uint32_t blk = K * N / 2 + N * (K / G) * 2;
+    for (uint32_t mo = 0; mo < m_out; mo += N)
+        _gemv_bcast_w2<N, G, K>(w + (mo / N) * blk, x, out + mo);
+}
+
+// DOT-PRODUCT tile (production-equivalent baseline): row-major signed int4,
+// double-pump 2 accumulators, per-element scale vmul, reduce_add → out[r].
+// Mirrors _lf_dual_gemv math but vector store (no static buffer).
+template <uint32_t N, uint32_t G, uint32_t K>
+static void _gemv_dot_tile(const uint8_t *__restrict w,
+                           const bfloat16 *__restrict x,
+                           bfloat16 *__restrict out, uint32_t m_out) {
+    constexpr uint32_t gpr = K / G;
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const int4 *wp = reinterpret_cast<const int4 *>(w);
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(w + m_out * K / 2);
+    for (uint32_t row = 0; row < m_out; row++) {
+        const int4 *w_row = wp + row * K / 2;
+        const bfloat16 *s_row = scales + row * gpr;
+        const bfloat16 *b_ptr = x;
+        aie::accum<accfloat, N> acc0 = aie::zeros<accfloat, N>();
+        aie::accum<accfloat, N> acc1 = aie::zeros<accfloat, N>();
+        AIE_LOOP_UNROLL(8)
+        for (uint32_t g = 0; g < gpr; g += 2) {
+            aie::vector<bfloat16, N> s0 = aie::broadcast<bfloat16, N>(s_row[g]);
+            aie::vector<int4, N> I0 = aie::load_v<N>(w_row); w_row += N / 2;
+            aie::vector<bfloat16, N> s1 = aie::broadcast<bfloat16, N>(s_row[g + 1]);
+            aie::vector<int4, N> I1 = aie::load_v<N>(w_row); w_row += N / 2;
+            aie::vector<bfloat16, N> w0 =
+                aie::mul(aie::to_float<bfloat16>(aie::unpack(I0), 0), s0).template to_vector<bfloat16>();
+            aie::vector<bfloat16, N> w1 =
+                aie::mul(aie::to_float<bfloat16>(aie::unpack(I1), 0), s1).template to_vector<bfloat16>();
+            aie::vector<bfloat16, N> bv0 = aie::load_v<N>(b_ptr); b_ptr += N;
+            aie::vector<bfloat16, N> bv1 = aie::load_v<N>(b_ptr); b_ptr += N;
+            acc0 = aie::mac(acc0, w0, bv0);
+            acc1 = aie::mac(acc1, w1, bv1);
+        }
+        aie::accum<accfloat, N> acc = aie::add(acc0, acc1);
+        out[row] = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+    }
+}
+
+// Weights for M_OUTPUT_MAX outputs don't fit one tile's L1 (must stream); for a
+// pure COMPUTE-bound A/B we keep one resident 32-output block and REPEAT its GEMV
+// TILE_REPEAT times → same total MAC count as a 32*TILE_REPEAT-output tile, no DMA.
+#ifndef TILE_REPEAT
+#define TILE_REPEAT 16
+#endif
+extern "C" void layer_fused_gemv_bcast_tile_bf16(const uint8_t *ws,
+                                                 const bfloat16 *x, bfloat16 *out) {
+    for (int r = 0; r < TILE_REPEAT; r++)
+        _gemv_bcast_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);
+}
+extern "C" void layer_fused_gemv_dot_tile_bf16(const uint8_t *ws,
+                                               const bfloat16 *x, bfloat16 *out) {
+    for (int r = 0; r < TILE_REPEAT; r++)
+        _gemv_dot_tile<32, GROUP_SIZE, EMBED_DIM>(ws, x, out, 32);
+}
+
 // SIGNED-int4 GEMV (#12 density). Weights stored as signed int4 = (nibble-8) in
 // two's complement, so the -8 centering is FREE via a signed unpack — no bf16
 // `aie::sub` in the hot loop. Removing the sub (1) keeps full bf16 precision
