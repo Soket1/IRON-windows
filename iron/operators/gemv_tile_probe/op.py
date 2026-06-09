@@ -49,6 +49,7 @@ class AIEGemvTileProbe(AIEOperatorBase):
         import os as _os
         for _tok in _os.environ.get("GEMV_MLLVM", "").split():
             relay_flags += ["-mllvm", _tok]
+        relay_flags += _os.environ.get("GEMV_CFLAGS", "").split()
         relay_obj = KernelObjectArtifact.new(
             "layer_fused_relay.o",
             depends=[SourceArtifact.new(
