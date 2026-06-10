@@ -914,6 +914,19 @@ void layer_fused_gate_up_bf16(
     _lf_dual_gemv<32, GROUP_SIZE, EMBED_DIM>(m, row_offset, a, b, phase);
 }
 
+// BROADCAST Gate/Up (#33): same lf_left/right_buf interface but the dense
+// outer-product GEMV (_gemv_bcast_w2, -23% vs dot). `n` outputs (multiple of 32),
+// weights COLUMN-MAJOR signed int4 per 32-block: [K*16 bytes][32*(K/G) bf16] each.
+// Writes n outputs to dest+row_offset. silu/down downstream are unchanged.
+void layer_fused_gate_up_bcast_bf16(
+        uint32_t n, uint32_t row_offset,
+        const uint8_t *a, const bfloat16 *b, int phase) {
+    bfloat16 *dest = (phase == 0) ? lf_left_buf : lf_right_buf;
+    const uint32_t blk = EMBED_DIM * 32 / 2 + 32 * (EMBED_DIM / GROUP_SIZE) * 2;
+    for (uint32_t o = 0; o < n; o += 32)
+        _gemv_bcast_w2<32, GROUP_SIZE, EMBED_DIM>(a + (o / 32) * blk, b, dest + row_offset + o);
+}
+
 // Fused SiLU*Mul: out[i] = silu(lf_left_buf[i]) * lf_right_buf[i].
 // silu(x) = x * sigmoid(x), sigmoid(x) = 0.5*(1 + tanh(x/2)).
 void layer_fused_silu_mul_bf16(bfloat16 *c_out, uint32_t m_output) {
