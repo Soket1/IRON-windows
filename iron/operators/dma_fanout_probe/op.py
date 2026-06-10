@@ -13,11 +13,14 @@ from iron.common import (
 
 class AIEDmaFanoutProbe(AIEOperatorBase):
     def __init__(self, cols=(2, 3, 4, 5), embed_dim=2048, group_size=32,
-                 m_input=4, context=None):
+                 m_input=4, chans_per_col=1, context=None):
+        if chans_per_col != 1:
+            raise ValueError("IRON ObjectFifo API only supports chans_per_col=1; C=2 needs raw-aiex BD chains")
         self.cols = tuple(cols)
         self.embed_dim = embed_dim
         self.group_size = group_size
         self.m_input = m_input
+        self.chans_per_col = chans_per_col
         self.xclbin_artifact = None
         self.insts_artifact = None
         AIEOperatorBase.__init__(self, context=context)
@@ -31,7 +34,8 @@ class AIEDmaFanoutProbe(AIEOperatorBase):
             import_path=operator_dir / "design.py",
             callback_fn="my_dma_fanout_probe",
             callback_args=[self.context.device_manager.device_type,
-                           list(self.cols), E, g, self.m_input],
+                           list(self.cols), E, g, self.m_input,
+                           self.chans_per_col],
         )
         xclbin_artifact = XclbinArtifact.new(f"{base}.xclbin", depends=[mlir_artifact])
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
