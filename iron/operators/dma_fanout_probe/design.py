@@ -29,38 +29,36 @@ def my_dma_fanout_probe(dev, cols=(2, 3, 4, 5), embed_dim=2048, group_size=32,
     E, g, m = embed_dim, group_size, m_input
     NCOL = len(cols)
     R = 4
+    F = chans_per_col                          # ingress fifos (shim MM2S) per column
+    assert R % F == 0, "fifos_per_col must divide R=4"
+    RF = R // F                                 # tiles fed per fifo
     PACKED = m * E // 2 + m * (E // g) * 2     # 4608
-    C = chans_per_col
-    # fixed total = 1536*4*PACKED = 28.31MB regardless of NCOL or C
-    assert 1536 % (NCOL * C) == 0, "NCOL*C must divide 1536 for a fixed 28.3MB total"
-    ROUNDS_PER_CHAN = 1536 // (NCOL * C)       # rounds per (col, channel)
+    # fixed total = 1536*4*PACKED = 28.31MB regardless of NCOL or F
+    assert 1536 % NCOL == 0, "NCOL must divide 1536 for a fixed 28.3MB total"
+    WT = 1536 // NCOL                           # rounds per fifo (= per tile)
     Ntok = 32
 
     L1_W_ty  = np.ndarray[(PACKED,), u8]
-    L1_W4_ty = np.ndarray[(R * PACKED,), u8]   # one round = 4 rows' j-th block
+    L1_WF_ty = np.ndarray[(RF * PACKED,), u8]  # one round = RF rows' j-th block
     L1_O_ty  = np.ndarray[(Ntok,), bf]
-    L1_4O_ty = np.ndarray[(R * Ntok,), bf]     # 4 worker tokens joined per column
-    wchan = ROUNDS_PER_CHAN * R * PACKED       # per-(col,channel) bytes
-    wcol = C * wchan                            # per-column bytes
+    L1_4O_ty = np.ndarray[(R * Ntok,), bf]
+    wfifo = WT * RF * PACKED                     # per-fifo bytes
+    wcol = F * wfifo                             # per-column bytes (= WT*R*PACKED, F-indep)
     L3_W_ty = np.ndarray[(NCOL * wcol,), u8]
     L3_O_ty = np.ndarray[(NCOL * R * Ntok,), bf]
 
-    # per-column weight ingress: C shim channels per col, each fills
-    # 1/C of the per-column region. IRON LIMITATION: join() is on PROD of a SINGLE
-    # ObjectFifo (multi-prod via obj_types), not across DIFFERENT ObjectFifos. So
-    # the C-channel fan-in cannot be expressed in IRON's high-level API at all.
-    # This probe therefore tests the C=1 case (and falls back to N4/N6/N8 cols).
-    # For C=2 on 4 center cols, would need raw-aiex BD chains.
-    if C != 1:
-        raise ValueError(f"chans_per_col={C} unsupported in IRON (only C=1): join() requires a single ObjectFifo prod.")
-    Wsrc = [ObjectFifo(L1_W4_ty, name=f"Wsrc_{i}", depth=2) for i in range(NCOL)]
-    Wf = [Wsrc[i].cons().split(
-            offsets=[r * PACKED for r in range(R)],
-            placement=Tile(col=cols[i], row=1),
-            obj_types=[L1_W_ty for _ in range(R)])
-          for i in range(NCOL)]
-    # per-column token JOIN (4 workers -> 1 drain/col) keeps shim endpoints to
-    # NCOL*C fills + NCOL drains = 12 channels @ N=6 (FFLM-faithful), not 4/col.
+    # per-column weight ingress: F INDEPENDENT fifos per col (= F shim MM2S channels).
+    # No join() needed — each fifo splits to RF tiles. This DOES express 2 MM2S/col
+    # (F=2): #37's "join-required" framing was wrong. IRON's SequentialPlacer assigns
+    # the F*NCOL fills to shim MM2S channels independently of the GEMV column.
+    Wsrc = [[ObjectFifo(L1_WF_ty, name=f"Wsrc_{i}_{s}", depth=2) for s in range(F)]
+            for i in range(NCOL)]
+    Wf = [[Wsrc[i][s].cons().split(
+              offsets=[r * PACKED for r in range(RF)],
+              placement=Tile(col=cols[i], row=1),
+              obj_types=[L1_W_ty for _ in range(RF)])
+           for s in range(F)] for i in range(NCOL)]
+    # per-column token JOIN (R workers -> 1 drain/col)
     ColTok, CT_parts = [], []
     for i in range(NCOL):
         ct = ObjectFifo(L1_4O_ty, name=f"ColTok_{i}", depth=1)
@@ -74,22 +72,25 @@ def my_dma_fanout_probe(dev, cols=(2, 3, 4, 5), embed_dim=2048, group_size=32,
 
     def drain_body(wf, of):
         for _ in range_(0xFFFFFFFF):
-            for _b in range_(ROUNDS_PER_CHAN * C):
+            for _b in range_(WT):
                 wf.acquire(1)
                 wf.release(1)
             of.acquire(1)        # emit 1 token AFTER all weights drained
             of.release(1)
 
+    # tile (i, row 2+r); fifo s feeds tiles [s*RF .. s*RF+RF)
     for i in range(NCOL):
-        for r in range(R):
-            workers.append(Worker(
-                drain_body, [Wf[i][r].cons(), CT_parts[i][r].prod()],
-                placement=Tile(col=cols[i], row=2 + r)))
+        for s in range(F):
+            for rr in range(RF):
+                r = s * RF + rr
+                workers.append(Worker(
+                    drain_body, [Wf[i][s][rr].cons(), CT_parts[i][r].prod()],
+                    placement=Tile(col=cols[i], row=2 + r)))
 
-    def w_tap(i):
+    def w_tap(i, s):
         return TensorAccessPattern(tensor_dims=(1, NCOL * wcol),
-                                   offset=i * wcol,
-                                   sizes=[1, 1, 1, wcol], strides=[0, 0, 0, 1])
+                                   offset=i * wcol + s * wfifo,
+                                   sizes=[1, 1, 1, wfifo], strides=[0, 0, 0, 1])
 
     def o_tap(i):
         return TensorAccessPattern(tensor_dims=(1, NCOL * R * Ntok),
@@ -102,7 +103,8 @@ def my_dma_fanout_probe(dev, cols=(2, 3, 4, 5), embed_dim=2048, group_size=32,
         rt.start(*workers)
         tg = rt.task_group()
         for i in range(NCOL):
-            rt.fill(Wsrc[i].prod(), w, w_tap(i), task_group=tg)
+            for s in range(F):
+                rt.fill(Wsrc[i][s].prod(), w, w_tap(i, s), task_group=tg)
         for i in range(NCOL):
             rt.drain(ColTok[i].cons(), o, o_tap(i), task_group=tg, wait=True)
         rt.finish_task_group(tg)

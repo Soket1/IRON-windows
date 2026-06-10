@@ -14,8 +14,7 @@ from iron.common import (
 class AIEDmaFanoutProbe(AIEOperatorBase):
     def __init__(self, cols=(2, 3, 4, 5), embed_dim=2048, group_size=32,
                  m_input=4, chans_per_col=1, context=None):
-        if chans_per_col != 1:
-            raise ValueError("IRON ObjectFifo API only supports chans_per_col=1; C=2 needs raw-aiex BD chains")
+        # chans_per_col = F independent ingress fifos per column (= F shim MM2S/col)
         self.cols = tuple(cols)
         self.embed_dim = embed_dim
         self.group_size = group_size
@@ -28,7 +27,7 @@ class AIEDmaFanoutProbe(AIEOperatorBase):
     def get_artifacts(self, prefix="dma_fanout_"):
         operator_dir = Path(__file__).parent
         E, g = self.embed_dim, self.group_size
-        base = f"{prefix}n{len(self.cols)}_c{'_'.join(map(str, self.cols))}"
+        base = f"{prefix}n{len(self.cols)}_f{self.chans_per_col}_c{'_'.join(map(str, self.cols))}"
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
             import_path=operator_dir / "design.py",
