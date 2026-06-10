@@ -905,6 +905,53 @@ static void _lf_dual_gemv(uint32_t m, uint32_t row_offset,
     }
 }
 
+// K-STREAMING BROADCAST Gate/Up (#33): keeps the existing 4608B weight element and
+// the 128-call loop (NO topology change). Each call = one K-chunk (N=32 outputs ×
+// KC=EMBED_DIM/NCHUNK columns, COLUMN-MAJOR signed int4). j = element index:
+// block=j/NCHUNK, chunk=j%NCHUNK. Accumulates a per-block float partial across the
+// NCHUNK chunks (dense _gemv_bcast_w2 over KC cols + 2 accs), flushes to
+// lf_left/right_buf[block*32] on the last chunk. silu/down downstream unchanged.
+static float lf_bc_partial[32] __attribute__((aligned(64)));
+
+template <uint32_t N, uint32_t G, uint32_t NCHUNK>
+static void _gate_up_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
+                                 const bfloat16 *__restrict x, int phase) {
+    constexpr uint32_t KC = EMBED_DIM / NCHUNK;     // columns this chunk
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint32_t chunk = j % NCHUNK;
+    const uint32_t block = j / NCHUNK;
+    const bfloat16 *xc = x + chunk * KC;            // this chunk's activation slice
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(a + KC * N / 2);
+    aie::accum<accfloat, N> acc = aie::zeros<accfloat, N>();
+    for (uint32_t kg = 0; kg < KC / G; kg++) {
+        aie::vector<bfloat16, G> xv = aie::load_v<G>(xc + kg * G);
+        aie::accum<accfloat, N> g0 = aie::zeros<accfloat, N>();
+        aie::accum<accfloat, N> g1 = aie::zeros<accfloat, N>();
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (uint32_t k = 0; k < G; k += 2) {
+            const int4 *wp = reinterpret_cast<const int4 *>(a + (kg * G + k) * (N / 2));
+            aie::vector<int4, 2 * N> w2 = aie::load_v<2 * N>(wp);
+            aie::vector<bfloat16, 2 * N> wbf2 = aie::to_float<bfloat16>(aie::unpack(w2), 0);
+            g0 = aie::mac(g0, wbf2.template extract<N>(0), aie::broadcast<bfloat16, N>(xv[k]));
+            g1 = aie::mac(g1, wbf2.template extract<N>(1), aie::broadcast<bfloat16, N>(xv[k + 1]));
+        }
+        aie::accum<accfloat, N> gacc = aie::add(g0, g1);
+        aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
+        acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
+    }
+    // accumulate this chunk's scaled partial into the running float partial
+    aie::vector<float, N> cur = acc.template to_vector<float>();
+    if (chunk != 0)
+        cur = aie::add(cur, aie::load_v<N>(lf_bc_partial));
+    if (chunk == NCHUNK - 1) {
+        bfloat16 *dest = (phase == 0) ? lf_left_buf : lf_right_buf;
+        aie::accum<accfloat, N> facc; facc.from_vector(cur);     // float vec → bf16
+        aie::store_v(dest + block * N, facc.template to_vector<bfloat16>());
+    } else {
+        aie::store_v(lf_bc_partial, cur);
+    }
+}
+
 extern "C" {
 
 // Gate/Up entry: phase 0 → lf_left_buf, phase 1 → lf_right_buf.
@@ -914,17 +961,10 @@ void layer_fused_gate_up_bf16(
     _lf_dual_gemv<32, GROUP_SIZE, EMBED_DIM>(m, row_offset, a, b, phase);
 }
 
-// BROADCAST Gate/Up (#33): same lf_left/right_buf interface but the dense
-// outer-product GEMV (_gemv_bcast_w2, -23% vs dot). `n` outputs (multiple of 32),
-// weights COLUMN-MAJOR signed int4 per 32-block: [K*16 bytes][32*(K/G) bf16] each.
-// Writes n outputs to dest+row_offset. silu/down downstream are unchanged.
 void layer_fused_gate_up_bcast_bf16(
-        uint32_t n, uint32_t row_offset,
+        uint32_t j, uint32_t /*unused*/,
         const uint8_t *a, const bfloat16 *b, int phase) {
-    bfloat16 *dest = (phase == 0) ? lf_left_buf : lf_right_buf;
-    const uint32_t blk = EMBED_DIM * 32 / 2 + 32 * (EMBED_DIM / GROUP_SIZE) * 2;
-    for (uint32_t o = 0; o < n; o += 32)
-        _gemv_bcast_w2<32, GROUP_SIZE, EMBED_DIM>(a + (o / 32) * blk, b, dest + row_offset + o);
+    _gate_up_bcast_chunk<32, GROUP_SIZE, EMBED_DIM / 256>(j, a, b, phase);
 }
 
 // Fused SiLU*Mul: out[i] = silu(lf_left_buf[i]) * lf_right_buf[i].
