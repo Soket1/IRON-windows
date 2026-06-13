@@ -1012,8 +1012,16 @@ void layer_fused_silu_mul_static_bf16(uint32_t m_output) {
         // exp(-gate) = exp2(-gate * log2e): use accum multiply so .to_vector<float>() works
         // aie::mul(bf16, bf16) → accum<accfloat,VEC>; .to_vector<float>() available on accum
         aie::vector<bfloat16, VEC> mlog2e = aie::broadcast<bfloat16, VEC>(-1.4426950408f);
-        aie::vector<bfloat16, VEC> exp_neg =
-            aie::exp2<bfloat16>(aie::mul(l, mlog2e).template to_vector<float>());
+        // OVERFLOW FIX: for large negative gate, -gate*log2e is large positive and
+        // exp2 overflows bf16 (max exp ~2^127) → inf → poisons the whole cross-tile
+        // down reduce (one inf hidden unit makes ALL outputs inf). Clamp the exp2
+        // argument to 80 (exp2(80)≈1.2e24, sigmoid≈0 there, mathematically correct
+        // since sigmoid(gate→-inf)=0). Real decode activations (|x|≈2.14) push some
+        // gate units to ~-113 → arg ~163 without this clamp.
+        aie::vector<float, VEC> exp_arg = aie::mul(l, mlog2e).template to_vector<float>();
+        aie::vector<float, VEC> arg_cap = aie::broadcast<float, VEC>(80.0f);
+        exp_arg = aie::min(exp_arg, arg_cap);
+        aie::vector<bfloat16, VEC> exp_neg = aie::exp2<bfloat16>(exp_arg);
         // sigmoid = 1 / (1 + exp(-gate)); aie::add(bf16,bf16) returns vector<bfloat16>
         aie::vector<bfloat16, VEC> denom = aie::add(r1, exp_neg);
         aie::vector<bfloat16, VEC> sig   = aie::inv(denom);
@@ -1091,12 +1099,18 @@ void layer_fused_down_v2_static_bf16(
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     c_out += row_offset;
 
-    const uint4 *weights_packed = reinterpret_cast<const uint4 *>(a_in);
+    // SIGNED int4 down weights = (nibble-8) two's complement, matching ggml Q4_0
+    // dequant (nib-8)*scale. The host packs (nib-8)&0xF; int4 unpack sign-extends
+    // for free (same trick as _lf_dual_gemv gate/up). Using uint4 here was the
+    // FFN16 garbage bug: it computed nib*scale, off by +8*scale*activation, and
+    // the bias can't be host-corrected because the down activation (silu*up)
+    // lives only on-chip.
+    const int4 *weights_packed = reinterpret_cast<const int4 *>(a_in);
     const uint8_t *scale_bytes = a_in + m * DK / 2;
     const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(scale_bytes);
 
     for (uint32_t row = 0; row < m; row++) {
-        const uint4 *row_weights = weights_packed + row * DK / 2;
+        const int4 *row_weights = weights_packed + row * DK / 2;
         const bfloat16 *row_scales = scales + row * groups_per_row;
         const bfloat16 *b_ptr = lf_silu_buf;             // <-- activation = static
 
@@ -1111,23 +1125,23 @@ void layer_fused_down_v2_static_bf16(
                     bfloat16 sf_a = row_scales[g];
                     aie::vector<bfloat16, block_size> sf_a_bc =
                         aie::broadcast<bfloat16, block_size>(sf_a);
-                    aie::vector<uint4, block_size> I0_a =
+                    aie::vector<int4, block_size> I0_a =
                         aie::load_v<block_size>(row_weights);
                     row_weights += block_size / 2;
                     bfloat16 sf_b = row_scales[g + 1];
                     aie::vector<bfloat16, block_size> sf_b_bc =
                         aie::broadcast<bfloat16, block_size>(sf_b);
-                    aie::vector<uint4, block_size> I0_b =
+                    aie::vector<int4, block_size> I0_b =
                         aie::load_v<block_size>(row_weights);
                     row_weights += block_size / 2;
-                    aie::vector<uint8, block_size> a8_a = aie::unpack(I0_a);
-                    aie::vector<uint16, block_size> a16_a = aie::unpack(a8_a);
+                    aie::vector<int8, block_size> a8_a = aie::unpack(I0_a);
+                    aie::vector<int16, block_size> a16_a = aie::unpack(a8_a);
                     aie::vector<bfloat16, block_size> abf_a =
                         aie::to_float<bfloat16>(a16_a, 0);
                     aie::vector<bfloat16, block_size> w_a =
                         aie::mul(abf_a, sf_a_bc).template to_vector<bfloat16>();
-                    aie::vector<uint8, block_size> a8_b = aie::unpack(I0_b);
-                    aie::vector<uint16, block_size> a16_b = aie::unpack(a8_b);
+                    aie::vector<int8, block_size> a8_b = aie::unpack(I0_b);
+                    aie::vector<int16, block_size> a16_b = aie::unpack(a8_b);
                     aie::vector<bfloat16, block_size> abf_b =
                         aie::to_float<bfloat16>(a16_b, 0);
                     aie::vector<bfloat16, block_size> w_b =
@@ -1149,10 +1163,10 @@ void layer_fused_down_v2_static_bf16(
                         aie::broadcast<bfloat16, block_size>(sf);
                     AIE_LOOP_MIN_ITERATION_COUNT(blocks_per_group)
                     for (uint32_t blk = 0; blk < blocks_per_group; blk++) {
-                        aie::vector<uint4, block_size> I0 = aie::load_v<block_size>(row_weights);
+                        aie::vector<int4, block_size> I0 = aie::load_v<block_size>(row_weights);
                         row_weights += block_size / 2;
-                        aie::vector<uint8, block_size> as_int8 = aie::unpack(I0);
-                        aie::vector<uint16, block_size> as_int16 = aie::unpack(as_int8);
+                        aie::vector<int8, block_size> as_int8 = aie::unpack(I0);
+                        aie::vector<int16, block_size> as_int16 = aie::unpack(as_int8);
                         aie::vector<bfloat16, block_size> as_bf16 =
                             aie::to_float<bfloat16>(as_int16, 0);
                         aie::vector<bfloat16, block_size> w_dequant =
