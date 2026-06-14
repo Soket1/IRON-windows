@@ -6,13 +6,12 @@ Forked from decode_front. One dispatch: Q-GEMV -> REAL interleaved RoPE(Q, all h
 The output BO is OUTPUT-FIRST (bo0) so xclbin_replay can dump it, and its layout
 [col0_512 | col1_512 | col2_512 | col3_512] byte-matches decode_back_mono's ATTN input.
 
-Differences vs decode_front:
-  * rope kernel = rope_il.o (-DINTERLEAVED) fed a REAL per-position cos/sin LUT
-    (baked from `pos`, freq_base=10000, no freq_factors) instead of the identity LUT.
-    LUT covers ALL attn_group heads (q_rows-long, the 64-elem head LUT tiled attn_group×),
-    and rope rotates q_rows elements (all heads), not just head_dim (one head).
-  * flowkv compiled with -DMAX_Q_HEADS=attn_group (h8) so attn_group=8 statics don't overflow.
-  * output-first rt.sequence so the attn_out drain lands in bo0.
+RUNTIME LUT: the per-position cos/sin LUT is supplied at runtime, BUNDLED into the tail
+of the activation BO X = [vector(K_gemv) | lut(q_rows)]. The GEMV vector and the LUT thus
+ride ONE shim S2MM into each column tile (no extra channel, 2-S2MM/col gemv-phase cap
+preserved). rope_bundled (rope.cc -DINTERLEAVED -DLUT_OFF=K_gemv) reads the LUT from
+b[LUT_OFF:]. The LUT is the 64-elem interleaved head LUT [cos0,sin0,...,cos31,sin31]
+tiled attn_group× (so all heads rotate), built on host for the token position.
 
   tile (c, 2): GEMV + RoPE → Qi[c]
   tile (c, 3): score_init + score_rope_q(identity) + score_chunk → Ii[c]
@@ -32,7 +31,7 @@ from aie.iron.device import NPU1, NPU2, Tile
 
 def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_size=32,
                          attn_group=8, seq_len=32, chunk_size=None,
-                         m_input=4, num_cols=4, col_offset=2, pos=0):
+                         m_input=4, num_cols=4, col_offset=2):
     if chunk_size is None:
         chunk_size = seq_len
     dev_ty = NPU1() if dev == "npu" else NPU2()
@@ -48,11 +47,11 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
     assert q_rows % m_input == 0
     num_chunks = seq_len // chunk_size
     inter_size = chunk_size * attn_group + 2 * attn_group
+    xb_elems = K_gemv + q_rows                          # vector + bundled LUT
 
     L1_A_ty   = np.ndarray[(packed_tile,), u8]
-    L1_B_ty   = np.ndarray[(K_gemv,), bf]
+    L1_B_ty   = np.ndarray[(xb_elems,), bf]             # [vector | lut], one S2MM
     L1_Q_ty   = np.ndarray[(q_buf_elems,), bf]
-    L1_LUT_ty = np.ndarray[(q_rows,), bf]                 # real interleaved LUT, all heads
     L1_K_ty   = np.ndarray[(chunk_size * head_dim,), bf]
     L1_I_ty   = np.ndarray[(inter_size,), bf]
     L1_V_ty   = np.ndarray[(chunk_size * head_dim,), bf]
@@ -65,21 +64,21 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
 
     # DDR layouts. A-weights: per-column contiguous. K/V: per-column aligned.
     L3_W_ty = np.ndarray[(num_cols * gemv_tiles * packed_tile,), u8]
-    L3_X_ty = np.ndarray[(K_gemv,), bf]                       # shared input vector
+    L3_X_ty = np.ndarray[(xb_elems,), bf]               # shared [vector | lut]
     L3_K_ty = np.ndarray[(num_cols * ahs_elems,), bf]
     L3_V_ty = np.ndarray[(num_cols * ahs_elems,), bf]
     L3_O_ty = np.ndarray[(num_cols * attn_group * head_dim,), bf]
 
     # -------------------------------------------------------------------
-    # Kernels — declared ONCE, shared across all column workers (the flowkv
-    # pattern; declaring per-column redefines the symbol → AIECC error).
+    # Kernels — declared ONCE, shared across all column workers.
     # -------------------------------------------------------------------
     gemv = Kernel(
         "fused_dequant_matvec_v2_bf16",
         f"fused_dequant_gemv_v2_{K_gemv}k_g{group_size}.o",
         [np.int32, np.int32, L1_A_ty, L1_B_ty, L1_Q_ty],
     )
-    rope = Kernel("rope", "rope_il.o", [L1_Q_ty, L1_LUT_ty, L1_Q_ty, np.int32])
+    # rope_bundled reads the LUT from b[LUT_OFF:] (LUT_OFF=K_gemv, set in op.py flags).
+    rope = Kernel("rope_bundled", "rope_il.o", [L1_Q_ty, L1_B_ty, L1_Q_ty, np.int32])
     fkv = f"flowkv_{head_dim}d_h{attn_group}.o"
     s_init  = Kernel("flowkv_score_init_bf16",      fkv, [np.int32])
     s_rope  = Kernel("flowkv_score_rope_q_bf16",    fkv, [L1_Q_ty, np.int32, np.int32])
@@ -98,38 +97,25 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
     Ii  = [ObjectFifo(L1_I_ty, name=f"Ii_{c}", depth=2) for c in range(num_cols)]
     O_f = [ObjectFifo(L1_O_ty, name=f"O_{c}", depth=2) for c in range(num_cols)]
 
-    # REAL interleaved RoPE LUT for token `pos` (freq_base=10000, no freq_factors),
-    # head LUT [cos0,sin0,...,cos31,sin31] tiled attn_group× to cover all q-heads.
-    theta = 10000.0
-    lut_head = np.zeros(head_dim, dtype=np.float32)
-    for i in range(head_dim // 2):
-        ang = pos * (theta ** (-2.0 * i / head_dim))
-        lut_head[2 * i] = np.cos(ang)
-        lut_head[2 * i + 1] = np.sin(ang)
-    rope_lut_data = np.tile(lut_head, attn_group).astype(bfloat16)
-    luts = [Buffer(type=L1_LUT_ty, initial_value=rope_lut_data, name=f"rope_lut_{c}")
-            for c in range(num_cols)]
-
     workers = []
     for c in range(num_cols):
         pc = c + col_offset
 
-        def gemv_body(af, bf_, qf, lut, gemv_fn, rope_fn):
+        def gemv_body(af, bf_, qf, gemv_fn, rope_fn):
             for _ in range_(0xFFFFFFFF):
-                b = bf_.acquire(1)
+                b = bf_.acquire(1)                       # [vector | lut]
                 q = qf.acquire(1)
                 for j in range_(gemv_tiles):
                     a = af.acquire(1)
                     ro = index.casts(T.i32(), j) * m_input
-                    gemv_fn(m_input, ro, a, b, q)
+                    gemv_fn(m_input, ro, a, b, q)        # reads b[0:K_gemv]
                     af.release(1)
-                rope_fn(q, lut, q, q_rows)
+                rope_fn(q, b, q, q_rows)                 # reads lut from b[LUT_OFF:]
                 qf.release(1)
                 bf_.release(1)
 
         workers.append(Worker(
-            gemv_body, [A_f[c].cons(), B_f[c].cons(), Qi[c].prod(), luts[c],
-                        gemv, rope],
+            gemv_body, [A_f[c].cons(), B_f[c].cons(), Qi[c].prod(), gemv, rope],
             placement=Tile(col=pc, row=2)))
 
         def score_body(kf, qf, inf, init_fn, rope_fn, chunk_fn):
@@ -179,8 +165,8 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
             sizes=[1, 1, 1, gemv_tiles * packed_tile], strides=[0, 0, 0, 1])
 
     x_tap = TensorAccessPattern(
-        tensor_dims=(1, K_gemv), offset=0,
-        sizes=[1, 1, 1, K_gemv], strides=[0, 0, 0, 1])
+        tensor_dims=(1, xb_elems), offset=0,
+        sizes=[1, 1, 1, xb_elems], strides=[0, 0, 0, 1])
 
     def kv_tap(c):
         return TensorAccessPattern(
@@ -196,7 +182,7 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
     rt = Runtime()
     with rt.sequence(L3_O_ty, L3_W_ty, L3_X_ty, L3_K_ty, L3_V_ty) as (o, w, x, k, v):
         rt.start(*workers)
-        # phase 1: gemv inputs (A per-col + B broadcast) — 2 S2MM per col
+        # phase 1: gemv inputs (A per-col + B=[vector|lut] broadcast) — 2 S2MM per col
         tg1 = rt.task_group()
         for c in range(num_cols):
             rt.fill(A_f[c].prod(), w, a_tap(c), task_group=tg1)

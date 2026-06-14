@@ -20,7 +20,7 @@ from iron.common import (
 class AIEDecodeFrontAttn(AIEOperatorBase):
     def __init__(self, embed_dim=2048, K_gemv=2048, head_dim=64, group_size=32,
                  attn_group=8, m_input=4, seq_len=32, num_cols=4, col_offset=2,
-                 pos=0, context=None):
+                 context=None):
         self.embed_dim = embed_dim
         self.K = K_gemv
         self.head_dim = head_dim
@@ -30,7 +30,6 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
         self.seq_len = seq_len
         self.num_cols = num_cols
         self.col_offset = col_offset
-        self.pos = pos
         self.xclbin_artifact = None
         self.insts_artifact = None
         AIEOperatorBase.__init__(self, context=context)
@@ -39,7 +38,7 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
         operator_dir = Path(__file__).parent
         base = (f"{prefix}{self.embed_dim}x{self.K}_d{self.head_dim}"
                 f"_g{self.group_size}_s{self.seq_len}_a{self.attn_group}"
-                f"_c{self.num_cols}_p{self.pos}")
+                f"_c{self.num_cols}")
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -57,7 +56,6 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
                 self.m_input,
                 self.num_cols,
                 self.col_offset,
-                self.pos,
             ],
         )
 
@@ -72,7 +70,7 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
             "rope_il.o",
             depends=[SourceArtifact.new(
                 self.context.base_dir / "aie_kernels" / "generic" / "rope.cc")],
-            extra_flags=["-DINTERLEAVED"],
+            extra_flags=["-DINTERLEAVED", f"-DLUT_OFF={self.K}"],
         )
         flowkv_obj = KernelObjectArtifact.new(
             f"flowkv_{self.head_dim}d_h{self.attn_group}.o",
@@ -107,7 +105,7 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
         # OUTPUT-FIRST: attn_out is bo0 (col-major [col0|col1|col2|col3]).
         self.add_buffer("output", nc * self.attn_group * self.head_dim, dtype=bfloat16)
         self.add_buffer("packed_weights", nc * gemv_tiles * packed_tile, dtype=np.uint8)
-        self.add_buffer("vector", self.K, dtype=bfloat16)
+        self.add_buffer("vector", self.K + q_rows, dtype=bfloat16)  # [vector | lut]
         self.add_buffer("K_cache", nc * ahs_elems, dtype=bfloat16)
         self.add_buffer("V_cache", nc * ahs_elems, dtype=bfloat16)
         self.add_kernel("decode_front_attn", self.xclbin_artifact,

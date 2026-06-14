@@ -79,4 +79,21 @@ void rope(bfloat16 *input, bfloat16 *lut, bfloat16 *output, int32_t dims)
         input, lut, output, dims); // For the interleaved method used in the Llama paper
 #endif
 }
+
+#ifdef LUT_OFF
+// RoPE where the cos/sin LUT is BUNDLED into the input-vector buffer at offset
+// LUT_OFF (elements). Lets one shim S2MM carry both the GEMV activation vector
+// (vec_lut[0:LUT_OFF]) and the per-position LUT (vec_lut[LUT_OFF:]), so a tile
+// already streaming the vector for GEMV gets the LUT for free (no extra channel).
+void rope_bundled(bfloat16 *qin, bfloat16 *vec_lut, bfloat16 *output, int32_t dims)
+{
+    event0();
+#if defined(TWO_HALVES)
+    rope_kernel_two_halves<bfloat16, 16>(qin, vec_lut + LUT_OFF, output, dims);
+#elif defined(INTERLEAVED)
+    rope_kernel_interleaved<bfloat16, 16>(qin, vec_lut + LUT_OFF, output, dims);
+#endif
+    event1();
+}
+#endif
 }
