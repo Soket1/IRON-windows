@@ -19,13 +19,14 @@ from iron.common import (
 
 class AIEDecodeFrontAttn(AIEOperatorBase):
     def __init__(self, embed_dim=2048, K_gemv=2048, head_dim=64, group_size=32,
-                 attn_group=8, m_input=4, seq_len=32, num_cols=4, col_offset=2,
-                 context=None):
+                 attn_group=4, num_kv_heads=8, m_input=4, seq_len=32, num_cols=4,
+                 col_offset=2, context=None):
         self.embed_dim = embed_dim
         self.K = K_gemv
         self.head_dim = head_dim
         self.group_size = group_size
         self.attn_group = attn_group
+        self.num_kv_heads = num_kv_heads
         self.m_input = m_input
         self.seq_len = seq_len
         self.num_cols = num_cols
@@ -38,7 +39,7 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
         operator_dir = Path(__file__).parent
         base = (f"{prefix}{self.embed_dim}x{self.K}_d{self.head_dim}"
                 f"_g{self.group_size}_s{self.seq_len}_a{self.attn_group}"
-                f"_c{self.num_cols}")
+                f"_kv{self.num_kv_heads}_c{self.num_cols}")
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -51,6 +52,7 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
                 self.head_dim,
                 self.group_size,
                 self.attn_group,
+                self.num_kv_heads,
                 self.seq_len,
                 None,                # chunk_size -> seq_len
                 self.m_input,
@@ -91,7 +93,7 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
         self.add_artifacts([self.xclbin_artifact, self.insts_artifact])
 
     def set_up_runtime(self):
-        nc = self.num_cols
+        ng = self.num_kv_heads                     # DDR buffers sized per kv-head group
         groups = self.K // self.group_size
         packed_tile = self.m_input * self.K // 2 + self.m_input * groups * 2
         q_rows = self.attn_group * self.head_dim
@@ -102,12 +104,12 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
         ahs = int((raw_head + 63) / 64) * 64
         ahs_elems = ahs // dts
 
-        # OUTPUT-FIRST: attn_out is bo0 (col-major [col0|col1|col2|col3]).
-        self.add_buffer("output", nc * self.attn_group * self.head_dim, dtype=bfloat16)
-        self.add_buffer("packed_weights", nc * gemv_tiles * packed_tile, dtype=np.uint8)
+        # OUTPUT-FIRST: attn_out is bo0, [grp0_qheads | grp1 | ...] over num_kv_heads.
+        self.add_buffer("output", ng * self.attn_group * self.head_dim, dtype=bfloat16)
+        self.add_buffer("packed_weights", ng * gemv_tiles * packed_tile, dtype=np.uint8)
         self.add_buffer("vector", self.K + q_rows, dtype=bfloat16)  # [vector | lut]
-        self.add_buffer("K_cache", nc * ahs_elems, dtype=bfloat16)
-        self.add_buffer("V_cache", nc * ahs_elems, dtype=bfloat16)
+        self.add_buffer("K_cache", ng * ahs_elems, dtype=bfloat16)
+        self.add_buffer("V_cache", ng * ahs_elems, dtype=bfloat16)
         self.add_kernel("decode_front_attn", self.xclbin_artifact,
                         self.xclbin_artifact.kernel_name, self.insts_artifact)
         self.add_to_runlist("decode_front_attn", "output", "packed_weights",
