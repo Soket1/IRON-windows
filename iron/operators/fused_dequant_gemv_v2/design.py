@@ -23,7 +23,7 @@ from aie.iron.device import NPU1, NPU2, Tile
 
 
 def my_fused_dequant_matvec_v2(dev, cols, M, K, m_input, m_output=None, group_size=32,
-                               col_offset=2, compute_row=2):
+                               col_offset=None, compute_row=2):
     if m_output is None:
         m_output = m_input
 
@@ -45,7 +45,13 @@ def my_fused_dequant_matvec_v2(dev, cols, M, K, m_input, m_output=None, group_si
     # FFLM puts its 4-col INT4 GEMV array on the CENTRAL columns (2-5) in a
     # single core row, not left-packed at col 0. NPU2 compute tiles span
     # cols 0-7 x rows 2-5 (verified via device.get_compute_tiles). col_offset
-    # shifts the array right to match FFLM geometry.
+    # shifts the array right to match FFLM geometry. When not given, center the
+    # `cols`-wide array within the 8 columns: cols=4 -> offset 2 (cols 2-5),
+    # cols=8 -> offset 0 (cols 0-7). This keeps the FFLM geometry for the common
+    # 4-col case while still allowing a full 8-col build (the original pre-FFLM
+    # layout) without overflowing.
+    if col_offset is None:
+        col_offset = (8 - cols) // 2
     assert col_offset + cols <= 8, "compute array overflows 8 columns"
     assert compute_row in (2, 3, 4, 5), "NPU2 compute rows are 2-5"
 
