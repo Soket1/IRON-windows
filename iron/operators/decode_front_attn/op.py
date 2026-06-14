@@ -61,12 +61,16 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
             ],
         )
 
+        # SIGNED int4 GEMV: the Q-proj output is consumed on-chip (no host
+        # bias-comp hook), so the Q4_0 -8 must be applied on-chip. Host packs
+        # (nib-8)&0xF; the kernel sign-extends -> (nib-8)*scale.
         gemv_obj = KernelObjectArtifact.new(
-            f"fused_dequant_gemv_v2_{self.K}k_g{self.group_size}.o",
+            f"fused_dequant_gemv_v2_signed_{self.K}k_g{self.group_size}.o",
             depends=[SourceArtifact.new(
                 self.context.base_dir / "aie_kernels" / "aie2p"
                 / "fused_dequant_gemv_v2.cc")],
-            extra_flags=[f"-DDIM_K={self.K}", f"-DGROUP_SIZE={self.group_size}"],
+            extra_flags=[f"-DDIM_K={self.K}", f"-DGROUP_SIZE={self.group_size}",
+                         "-DWEIGHT_SIGNED"],
         )
         rope_obj = KernelObjectArtifact.new(
             "rope_il.o",

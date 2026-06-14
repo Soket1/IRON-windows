@@ -28,6 +28,21 @@
 #include <stdint.h>
 #include <type_traits>
 
+// Weight nibble interpretation. Default = UNSIGNED (kernel computes nib*scale;
+// the host applies the Q4_0 -8 bias-compensation after the GEMV). With
+// -DWEIGHT_SIGNED the nibbles are SIGNED int4 (sign-extended on unpack), so the
+// kernel computes (nib-8)*scale directly on-chip when the host packs (nib-8)&0xF
+// — required when the GEMV output is consumed on-chip (no host bias-comp hook).
+#ifdef WEIGHT_SIGNED
+using wnib_t = int4;
+using w8_t   = int8;
+using w16_t  = int16;
+#else
+using wnib_t = uint4;
+using w8_t   = uint8;
+using w16_t  = uint16;
+#endif
+
 // block_size: dequant vector width (must be 32 for aie::unpack)
 // G: group size (compile-time, must be multiple of block_size)
 // DK: K dimension (compile-time for loop count optimization)
@@ -47,13 +62,13 @@ void fused_dequant_matvec(uint32_t m,
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
-    const uint4 *weights_packed = reinterpret_cast<const uint4 *>(a_in);
+    const wnib_t *weights_packed = reinterpret_cast<const wnib_t *>(a_in);
     const uint8_t *scale_bytes = a_in + m * DK / 2;
     const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(scale_bytes);
 
     event0();
     for (uint32_t row = 0; row < m; row++) {
-        const uint4 *row_weights = weights_packed + row * DK / 2;
+        const wnib_t *row_weights = weights_packed + row * DK / 2;
         const bfloat16 *row_scales = scales + row * groups_per_row;
         const bfloat16 *b_ptr = b_in;
 
@@ -71,7 +86,7 @@ void fused_dequant_matvec(uint32_t m,
                     aie::vector<bfloat16, block_size> sf_a_bc =
                         aie::broadcast<bfloat16, block_size>(sf_a);
 
-                    aie::vector<uint4, block_size> I0_a =
+                    aie::vector<wnib_t, block_size> I0_a =
                         aie::load_v<block_size>(row_weights);
                     row_weights += block_size / 2;
 
@@ -80,21 +95,21 @@ void fused_dequant_matvec(uint32_t m,
                     aie::vector<bfloat16, block_size> sf_b_bc =
                         aie::broadcast<bfloat16, block_size>(sf_b);
 
-                    aie::vector<uint4, block_size> I0_b =
+                    aie::vector<wnib_t, block_size> I0_b =
                         aie::load_v<block_size>(row_weights);
                     row_weights += block_size / 2;
 
                     // Unpack chain A
-                    aie::vector<uint8, block_size> a8_a = aie::unpack(I0_a);
-                    aie::vector<uint16, block_size> a16_a = aie::unpack(a8_a);
+                    aie::vector<w8_t, block_size> a8_a = aie::unpack(I0_a);
+                    aie::vector<w16_t, block_size> a16_a = aie::unpack(a8_a);
                     aie::vector<bfloat16, block_size> abf_a =
                         aie::to_float<bfloat16>(a16_a, 0);
                     aie::vector<bfloat16, block_size> w_a =
                         aie::mul(abf_a, sf_a_bc).template to_vector<bfloat16>();
 
                     // Unpack chain B
-                    aie::vector<uint8, block_size> a8_b = aie::unpack(I0_b);
-                    aie::vector<uint16, block_size> a16_b = aie::unpack(a8_b);
+                    aie::vector<w8_t, block_size> a8_b = aie::unpack(I0_b);
+                    aie::vector<w16_t, block_size> a16_b = aie::unpack(a8_b);
                     aie::vector<bfloat16, block_size> abf_b =
                         aie::to_float<bfloat16>(a16_b, 0);
                     aie::vector<bfloat16, block_size> w_b =
@@ -121,11 +136,11 @@ void fused_dequant_matvec(uint32_t m,
 
                     AIE_LOOP_MIN_ITERATION_COUNT(blocks_per_group)
                     for (uint32_t blk = 0; blk < blocks_per_group; blk++) {
-                        aie::vector<uint4, block_size> I0 = aie::load_v<block_size>(row_weights);
+                        aie::vector<wnib_t, block_size> I0 = aie::load_v<block_size>(row_weights);
                         row_weights += block_size / 2;
 
-                        aie::vector<uint8, block_size> as_int8 = aie::unpack(I0);
-                        aie::vector<uint16, block_size> as_int16 = aie::unpack(as_int8);
+                        aie::vector<w8_t, block_size> as_int8 = aie::unpack(I0);
+                        aie::vector<w16_t, block_size> as_int16 = aie::unpack(as_int8);
                         aie::vector<bfloat16, block_size> as_bf16 =
                             aie::to_float<bfloat16>(as_int16, 0);
                         aie::vector<bfloat16, block_size> w_dequant =

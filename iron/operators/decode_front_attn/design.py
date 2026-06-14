@@ -81,7 +81,7 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
     # -------------------------------------------------------------------
     gemv = Kernel(
         "fused_dequant_matvec_v2_bf16",
-        f"fused_dequant_gemv_v2_{K_gemv}k_g{group_size}.o",
+        f"fused_dequant_gemv_v2_signed_{K_gemv}k_g{group_size}.o",
         [np.int32, np.int32, L1_A_ty, L1_B_ty, L1_Q_ty],
     )
     rope = Kernel("rope_bundled", "rope_il.o", [L1_Q_ty, L1_B_ty, L1_Q_ty, np.int32])
