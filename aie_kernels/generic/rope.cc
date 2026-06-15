@@ -85,6 +85,11 @@ void rope(bfloat16 *input, bfloat16 *lut, bfloat16 *output, int32_t dims)
 // LUT_OFF (elements). Lets one shim S2MM carry both the GEMV activation vector
 // (vec_lut[0:LUT_OFF]) and the per-position LUT (vec_lut[LUT_OFF:]), so a tile
 // already streaming the vector for GEMV gets the LUT for free (no extra channel).
+// `dims` = q_rows (all heads). The bundle tail also carries actual_seq_len at
+// vec_lut[LUT_OFF + dims], which we copy into the Q buffer's metadata slot
+// (output[dims + HEAD_DIM_FOR_SEQ]) so the flowkv score kernel can mask the
+// padded KV cache. HEAD_DIM_FOR_SEQ = the per-head dim (= LUT length / heads);
+// flowkv reads actual at output[q_rows + head_dim].
 void rope_bundled(bfloat16 *qin, bfloat16 *vec_lut, bfloat16 *output, int32_t dims)
 {
     event0();
@@ -92,6 +97,13 @@ void rope_bundled(bfloat16 *qin, bfloat16 *vec_lut, bfloat16 *output, int32_t di
     rope_kernel_two_halves<bfloat16, 16>(qin, vec_lut + LUT_OFF, output, dims);
 #elif defined(INTERLEAVED)
     rope_kernel_interleaved<bfloat16, 16>(qin, vec_lut + LUT_OFF, output, dims);
+#endif
+#ifdef SEQ_META
+    // actual_seq_len bf16 lives at the end of the bundle (after vector+LUT) and
+    // must land at output[q_rows + head_dim] where flowkv_score_rope_q reads it.
+    // SEQ_META = head_dim (per-head). LUT length == dims (q_rows), so the seq
+    // value is at vec_lut[LUT_OFF + dims]; write it to output[dims + SEQ_META].
+    output[dims + SEQ_META] = vec_lut[LUT_OFF + dims];
 #endif
     event1();
 }

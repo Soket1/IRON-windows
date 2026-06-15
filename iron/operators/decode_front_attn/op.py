@@ -76,7 +76,8 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
             "rope_il.o",
             depends=[SourceArtifact.new(
                 self.context.base_dir / "aie_kernels" / "generic" / "rope.cc")],
-            extra_flags=["-DINTERLEAVED", f"-DLUT_OFF={self.K}"],
+            extra_flags=["-DINTERLEAVED", f"-DLUT_OFF={self.K}",
+                         f"-DSEQ_META={self.head_dim}"],
         )
         flowkv_obj = KernelObjectArtifact.new(
             f"flowkv_{self.head_dim}d_h{self.attn_group}.o",
@@ -111,7 +112,7 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
         # OUTPUT-FIRST: attn_out is bo0, [grp0_qheads | grp1 | ...] over num_kv_heads.
         self.add_buffer("output", ng * self.attn_group * self.head_dim, dtype=bfloat16)
         self.add_buffer("packed_weights", ng * gemv_tiles * packed_tile, dtype=np.uint8)
-        self.add_buffer("vector", self.K + q_rows, dtype=bfloat16)  # [vector | lut]
+        self.add_buffer("vector", self.K + q_rows + 16, dtype=bfloat16)  # [vector|lut|seq(pad16)]
         self.add_buffer("K_cache", ng * ahs_elems, dtype=bfloat16)
         self.add_buffer("V_cache", ng * ahs_elems, dtype=bfloat16)
         self.add_kernel("decode_front_attn", self.xclbin_artifact,

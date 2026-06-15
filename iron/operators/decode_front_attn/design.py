@@ -53,7 +53,9 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
     assert q_rows % m_input == 0
     num_chunks = seq_len // chunk_size
     inter_size = chunk_size * attn_group + 2 * attn_group
-    xb_elems = K_gemv + q_rows                          # vector + bundled LUT
+    # vector + bundled LUT + actual_seq_len, padded so the shim DMA length stays
+    # 4-byte (here 16-elem) aligned — an odd +1 element fails aie.dma_bd alignment.
+    xb_elems = K_gemv + q_rows + 16                     # actual_seq_len at [K_gemv+q_rows]
 
     L1_A_ty   = np.ndarray[(packed_tile,), u8]
     L1_B_ty   = np.ndarray[(xb_elems,), bf]             # [vector | lut], one S2MM
