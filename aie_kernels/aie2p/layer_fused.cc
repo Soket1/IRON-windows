@@ -1248,7 +1248,11 @@ void layer_fused_ffn_mono_bf16(
     _qkv_gemv_s4<32, G, E>(m, up_w, x, utmp);
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
-    const uint4 *dw_base = reinterpret_cast<const uint4 *>(down_w);
+    // SIGNED int4 down = (nibble-8) two's complement (ggml Q4_0 (nib-8)*scale).
+    // Host packs (nib-8)&0xF; int4 unpack sign-extends for free, same as gate/up
+    // (_qkv_gemv_s4) and the fixed layer_fused_down_v2_static_bf16. Reading uint4
+    // here (the old bug) gave nib*scale -> garbage on real Q4_0 weights.
+    const int4 *dw_base = reinterpret_cast<const int4 *>(down_w);
     // down scales are PER-OUTPUT (E values, one per output row), shared by all m
     // hidden rows of this chunk (they fall in one hidden quant-group). Layout:
     // down block = [m*E/2 nibble bytes][E bf16 per-output scales].
@@ -1279,10 +1283,10 @@ void layer_fused_ffn_mono_bf16(
             ::aie::accum<accfloat, BS> acc;
             acc.from_vector(::aie::load_v<BS>(down_acc + gg * BS));
             for (uint32_t r = 0; r < m; r++) {
-                ::aie::vector<uint4, BS> I =
+                ::aie::vector<int4, BS> I =
                     ::aie::load_v<BS>(dw_base + r * (E / 2) + gg * (BS / 2));
-                ::aie::vector<uint8, BS> a8 = ::aie::unpack(I);
-                ::aie::vector<uint16, BS> a16 = ::aie::unpack(a8);
+                ::aie::vector<int8, BS> a8 = ::aie::unpack(I);
+                ::aie::vector<int16, BS> a16 = ::aie::unpack(a8);
                 ::aie::vector<bfloat16, BS> abf = ::aie::to_float<bfloat16>(a16, 0);
                 ::aie::vector<bfloat16, BS> wv =
                     ::aie::mul(abf, sf).template to_vector<bfloat16>();          // dequant (no bias)
