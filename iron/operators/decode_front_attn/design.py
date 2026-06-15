@@ -36,7 +36,8 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
                          attn_group=4, num_kv_heads=8, seq_len=32, chunk_size=None,
                          m_input=4, num_cols=4, col_offset=2):
     if chunk_size is None:
-        chunk_size = seq_len
+        chunk_size = 32 if seq_len % 32 == 0 else seq_len   # cap L1 K/V fifo size
+    assert seq_len % chunk_size == 0, "seq_len must be divisible by chunk_size"
     dev_ty = NPU1() if dev == "npu" else NPU2()
     bf = np.dtype[bfloat16]
     u8 = np.dtype[np.uint8]
