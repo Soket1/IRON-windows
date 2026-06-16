@@ -212,31 +212,45 @@ def my_ffn_overlap_probe(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
             tensor_dims=(1, NPHASE * wphase), offset=off,
             sizes=[1, 1, 1, wstream], strides=[0, 0, 0, 1])
 
+    # ELEMENT-ITERATING tap for the raw BD-chain: the Wsrc fifo element is
+    # L1_WS_ty (= TPS*PACKED bytes); the .split() consumer signals its semaphore
+    # ONCE PER ELEMENT. A flat single-blob BD (w_tap) delivers bytes but signals
+    # only once → the split stalls. This pattern iterates WT_PER_TILE times over
+    # element-sized chunks so the DMA fires the producer semaphore per element,
+    # exactly as rt.fill auto-tiles. (Root cause of the chain+split hang.)
+    WS_ELEM = TPS * PACKED
+    def w_tap_iter(ph, c, s):
+        off = ph * wphase + c * wcol + s * wstream
+        return TensorAccessPattern(
+            tensor_dims=(1, NPHASE * wphase), offset=off,
+            sizes=[1, 1, WT_PER_TILE, WS_ELEM], strides=[0, 0, WS_ELEM, 1])
+
     rt = Runtime()
     with rt.sequence(L3_E_ty, L3_W_ty, L3_E_ty) as (o, w, x):
         rt.start(*workers)
         tg = rt.task_group()
 
         if WMODE == "chain":
-            # register each (col,stream) fifo + its shim channel once, then chain
-            # BOTH phases' weight regions as 2 BDs on that ONE channel (FFLM-style).
+            # rt.fill registers each fifo + its shim channel (proven inline_fill_probe
+            # pattern: rt.fill then inline_ops chain on the SAME fifo). The chain emits
+            # ALL NPHASE phases as element-ITERATING BDs so the .split() consumer gets
+            # per-element semaphore signals (the flat single-blob BD stalled the split).
             for c in range(NC):
                 for s in range(SPC):
-                    rt.fill(Wsrc[c][s].prod(), w, w_tap(0, c, s), task_group=tg)
+                    rt.fill(Wsrc[c][s].prod(), w, w_tap_iter(0, c, s), task_group=tg)
 
             def fill_chain(w_rt):
                 w_op = w_rt.op
-                # Configure+start ALL channels FIRST, then await ALL. Serial
-                # start+await per channel DEADLOCKS: awaiting (c,0) needs col c's
-                # tiles to drain, but their PF[c] join also needs rows fed by (c,1)
-                # which hasn't started yet. Concurrent start lets the pipeline flow.
+                # Configure+start ALL channels FIRST, then await ALL (serial
+                # start+await deadlocks: (c,0) await needs col c tiles to drain, but
+                # PF[c] join also needs rows fed by (c,1) not yet started).
                 tasks = []
                 for c in range(NC):
                     for s in range(SPC):
                         task = dma_configure_task_for(f"Wsrc_{c}_{s}", issue_token=True)
                         with bds(task) as bd:
                             for ph in range(NPHASE):
-                                tp = w_tap(ph, c, s)
+                                tp = w_tap_iter(ph, c, s)
                                 with bd[ph]:
                                     shim_dma_bd(w_op, offset=tp.offset,
                                                 sizes=tp.sizes, strides=tp.strides)

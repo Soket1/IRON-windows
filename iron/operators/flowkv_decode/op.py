@@ -132,7 +132,9 @@ class AIEFlowKVDecode(AIEOperatorBase):
         # specializations don't collide in the build cache. The
         # -DHEAD_DIM=N flag selects the static-buffer size and unrolled
         # dot-product chunk count inside flowkv.cc.
-        kernel_obj_name = f"flowkv_{self.head_dim}d.o"
+        _cf = __import__("os").environ.get("FLOWKV_CFLAGS", "")
+        _cf_tag = ("_" + "".join(c for c in _cf if c.isalnum())[:16]) if _cf else ""
+        kernel_obj_name = f"flowkv_{self.head_dim}d{_cf_tag}.o"
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
@@ -148,7 +150,8 @@ class AIEFlowKVDecode(AIEOperatorBase):
                             / "flowkv.cc"
                         )
                     ],
-                    extra_flags=[f"-DHEAD_DIM={self.head_dim}"],
+                    extra_flags=[f"-DHEAD_DIM={self.head_dim}"]
+                    + (__import__("os").environ.get("FLOWKV_CFLAGS", "").split()),
                 ),
             ],
         )

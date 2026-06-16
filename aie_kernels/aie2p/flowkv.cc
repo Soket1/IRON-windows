@@ -227,7 +227,13 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
                 acc = aie::mac(acc, qv, kv);
             }
 
+#ifdef FLOWKV_SCORE_NOREDUCE
+            // PROBE (latency-only, WRONG answer): skip the horizontal reduce_add
+            // to size its cost. Same loads/macs, no 32→1 reduction.
+            bfloat16 score = static_cast<bfloat16>(acc.to_vector<float>()[0] * inv_sqrt_d);
+#else
             bfloat16 score = static_cast<bfloat16>(aie::reduce_add(acc.to_vector<float>()) * inv_sqrt_d);
+#endif
 
             scores_bf16[pos] = score;
             if (static_cast<float>(score) > static_cast<float>(m_chunk_bf16)) {
@@ -251,11 +257,16 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
 
         // Compute exp2 for each score position — one at a time, no float arrays
         for (int pos = 0; pos < eff_chunk; pos++) {
+#ifdef FLOWKV_NOEXP
+            // PROBE (latency-only, WRONG): skip per-position exp2.
+            bfloat16 f_bf16 = scores_bf16[pos];
+#else
             bfloat16 diff = static_cast<bfloat16>((static_cast<float>(scores_bf16[pos]) - m_new) * 1.4453125f);
             aie::vector<bfloat16, 16> diff_vec = aie::broadcast<bfloat16, 16>(diff);
             aie::accum<accfloat, 16> diff_acc(diff_vec);
             aie::vector<bfloat16, 16> exp_result = aie::exp2<bfloat16>(diff_acc.to_vector<float>());
             bfloat16 f_bf16 = exp_result[0];
+#endif
             l_new_bf16 = static_cast<bfloat16>(static_cast<float>(l_new_bf16) + static_cast<float>(f_bf16));
             scores_out[pos * num_q_heads + h] = f_bf16;
         }
@@ -334,6 +345,7 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
             const bfloat16 *v_pos = v_chunk + pos * head_dim;
             aie::vector<float, 16> f_vec = aie::broadcast<float, 16>(f);
 
+#ifndef FLOWKV_NOVALUE
             for (int d = 0; d < head_dim; d += 16) {
                 aie::vector<float, 16> y_vec = aie::load_v<16>(y_head + d);
                 aie::vector<bfloat16, 16> v_vec = aie::load_v<16>(v_pos + d);
@@ -343,6 +355,7 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
                 y_vec = aie::add(y_vec, fv);
                 aie::store_v(y_head + d, y_vec);
             }
+#endif
         }
     }
 
