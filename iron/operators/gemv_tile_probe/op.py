@@ -59,7 +59,7 @@ class AIEGemvTileProbe(AIEOperatorBase):
             relay_obj = KernelObjectArtifact.new(
                 "layer_fused_relay.o",
                 depends=[SourceArtifact.new(Path(
-                    r"C:\llama.cpp-xdna\dev_notes\track_a_build\handasm_probe\gemv_m2.s"))],
+                    r"C:\llama.cpp-xdna\dev_notes\track_a_build\handasm_probe\bcast_gemv.s"))],
                 extra_flags=[],
             )
         else:
