@@ -26,7 +26,8 @@ class AIEGemvTileProbe(AIEOperatorBase):
                 "dot": "layer_fused_gemv_dot_tile_bf16",
                 "floor": "layer_fused_gemv_floor_tile_bf16",
                 "floor_reg": "layer_fused_gemv_floor_reg_tile_bf16",
-                "floor_reg2": "layer_fused_gemv_floor_reg2_tile_bf16"}[self.kernel]
+                "floor_reg2": "layer_fused_gemv_floor_reg2_tile_bf16",
+                "handasm": "layer_fused_gemv_handasm_tile_bf16"}[self.kernel]
 
     def get_artifacts(self, prefix="gemv_tile_"):
         operator_dir = Path(__file__).parent
@@ -50,12 +51,24 @@ class AIEGemvTileProbe(AIEOperatorBase):
         for _tok in _os.environ.get("GEMV_MLLVM", "").split():
             relay_flags += ["-mllvm", _tok]
         relay_flags += _os.environ.get("GEMV_CFLAGS", "").split()
-        relay_obj = KernelObjectArtifact.new(
-            "layer_fused_relay.o",
-            depends=[SourceArtifact.new(
-                self.context.base_dir / "aie_kernels" / "aie2p" / "layer_fused.cc")],
-            extra_flags=relay_flags,
-        )
+        if self.kernel == "handasm":
+            # Hand-written AIE2P assembly (#32 density path). Same output .o name
+            # ("layer_fused_relay.o") and same 3-arg ABI (ws=p0,x=p1,out=p2) so
+            # design.py links it unchanged; clang assembles .s by extension
+            # (-std=c++20 is ignored for asm).
+            relay_obj = KernelObjectArtifact.new(
+                "layer_fused_relay.o",
+                depends=[SourceArtifact.new(Path(
+                    r"C:\llama.cpp-xdna\dev_notes\track_a_build\handasm_probe\gemv_handasm.s"))],
+                extra_flags=[],
+            )
+        else:
+            relay_obj = KernelObjectArtifact.new(
+                "layer_fused_relay.o",
+                depends=[SourceArtifact.new(
+                    self.context.base_dir / "aie_kernels" / "aie2p" / "layer_fused.cc")],
+                extra_flags=relay_flags,
+            )
         xclbin_artifact = XclbinArtifact.new(f"{base}.xclbin",
                                              depends=[mlir_artifact, relay_obj])
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
