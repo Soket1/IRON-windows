@@ -16,6 +16,12 @@ GQA via TEMPORAL BATCHING: num_batches = num_kv_heads // num_cols; the rt.sequen
 the batches in ONE dispatch. Because everything but placement matches decode_front_attn,
 a numeric PASS proves the center->edge Q relay + the edge score/value placement. RoPE stays
 on the (now center) GEMV tile for parity; relocating it to the edge is a later refinement.
+
+fuse_sv=True merges score+value onto ONE edge tile (K/V time-muxed on one fifo to fit the
+2-S2MM cap). NOTE: this is CORRECT ONLY for a SINGLE chunk (seq <= chunk_size). With >1
+chunk the per-chunk score->value interleave breaks the online-softmax (value does not
+rescale its accumulator when the running max updates across chunks), so fuse_sv is a dead
+end for growing context. Use the default 2-stage path for multi-chunk correctness.
 """
 import numpy as np
 from ml_dtypes import bfloat16
@@ -24,14 +30,15 @@ import aie.dialects.index as index
 from aie.dialects.aie import T
 from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2, Tile
 
 
 def my_decode_attn_split(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_size=32,
                          attn_group=4, num_kv_heads=8, seq_len=32, chunk_size=None,
-                         m_input=4, num_cols=2, center_col_offset=2, edge_col_offset=6):
+                         m_input=4, num_cols=2, center_col_offset=2, edge_col_offset=6,
+                         fuse_sv=False):
     if chunk_size is None:
         chunk_size = 32 if seq_len % 32 == 0 else seq_len
     assert seq_len % chunk_size == 0, "seq_len must be divisible by chunk_size"
@@ -92,10 +99,22 @@ def my_decode_attn_split(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
 
     A_f = [ObjectFifo(L1_A_ty, name=f"A_{c}", depth=2) for c in range(num_cols)]
     B_f = [ObjectFifo(L1_B_ty, name=f"B_{c}", depth=1) for c in range(num_cols)]
-    K_f = [ObjectFifo(L1_K_ty, name=f"K_{c}", depth=2) for c in range(num_cols)]
-    V_f = [ObjectFifo(L1_V_ty, name=f"V_{c}", depth=2) for c in range(num_cols)]
+    if fuse_sv:
+        # fused tile would need K+Q+V = 3 S2MM > 2 cap. K and V are the SAME shape
+        # (chunk_size*head_dim), so time-mux them onto ONE fifo: fill K then V, the
+        # fused body acquires it twice/chunk (K for score, V for value). 1 S2MM.
+        KV_f = [ObjectFifo(L1_K_ty, name=f"KV_{c}", depth=4) for c in range(num_cols)]
+    else:
+        K_f = [ObjectFifo(L1_K_ty, name=f"K_{c}", depth=2) for c in range(num_cols)]
+        V_f = [ObjectFifo(L1_V_ty, name=f"V_{c}", depth=2) for c in range(num_cols)]
     Qi  = [ObjectFifo(L1_Q_ty, name=f"Qi_{c}", depth=2) for c in range(num_cols)]  # center→edge relay
-    Ii  = [ObjectFifo(L1_I_ty, name=f"Ii_{c}", depth=2) for c in range(num_cols)]
+    if not fuse_sv:
+        Ii = [ObjectFifo(L1_I_ty, name=f"Ii_{c}", depth=2) for c in range(num_cols)]
+    else:
+        # fused score+value on ONE edge tile: Ii is a tile-local scratch buffer
+        # (score_chunk writes it, value_accum reads it — no inter-tile fifo).
+        Ii_buf = [Buffer(type=L1_I_ty, initial_value=np.zeros(inter_size, dtype=bfloat16),
+                         name=f"Ii_buf_{c}") for c in range(num_cols)]
     O_f = [ObjectFifo(L1_O_ty, name=f"O_{c}", depth=2) for c in range(num_cols)]
 
     workers = []
@@ -120,41 +139,69 @@ def my_decode_attn_split(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
             gemv_body, [A_f[c].cons(), B_f[c].cons(), Qi[c].prod(), gemv, rope],
             placement=Tile(col=cc, row=2)))
 
-        def score_body(kf, qf, inf, init_fn, rope_fn, chunk_fn):
-            for _ in range_(0xFFFFFFFF):
-                init_fn(attn_group)
-                q = qf.acquire(1)
-                rope_fn(q, attn_group, head_dim)
-                for _ in range_(num_chunks):
-                    k = kf.acquire(1)
-                    it = inf.acquire(1)
-                    chunk_fn(q, k, it, attn_group, head_dim, chunk_size)
-                    kf.release(1)
-                    inf.release(1)
-                qf.release(1)
+        if not fuse_sv:
+            def score_body(kf, qf, inf, init_fn, rope_fn, chunk_fn):
+                for _ in range_(0xFFFFFFFF):
+                    init_fn(attn_group)
+                    q = qf.acquire(1)
+                    rope_fn(q, attn_group, head_dim)
+                    for _ in range_(num_chunks):
+                        k = kf.acquire(1)
+                        it = inf.acquire(1)
+                        chunk_fn(q, k, it, attn_group, head_dim, chunk_size)
+                        kf.release(1)
+                        inf.release(1)
+                    qf.release(1)
 
-        workers.append(Worker(
-            score_body, [K_f[c].cons(), Qi[c].cons(), Ii[c].prod(),
-                         s_init, s_rope, s_chunk],
-            placement=Tile(col=ec, row=2)))
+            workers.append(Worker(
+                score_body, [K_f[c].cons(), Qi[c].cons(), Ii[c].prod(),
+                             s_init, s_rope, s_chunk],
+                placement=Tile(col=ec, row=2)))
 
-        def value_body(vf, inf, of, init_fn, accum_fn, norm_fn):
-            for _ in range_(0xFFFFFFFF):
-                init_fn(attn_group, head_dim)
-                for _ in range_(num_chunks):
-                    it = inf.acquire(1)
-                    v = vf.acquire(1)
-                    accum_fn(it, v, attn_group, head_dim, chunk_size)
-                    inf.release(1)
-                    vf.release(1)
-                o = of.acquire(1)
-                norm_fn(o, attn_group, head_dim)
-                of.release(1)
+            def value_body(vf, inf, of, init_fn, accum_fn, norm_fn):
+                for _ in range_(0xFFFFFFFF):
+                    init_fn(attn_group, head_dim)
+                    for _ in range_(num_chunks):
+                        it = inf.acquire(1)
+                        v = vf.acquire(1)
+                        accum_fn(it, v, attn_group, head_dim, chunk_size)
+                        inf.release(1)
+                        vf.release(1)
+                    o = of.acquire(1)
+                    norm_fn(o, attn_group, head_dim)
+                    of.release(1)
 
-        workers.append(Worker(
-            value_body, [V_f[c].cons(), Ii[c].cons(), O_f[c].prod(),
-                         v_init, v_accum, v_norm],
-            placement=Tile(col=ec, row=3)))
+            workers.append(Worker(
+                value_body, [V_f[c].cons(), Ii[c].cons(), O_f[c].prod(),
+                             v_init, v_accum, v_norm],
+                placement=Tile(col=ec, row=3)))
+        else:
+            # FUSED score+value on ONE edge tile (col ec, row 2). Ii is a tile-local
+            # scratch buffer (no inter-tile fifo). Per chunk: score writes ii, value
+            # reads it immediately (the standard flash-attention interleave).
+            def attn_body(kvf, qf, of, ii, s_init_fn, s_rope_fn, s_chunk_fn,
+                          v_init_fn, v_accum_fn, v_norm_fn):
+                for _ in range_(0xFFFFFFFF):
+                    s_init_fn(attn_group)
+                    q = qf.acquire(1)
+                    s_rope_fn(q, attn_group, head_dim)
+                    v_init_fn(attn_group, head_dim)
+                    for _ in range_(num_chunks):
+                        k = kvf.acquire(1)          # K chunk (time-mux slot 1)
+                        s_chunk_fn(q, k, ii, attn_group, head_dim, chunk_size)
+                        kvf.release(1)
+                        v = kvf.acquire(1)          # V chunk (time-mux slot 2)
+                        v_accum_fn(ii, v, attn_group, head_dim, chunk_size)
+                        kvf.release(1)
+                    qf.release(1)
+                    o = of.acquire(1)
+                    v_norm_fn(o, attn_group, head_dim)
+                    of.release(1)
+
+            workers.append(Worker(
+                attn_body, [KV_f[c].cons(), Qi[c].cons(), O_f[c].prod(),
+                            Ii_buf[c], s_init, s_rope, s_chunk, v_init, v_accum, v_norm],
+                placement=Tile(col=ec, row=2)))
 
     # Runtime: temporal-batched per-(batch,col) taps indexed by group g. OUTPUT-FIRST.
     def a_tap(g):
@@ -191,8 +238,14 @@ def my_decode_attn_split(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
             tg2 = rt.task_group()
             for c in range(num_cols):
                 g = b * num_cols + c
-                rt.fill(K_f[c].prod(), k, kv_tap(g), task_group=tg2)  # edge shim
-                rt.fill(V_f[c].prod(), v, kv_tap(g), task_group=tg2)  # edge shim
+                if fuse_sv:
+                    # time-mux K then V onto the SAME edge fifo (1 S2MM); the fused
+                    # body acquires it twice/chunk (K for score, V for value).
+                    rt.fill(KV_f[c].prod(), k, kv_tap(g), task_group=tg2)
+                    rt.fill(KV_f[c].prod(), v, kv_tap(g), task_group=tg2)
+                else:
+                    rt.fill(K_f[c].prod(), k, kv_tap(g), task_group=tg2)  # edge shim
+                    rt.fill(V_f[c].prod(), v, kv_tap(g), task_group=tg2)  # edge shim
             rt.finish_task_group(tg2)
             tg3 = rt.task_group()
             for c in range(num_cols):

@@ -19,7 +19,7 @@ from iron.common import (
 class AIEDecodeAttnSplit(AIEOperatorBase):
     def __init__(self, embed_dim=2048, K_gemv=2048, head_dim=64, group_size=32,
                  attn_group=4, num_kv_heads=8, m_input=4, seq_len=32, num_cols=2,
-                 center_col_offset=2, edge_col_offset=6, context=None):
+                 center_col_offset=2, edge_col_offset=6, fuse_sv=False, context=None):
         self.embed_dim = embed_dim
         self.K = K_gemv
         self.head_dim = head_dim
@@ -31,6 +31,7 @@ class AIEDecodeAttnSplit(AIEOperatorBase):
         self.num_cols = num_cols
         self.center_col_offset = center_col_offset
         self.edge_col_offset = edge_col_offset
+        self.fuse_sv = fuse_sv
         self.xclbin_artifact = None
         self.insts_artifact = None
         AIEOperatorBase.__init__(self, context=context)
@@ -40,7 +41,8 @@ class AIEDecodeAttnSplit(AIEOperatorBase):
         base = (f"{prefix}{self.embed_dim}x{self.K}_d{self.head_dim}"
                 f"_g{self.group_size}_s{self.seq_len}_a{self.attn_group}"
                 f"_kv{self.num_kv_heads}_c{self.num_cols}"
-                f"_cc{self.center_col_offset}_ec{self.edge_col_offset}")
+                f"_cc{self.center_col_offset}_ec{self.edge_col_offset}"
+                f"{'_fsv' if self.fuse_sv else ''}")
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -60,6 +62,7 @@ class AIEDecodeAttnSplit(AIEOperatorBase):
                 self.num_cols,
                 self.center_col_offset,
                 self.edge_col_offset,
+                self.fuse_sv,
             ],
         )
 
