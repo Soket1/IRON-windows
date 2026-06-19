@@ -31,4 +31,14 @@ void attn_concat2_bf16(const bfloat16 *__restrict a,
         out[half + i] = b[i];
 }
 
+void attn_copy_bf16(const bfloat16 *__restrict in,
+                    bfloat16 *__restrict out, int32_t n) {
+    constexpr int VEC = 16;
+    int chunks = n / VEC;
+    for (int i = 0; i < chunks; i++)
+        ::aie::store_v(out + i * VEC, ::aie::load_v<VEC>(in + i * VEC));
+    for (int i = chunks * VEC; i < n; i++)
+        out[i] = in[i];
+}
+
 }  // extern "C"
