@@ -534,6 +534,7 @@ flows.append("    aie.flow(%oJ, DMA : 0, %op, DMA : 0)   // O Half0 -> orelay")
 flows.append("    aie.flow(%oK, DMA : 0, %op, DMA : 1)   // O Half1 -> orelay")
 flows.append("    aie.flow(%op, DMA : 0, %nm, DMA : 0)   // O -> ANM")
 flows.append("    aie.flow(%sh2, DMA : 1, %nm, DMA : 1)   // resid+gain -> ANM (2-BD on S2MM1)")
+flows.append("    aie.flow(%nm, DMA : 1, %sh4, DMA : 1)   // s = O+resid (attn-residual) -> arg0 tail")
 # nm drains ffn_in -> mux via packet_flow(17) above (no circuit flow to mux)
 flows_txt = "\n".join(flows) + "\n"
 
@@ -636,6 +637,7 @@ nm = """
     %nm_O = aie.buffer(%nm) {sym_name = "nm_O"} : memref<2048xbf16>
     %nm_R = aie.buffer(%nm) {sym_name = "nm_R"} : memref<2048xbf16>
     %nm_F = aie.buffer(%nm) {sym_name = "nm_F"} : memref<2320xbf16>
+    %nm_FN = aie.buffer(%nm) {sym_name = "nm_FN"} : memref<2320xbf16>
     %nm_gain = aie.buffer(%nm) {sym_name = "nm_gain"} : memref<2048xbf16>
     %nm_Op = aie.lock(%nm, 0) {init = 1 : i32, sym_name = "nm_Op"}
     %nm_Oc = aie.lock(%nm, 1) {init = 0 : i32, sym_name = "nm_Oc"}
@@ -645,6 +647,8 @@ nm = """
     %nm_Fc = aie.lock(%nm, 5) {init = 0 : i32, sym_name = "nm_Fc"}
     %nm_Gp = aie.lock(%nm, 6) {init = 1 : i32, sym_name = "nm_Gp"}
     %nm_Gc = aie.lock(%nm, 7) {init = 0 : i32, sym_name = "nm_Gc"}
+    %nm_FNp = aie.lock(%nm, 8) {init = 1 : i32, sym_name = "nm_FNp"}
+    %nm_FNc = aie.lock(%nm, 9) {init = 0 : i32, sym_name = "nm_FNc"}
     %core_nm = aie.core(%nm) {
       %z = arith.constant 0 : index
       %N = arith.constant 9223372036854775807 : index
@@ -655,12 +659,14 @@ nm = """
         aie.use_lock(%nm_Rc, AcquireGreaterEqual, 1)
         aie.use_lock(%nm_Gc, AcquireGreaterEqual, 1)
         aie.use_lock(%nm_Fp, AcquireGreaterEqual, 1)
+        aie.use_lock(%nm_FNp, AcquireGreaterEqual, 1)
         func.call @layer_fused_add_bf16(%nm_O, %nm_R, %nm_F, %ne) : (memref<2048xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) -> ()
-        func.call @layer_fused_rms_norm2_bf16(%nm_F, %nm_gain, %nm_F, %ne) : (memref<2320xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @layer_fused_rms_norm2_bf16(%nm_F, %nm_gain, %nm_FN, %ne) : (memref<2320xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) -> ()
         aie.use_lock(%nm_Op, Release, 1)
         aie.use_lock(%nm_Rp, Release, 1)
         aie.use_lock(%nm_Gp, Release, 1)
         aie.use_lock(%nm_Fc, Release, 1)
+        aie.use_lock(%nm_FNc, Release, 1)
       }
       aie.end
     }
@@ -684,13 +690,20 @@ nm = """
       aie.use_lock(%nm_Gc, Release, 1)
       aie.next_bd ^nr
     ^nm0:
-      %m0 = aie.dma_start(MM2S, 0, ^nf, ^nme)
+      %m0 = aie.dma_start(MM2S, 0, ^nf, ^nm1)
     ^nf:
-      aie.use_lock(%nm_Fc, AcquireGreaterEqual, 1)
+      aie.use_lock(%nm_FNc, AcquireGreaterEqual, 1)
       aie.dma_bd_packet(0, 1)
+      aie.dma_bd(%nm_FN : memref<2320xbf16>, 0, 2048)
+      aie.use_lock(%nm_FNp, Release, 1)
+      aie.next_bd ^nf
+    ^nm1:
+      %m1 = aie.dma_start(MM2S, 1, ^ns, ^nme)
+    ^ns:
+      aie.use_lock(%nm_Fc, AcquireGreaterEqual, 1)
       aie.dma_bd(%nm_F : memref<2320xbf16>, 0, 2048)
       aie.use_lock(%nm_Fp, Release, 1)
-      aie.next_bd ^nf
+      aie.next_bd ^ns
     ^nme:
       aie.end
     }"""
@@ -826,11 +839,12 @@ shim_allocs += "    aie.shim_dma_allocation @Klo_alloc(%sh3, MM2S, 1)\n"
 shim_allocs += "    aie.shim_dma_allocation @Khi_alloc(%sh4, MM2S, 1)\n"
 shim_allocs += "    aie.shim_dma_allocation @Vlo_alloc(%sh5, MM2S, 1)\n"
 shim_allocs += "    aie.shim_dma_allocation @Vhi_alloc(%sh6, MM2S, 1)\n"
+shim_allocs += "    aie.shim_dma_allocation @S_alloc(%sh4, S2MM, 1)\n"
 shim_allocs += "".join(
     f'    aie.shim_dma_allocation @A{h}(%sh{h}, MM2S, 0)\n'
     f'    aie.shim_dma_allocation @P{h}(%sh{h}, S2MM, 0)\n' for h in range(NH))
 
-WT_TY = f"{NH*WT_BYTES}xi8"; P_TY = f"{NH*E}xbf16"; KV_TY = f"{2*NH*KVN}xbf16"
+WT_TY = f"{NH*WT_BYTES}xi8"; P_TY = f"{(NH+1)*E}xbf16"; KV_TY = f"{2*NH*KVN}xbf16"
 HALF_KV = 4 * KVN
 rt = []
 rt.append(f"""      %tx = aiex.dma_configure_task_for @X_alloc {{
@@ -874,7 +888,13 @@ for h in range(NH):
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tp{h})""")
-rt.append("".join(f"      aiex.dma_await_task(%tp{h})\n" for h in range(NH)).rstrip())
+rt.append(f"""      %ts = aiex.dma_configure_task_for @S_alloc {{
+        aie.dma_bd(%arg0 : memref<{P_TY}>, {NH*E}, {E}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {E}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.end
+      }} {{issue_token = true}}
+      aiex.dma_start_task(%ts)""")
+rt.append("".join(f"      aiex.dma_await_task(%tp{h})\n" for h in range(NH)).rstrip()
+          + "\n      aiex.dma_await_task(%ts)")
 rt_body = "\n".join(rt) + "\n"
 rt_args = (f"%arg0: memref<{P_TY}>, %arg1: memref<6416xbf16>, %arg2: memref<{WT_TY}>, "
            f"%arg3: memref<2359296xi8>, %arg4: memref<{KV_TY}>")
