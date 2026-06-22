@@ -809,7 +809,6 @@ void layer_fused_dump_oproj_bf16(
 void layer_fused_rms_norm2_bf16(
         const bfloat16 *input, const bfloat16 *gain,
         bfloat16 *output, int32_t n) {
-    (void)gain;
     constexpr float eps = 1e-5f;
     constexpr int VEC = 16;
     ::aie::vector<float, VEC> acc = ::aie::zeros<float, VEC>();
@@ -829,7 +828,9 @@ void layer_fused_rms_norm2_bf16(
     ::aie::vector<bfloat16, VEC> inv = ::aie::broadcast<bfloat16, VEC>((bfloat16)inv_rms);
     for (int i = 0; i < chunks; i++) {
         ::aie::vector<bfloat16, VEC> v = ::aie::load_v<VEC>(input + i * VEC);
-        ::aie::store_v(output + i * VEC, ::aie::mul(v, inv).template to_vector<bfloat16>());
+        ::aie::vector<bfloat16, VEC> g = ::aie::load_v<VEC>(gain + i * VEC);
+        ::aie::vector<bfloat16, VEC> normed = ::aie::mul(v, inv).template to_vector<bfloat16>();
+        ::aie::store_v(output + i * VEC, ::aie::mul(normed, g).template to_vector<bfloat16>());
     }
     (void)chunks;
 }

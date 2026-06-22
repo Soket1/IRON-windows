@@ -533,7 +533,7 @@ flows.append("    aie.flow(%jB, DMA : 0, %rl, DMA : 1)   // attn Half1 -> relay"
 flows.append("    aie.flow(%oJ, DMA : 0, %op, DMA : 0)   // O Half0 -> orelay")
 flows.append("    aie.flow(%oK, DMA : 0, %op, DMA : 1)   // O Half1 -> orelay")
 flows.append("    aie.flow(%op, DMA : 0, %nm, DMA : 0)   // O -> ANM")
-flows.append("    aie.flow(%sh2, DMA : 1, %nm, DMA : 1)   // resid -> ANM")
+flows.append("    aie.flow(%sh2, DMA : 1, %nm, DMA : 1)   // resid+gain -> ANM (2-BD on S2MM1)")
 # nm drains ffn_in -> mux via packet_flow(17) above (no circuit flow to mux)
 flows_txt = "\n".join(flows) + "\n"
 
@@ -636,13 +636,15 @@ nm = """
     %nm_O = aie.buffer(%nm) {sym_name = "nm_O"} : memref<2048xbf16>
     %nm_R = aie.buffer(%nm) {sym_name = "nm_R"} : memref<2048xbf16>
     %nm_F = aie.buffer(%nm) {sym_name = "nm_F"} : memref<2320xbf16>
-    %nm_gain = aie.buffer(%nm) {sym_name = "nm_gain"} : memref<2048xbf16> = dense<1.000000e+00>
+    %nm_gain = aie.buffer(%nm) {sym_name = "nm_gain"} : memref<2048xbf16>
     %nm_Op = aie.lock(%nm, 0) {init = 1 : i32, sym_name = "nm_Op"}
     %nm_Oc = aie.lock(%nm, 1) {init = 0 : i32, sym_name = "nm_Oc"}
     %nm_Rp = aie.lock(%nm, 2) {init = 1 : i32, sym_name = "nm_Rp"}
     %nm_Rc = aie.lock(%nm, 3) {init = 0 : i32, sym_name = "nm_Rc"}
     %nm_Fp = aie.lock(%nm, 4) {init = 1 : i32, sym_name = "nm_Fp"}
     %nm_Fc = aie.lock(%nm, 5) {init = 0 : i32, sym_name = "nm_Fc"}
+    %nm_Gp = aie.lock(%nm, 6) {init = 1 : i32, sym_name = "nm_Gp"}
+    %nm_Gc = aie.lock(%nm, 7) {init = 0 : i32, sym_name = "nm_Gc"}
     %core_nm = aie.core(%nm) {
       %z = arith.constant 0 : index
       %N = arith.constant 9223372036854775807 : index
@@ -651,11 +653,13 @@ nm = """
       scf.for %it = %z to %N step %one {
         aie.use_lock(%nm_Oc, AcquireGreaterEqual, 1)
         aie.use_lock(%nm_Rc, AcquireGreaterEqual, 1)
+        aie.use_lock(%nm_Gc, AcquireGreaterEqual, 1)
         aie.use_lock(%nm_Fp, AcquireGreaterEqual, 1)
         func.call @layer_fused_add_bf16(%nm_O, %nm_R, %nm_F, %ne) : (memref<2048xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) -> ()
         func.call @layer_fused_rms_norm2_bf16(%nm_F, %nm_gain, %nm_F, %ne) : (memref<2320xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) -> ()
         aie.use_lock(%nm_Op, Release, 1)
         aie.use_lock(%nm_Rp, Release, 1)
+        aie.use_lock(%nm_Gp, Release, 1)
         aie.use_lock(%nm_Fc, Release, 1)
       }
       aie.end
@@ -673,6 +677,11 @@ nm = """
       aie.use_lock(%nm_Rp, AcquireGreaterEqual, 1)
       aie.dma_bd(%nm_R : memref<2048xbf16>, 0, 2048)
       aie.use_lock(%nm_Rc, Release, 1)
+      aie.next_bd ^ng
+    ^ng:
+      aie.use_lock(%nm_Gp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%nm_gain : memref<2048xbf16>, 0, 2048)
+      aie.use_lock(%nm_Gc, Release, 1)
       aie.next_bd ^nr
     ^nm0:
       %m0 = aie.dma_start(MM2S, 0, ^nf, ^nme)
@@ -825,12 +834,12 @@ WT_TY = f"{NH*WT_BYTES}xi8"; P_TY = f"{NH*E}xbf16"; KV_TY = f"{2*NH*KVN}xbf16"
 HALF_KV = 4 * KVN
 rt = []
 rt.append(f"""      %tx = aiex.dma_configure_task_for @X_alloc {{
-        aie.dma_bd(%arg1 : memref<4368xbf16>, 0, 2320, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = 2320, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%arg1 : memref<6416xbf16>, 0, 2320, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = 2320, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%tx)
       %tr = aiex.dma_configure_task_for @R_alloc {{
-        aie.dma_bd(%arg1 : memref<4368xbf16>, 2320, 2048, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = 2048, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%arg1 : memref<6416xbf16>, 2320, 4096, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = 4096, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%tr)
@@ -867,7 +876,7 @@ for h in range(NH):
       aiex.dma_start_task(%tp{h})""")
 rt.append("".join(f"      aiex.dma_await_task(%tp{h})\n" for h in range(NH)).rstrip())
 rt_body = "\n".join(rt) + "\n"
-rt_args = (f"%arg0: memref<{P_TY}>, %arg1: memref<4368xbf16>, %arg2: memref<{WT_TY}>, "
+rt_args = (f"%arg0: memref<{P_TY}>, %arg1: memref<6416xbf16>, %arg2: memref<{WT_TY}>, "
            f"%arg3: memref<2359296xi8>, %arg4: memref<{KV_TY}>")
 
 centers = "".join(center(h) for h in range(NH))

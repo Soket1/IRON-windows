@@ -129,10 +129,10 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         WT_BYTES = self.WT_TILES * PACKED
         KVN = self.seq_len * self.head_dim
 
-        # bo0 output (NH heads x E); bo1 [X(XB) | residual(E)]; bo2 weights A;
-        # bo3 unused Wo placeholder; bo4 KV cache (K then V, NH heads).
+        # bo0 output (NH heads x E); bo1 [X(XB) | residual(E) | ffn_norm gain(E)];
+        # bo2 weights A; bo3 unused Wo placeholder; bo4 KV cache (K then V, NH heads).
         self.add_buffer("output", NH * E, dtype=bfloat16)
-        self.add_buffer("XR", (E + 256 + 16) + E, dtype=bfloat16)
+        self.add_buffer("XR", (E + 256 + 16) + E + E, dtype=bfloat16)
         self.add_buffer("A", NH * WT_BYTES, dtype=np.uint8)
         self.add_buffer("Wo", self.WO_BYTES, dtype=np.uint8)
         self.add_buffer("KV", 2 * NH * KVN, dtype=bfloat16)
