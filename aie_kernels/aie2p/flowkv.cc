@@ -67,6 +67,16 @@ static_assert(HEAD_DIM % 32 == 0, "FlowKV: HEAD_DIM must be multiple of 32");
 #endif
 static_assert(MAX_Q_HEADS >= 1, "FlowKV: MAX_Q_HEADS must be >= 1");
 
+// MAX_CHUNK bounds the per-head score scratch array. chunk_size passed at
+// runtime must be <= MAX_CHUNK. Default 32 keeps legacy single-chunk xclbins
+// byte-identical; the SEQ=256 f3best build passes -DMAX_CHUNK=256 to process
+// the whole sequence in one "chunk" (single-chunk online softmax = standard
+// softmax over all positions).
+#ifndef MAX_CHUNK
+#define MAX_CHUNK 32
+#endif
+static_assert(MAX_CHUNK >= 1, "FlowKV: MAX_CHUNK must be >= 1");
+
 // ---------------------------------------------------------------------------
 // Score tile: static softmax state (only used by score tile Worker)
 // ---------------------------------------------------------------------------
@@ -208,7 +218,7 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
 
         // Phase 1: Compute dot products and find chunk-local max
         // Store scores as bf16 to avoid float array auto-vectorization issues
-        bfloat16 scores_bf16[32]; // chunk_size max = 32
+        bfloat16 scores_bf16[MAX_CHUNK]; // chunk_size max = MAX_CHUNK
         bfloat16 m_chunk_bf16 = static_cast<bfloat16>(-1e30f);
 
         for (int pos = 0; pos < eff_chunk; pos++) {
