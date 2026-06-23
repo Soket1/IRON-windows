@@ -33,7 +33,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
     WO_BYTES = 2359296          # unused arg3 placeholder (Wo lives inside A)
 
     def __init__(self, embed_dim=2048, hidden_dim=8192, K_gemv=2048, head_dim=64,
-                 group_size=32, attn_group=4, num_kv_heads=8, m_input=4, seq_len=32,
+                 group_size=32, attn_group=4, num_kv_heads=8, m_input=4, seq_len=256,
                  num_q_heads=32, context=None):
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
@@ -89,10 +89,11 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
                          f"-DSEQ_META={self.head_dim}"],
         )
         flowkv_obj = KernelObjectArtifact.new(
-            f"flowkv_{self.head_dim}d_h{self.attn_group}.o",
+            f"flowkv_{self.head_dim}d_h{self.attn_group}_c{self.seq_len}.o",
             depends=[SourceArtifact.new(k2p / "flowkv.cc")],
             extra_flags=[f"-DHEAD_DIM={self.head_dim}",
-                         f"-DMAX_Q_HEADS={self.attn_group}"],
+                         f"-DMAX_Q_HEADS={self.attn_group}",
+                         f"-DMAX_CHUNK={self.seq_len}"],
         )
         concat_obj = KernelObjectArtifact.new(
             "attn_concat.o",

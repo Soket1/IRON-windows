@@ -25,7 +25,8 @@ O_TILES = E // M
 WO_BYTES = O_TILES * PACKED                         # full Wo BO = UNUSED arg3 placeholder (O now in A)
 XB = E + 256 + 16
 QI = 256
-SEQ = 32; KVN = SEQ * HD                            # 2048 per head
+SEQ = 256; KVN = SEQ * HD                           # 16384 per head (f3best SEQ=256)
+IT_SZ = SEQ * AG + 2 * AG                           # packed score FIFO: scores(SEQ*AG)+corr(AG)+denom(AG)
 POS = 5; INV = np.float32(0.125); L2E = np.float32(1.4453125)
 
 # --- MLIR generation, verbatim from build_ofold8_f3best.py (returns MLIRTXT) ---
@@ -201,8 +202,8 @@ def score(h):
     p = f"sc{h}"
     return f"""
     %{p}_Qs = aie.buffer(%sc{h}) {{sym_name = "{p}_Qs"}} : memref<322xbf16>
-    %{p}_K  = aie.buffer(%sc{h}) {{sym_name = "{p}_K"}}  : memref<2048xbf16>
-    %{p}_It = aie.buffer(%sc{h}) {{sym_name = "{p}_It"}} : memref<136xbf16>
+    %{p}_K  = aie.buffer(%sc{h}) {{sym_name = "{p}_K"}}  : memref<{KVN}xbf16>
+    %{p}_It = aie.buffer(%sc{h}) {{sym_name = "{p}_It"}} : memref<{IT_SZ}xbf16>
     %{p}_Oh = aie.buffer(%sc{h}) {{sym_name = "{p}_Oh"}} : memref<256xbf16>
     %{p}_Qp = aie.lock(%sc{h}, 0) {{init = 1 : i32, sym_name = "{p}_Qp"}}
     %{p}_Qc = aie.lock(%sc{h}, 1) {{init = 0 : i32, sym_name = "{p}_Qc"}}
@@ -220,7 +221,7 @@ def score(h):
       %c1 = arith.constant 1 : index
       %a4 = arith.constant 4 : i32
       %h64 = arith.constant 64 : i32
-      %s32 = arith.constant 32 : i32
+      %s32 = arith.constant {SEQ} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         // ph1: scoring (Qi from S2MM0-BD0)
         func.call @flowkv_score_init_bf16(%a4) : (i32) -> ()
@@ -228,7 +229,7 @@ def score(h):
         func.call @flowkv_score_rope_q_bf16(%{p}_Qs, %a4, %h64) : (memref<322xbf16>, i32, i32) -> ()
         aie.use_lock(%{p}_Kc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Ip, AcquireGreaterEqual, 1)
-        func.call @flowkv_score_chunk_bf16(%{p}_Qs, %{p}_K, %{p}_It, %a4, %h64, %s32) : (memref<322xbf16>, memref<2048xbf16>, memref<136xbf16>, i32, i32, i32) -> ()
+        func.call @flowkv_score_chunk_bf16(%{p}_Qs, %{p}_K, %{p}_It, %a4, %h64, %s32) : (memref<322xbf16>, memref<{KVN}xbf16>, memref<{IT_SZ}xbf16>, i32, i32, i32) -> ()
         aie.use_lock(%{p}_Kp, Release, 1)
         aie.use_lock(%{p}_Ic, Release, 1)
         aie.use_lock(%{p}_Qp, Release, 1)
@@ -256,14 +257,14 @@ def score(h):
       %s1 = aie.dma_start(S2MM, 1, ^k{h}, ^im{h})
     ^k{h}:
       aie.use_lock(%{p}_Kp, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_K : memref<2048xbf16>, 0, 2048)
+      aie.dma_bd(%{p}_K : memref<{KVN}xbf16>, 0, {KVN})
       aie.use_lock(%{p}_Kc, Release, 1)
       aie.next_bd ^k{h}
     ^im{h}:
       %m0 = aie.dma_start(MM2S, 0, ^io{h}, ^ohm{h})
     ^io{h}:
       aie.use_lock(%{p}_Ic, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_It : memref<136xbf16>, 0, 136)
+      aie.dma_bd(%{p}_It : memref<{IT_SZ}xbf16>, 0, {IT_SZ})
       aie.use_lock(%{p}_Ip, Release, 1)
       aie.next_bd ^io{h}
     ^ohm{h}:
@@ -281,8 +282,8 @@ def score(h):
 def value(h):
     p = f"va{h}"
     return f"""
-    %{p}_Iv = aie.buffer(%va{h}) {{sym_name = "{p}_Iv"}} : memref<136xbf16>
-    %{p}_V  = aie.buffer(%va{h}) {{sym_name = "{p}_V"}}  : memref<2048xbf16>
+    %{p}_Iv = aie.buffer(%va{h}) {{sym_name = "{p}_Iv"}} : memref<{IT_SZ}xbf16>
+    %{p}_V  = aie.buffer(%va{h}) {{sym_name = "{p}_V"}}  : memref<{KVN}xbf16>
     %{p}_Of = aie.buffer(%va{h}) {{sym_name = "{p}_Of"}} : memref<256xbf16>
     %{p}_Ip = aie.lock(%va{h}, 0) {{init = 1 : i32, sym_name = "{p}_Ip"}}
     %{p}_Ic = aie.lock(%va{h}, 1) {{init = 0 : i32, sym_name = "{p}_Ic"}}
@@ -296,12 +297,12 @@ def value(h):
       %c1 = arith.constant 1 : index
       %a4 = arith.constant 4 : i32
       %h64 = arith.constant 64 : i32
-      %s32 = arith.constant 32 : i32
+      %s32 = arith.constant {SEQ} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         func.call @flowkv_value_init_bf16(%a4, %h64) : (i32, i32) -> ()
         aie.use_lock(%{p}_Ic, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Vc, AcquireGreaterEqual, 1)
-        func.call @flowkv_value_accum_bf16(%{p}_Iv, %{p}_V, %a4, %h64, %s32) : (memref<136xbf16>, memref<2048xbf16>, i32, i32, i32) -> ()
+        func.call @flowkv_value_accum_bf16(%{p}_Iv, %{p}_V, %a4, %h64, %s32) : (memref<{IT_SZ}xbf16>, memref<{KVN}xbf16>, i32, i32, i32) -> ()
         aie.use_lock(%{p}_Ip, Release, 1)
         aie.use_lock(%{p}_Vp, Release, 1)
         aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
@@ -314,14 +315,14 @@ def value(h):
       %s0 = aie.dma_start(S2MM, 0, ^iv{h}, ^vs{h})
     ^iv{h}:
       aie.use_lock(%{p}_Ip, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_Iv : memref<136xbf16>, 0, 136)
+      aie.dma_bd(%{p}_Iv : memref<{IT_SZ}xbf16>, 0, {IT_SZ})
       aie.use_lock(%{p}_Ic, Release, 1)
       aie.next_bd ^iv{h}
     ^vs{h}:
       %s1 = aie.dma_start(S2MM, 1, ^v{h}, ^om{h})
     ^v{h}:
       aie.use_lock(%{p}_Vp, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_V : memref<2048xbf16>, 0, 2048)
+      aie.dma_bd(%{p}_V : memref<{KVN}xbf16>, 0, {KVN})
       aie.use_lock(%{p}_Vc, Release, 1)
       aie.next_bd ^v{h}
     ^om{h}:
@@ -404,7 +405,7 @@ def split_memtile(name, tile):
     """1 shim stream (4*2048) -> 4 MM2S slices (2048 each). F3split per-slice locks + 4-BD fill."""
     SL = KVN
     s = f"""
-    %{name}_buf = aie.buffer(%{tile}) {{sym_name = "{name}_buf"}} : memref<8192xbf16>"""
+    %{name}_buf = aie.buffer(%{tile}) {{sym_name = "{name}_buf"}} : memref<{4*KVN}xbf16>"""
     for k in range(4):
         s += f"""
     %{name}_p{k} = aie.lock(%{tile}, {2*k}) {{init = 1 : i32, sym_name = "{name}_p{k}"}}
@@ -414,50 +415,50 @@ def split_memtile(name, tile):
       %s0 = aie.dma_start(S2MM, 0, ^{name}f0, ^{name}m0)
     ^{name}f0:
       aie.use_lock(%{name}_p0, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<8192xbf16>, 0, {SL})
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, 0, {SL})
       aie.use_lock(%{name}_c0, Release, 1)
       aie.next_bd ^{name}f1
     ^{name}f1:
       aie.use_lock(%{name}_p1, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<8192xbf16>, {SL}, {SL})
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {SL}, {SL})
       aie.use_lock(%{name}_c1, Release, 1)
       aie.next_bd ^{name}f2
     ^{name}f2:
       aie.use_lock(%{name}_p2, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<8192xbf16>, {2*SL}, {SL})
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {2*SL}, {SL})
       aie.use_lock(%{name}_c2, Release, 1)
       aie.next_bd ^{name}f3
     ^{name}f3:
       aie.use_lock(%{name}_p3, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<8192xbf16>, {3*SL}, {SL})
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {3*SL}, {SL})
       aie.use_lock(%{name}_c3, Release, 1)
       aie.next_bd ^{name}f0
     ^{name}m0:
       %m0 = aie.dma_start(MM2S, 0, ^{name}o0, ^{name}m1)
     ^{name}o0:
       aie.use_lock(%{name}_c0, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<8192xbf16>, 0, {SL})
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, 0, {SL})
       aie.use_lock(%{name}_p0, Release, 1)
       aie.next_bd ^{name}o0
     ^{name}m1:
       %m1 = aie.dma_start(MM2S, 1, ^{name}o1, ^{name}m2)
     ^{name}o1:
       aie.use_lock(%{name}_c1, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<8192xbf16>, {SL}, {SL})
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {SL}, {SL})
       aie.use_lock(%{name}_p1, Release, 1)
       aie.next_bd ^{name}o1
     ^{name}m2:
       %m2 = aie.dma_start(MM2S, 2, ^{name}o2, ^{name}m3)
     ^{name}o2:
       aie.use_lock(%{name}_c2, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<8192xbf16>, {2*SL}, {SL})
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {2*SL}, {SL})
       aie.use_lock(%{name}_p2, Release, 1)
       aie.next_bd ^{name}o2
     ^{name}m3:
       %m3 = aie.dma_start(MM2S, 3, ^{name}o3, ^{name}e)
     ^{name}o3:
       aie.use_lock(%{name}_c3, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<8192xbf16>, {3*SL}, {SL})
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {3*SL}, {SL})
       aie.use_lock(%{name}_p3, Release, 1)
       aie.next_bd ^{name}o3
     ^{name}e:
@@ -490,12 +491,12 @@ funcs = (
     '    func.func private @oproj_matvec_v2_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) attributes {link_with = "fused_dequant_gemv_v2_oproj_signed_2048k_g32.o"}\n'
     '    func.func private @layer_fused_add_bf16(memref<2048xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'
     '    func.func private @layer_fused_rms_norm2_bf16(memref<2320xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'
-    '    func.func private @flowkv_score_init_bf16(i32) attributes {link_with = "flowkv_64d_h4.o"}\n'
-    '    func.func private @flowkv_score_rope_q_bf16(memref<322xbf16>, i32, i32) attributes {link_with = "flowkv_64d_h4.o"}\n'
-    '    func.func private @flowkv_score_chunk_bf16(memref<322xbf16>, memref<2048xbf16>, memref<136xbf16>, i32, i32, i32) attributes {link_with = "flowkv_64d_h4.o"}\n'
-    '    func.func private @flowkv_value_init_bf16(i32, i32) attributes {link_with = "flowkv_64d_h4.o"}\n'
-    '    func.func private @flowkv_value_accum_bf16(memref<136xbf16>, memref<2048xbf16>, i32, i32, i32) attributes {link_with = "flowkv_64d_h4.o"}\n'
-    '    func.func private @flowkv_value_normalize_bf16(memref<256xbf16>, i32, i32) attributes {link_with = "flowkv_64d_h4.o"}\n')
+    '    func.func private @flowkv_score_init_bf16(i32) attributes {link_with = "flowkv_64d_h4_c256.o"}\n'
+    '    func.func private @flowkv_score_rope_q_bf16(memref<322xbf16>, i32, i32) attributes {link_with = "flowkv_64d_h4_c256.o"}\n'
+    '    func.func private @flowkv_score_chunk_bf16(memref<322xbf16>, memref<16384xbf16>, memref<1032xbf16>, i32, i32, i32) attributes {link_with = "flowkv_64d_h4_c256.o"}\n'
+    '    func.func private @flowkv_value_init_bf16(i32, i32) attributes {link_with = "flowkv_64d_h4_c256.o"}\n'
+    '    func.func private @flowkv_value_accum_bf16(memref<1032xbf16>, memref<16384xbf16>, i32, i32, i32) attributes {link_with = "flowkv_64d_h4_c256.o"}\n'
+    '    func.func private @flowkv_value_normalize_bf16(memref<256xbf16>, i32, i32) attributes {link_with = "flowkv_64d_h4_c256.o"}\n')
 
 flows = []
 flows.append("    aie.flow(%sh0, DMA : 1, %mx, DMA : 0)   // x_bundle -> mux S2MM0")
@@ -919,7 +920,7 @@ class OFold8F3BestEmitter:
         self.validate()
 
     def validate(self):
-        if (self.NH, self.E, self.G, self.M, self.HD, self.AG, self.SEQ) != (8, 2048, 32, 4, 64, 4, 32):
+        if (self.NH, self.E, self.G, self.M, self.HD, self.AG, self.SEQ) != (8, 2048, 32, 4, 64, 4, SEQ):
             raise ValueError('P6.4d-1 emitter is behavior-equivalent for Llama-3.2-1B shape only; '
                              'generalization comes next')
 
