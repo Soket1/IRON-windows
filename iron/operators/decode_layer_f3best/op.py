@@ -53,7 +53,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         operator_dir = Path(__file__).parent
         E, H, g = self.embed_dim, self.hidden_dim, self.group_size
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}")
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc")   # _mc = multi-chunk attn fix (#70/#74)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
