@@ -143,15 +143,27 @@ void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_hea
     *(volatile int32_t *)&g_actual_seq_len; // force re-read (compiler barrier)
     g_score_chunk_counter = 0;
 
-    // Q is already post-RoPE — just copy into the static rotated_q buffer.
+    // Q is already post-RoPE — copy into the static rotated_q buffer.
     // No rotation applied. The angles region is skipped (not needed).
+#ifdef FLOWKV_PRESCALE_Q
+    aie::vector<float, 16> scale_vec = aie::broadcast<float, 16>(HEAD_DIM_INV_SQRT);
+#endif
     for (int h = 0; h < num_q_heads; h++) {
         const bfloat16 *q_head = q_in + h * head_dim;
         bfloat16 *out_head = rotated_q + h * head_dim;
 
         for (int v = 0; v < head_dim; v += 16) {
             aie::vector<bfloat16, 16> q_vec = aie::load_v<16>(q_head + v);
+#ifdef FLOWKV_PRESCALE_Q
+            aie::accum<accfloat, 16> q_acc(q_vec);
+            aie::vector<float, 16> q_f32 = q_acc.to_vector<float>();
+            aie::vector<float, 16> scaled = aie::mul(q_f32, scale_vec);
+            aie::accum<accfloat, 16> scaled_acc(scaled);
+            aie::vector<bfloat16, 16> q_scaled = scaled_acc.to_vector<bfloat16>();
+            aie::store_v(out_head + v, q_scaled);
+#else
             aie::store_v(out_head + v, q_vec);
+#endif
         }
     }
 }
@@ -240,9 +252,17 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
 #ifdef FLOWKV_SCORE_NOREDUCE
             // PROBE (latency-only, WRONG answer): skip the horizontal reduce_add
             // to size its cost. Same loads/macs, no 32→1 reduction.
+  #ifdef FLOWKV_PRESCALE_Q
+            bfloat16 score = static_cast<bfloat16>(acc.to_vector<float>()[0]);
+  #else
             bfloat16 score = static_cast<bfloat16>(acc.to_vector<float>()[0] * inv_sqrt_d);
+  #endif
 #else
+  #ifdef FLOWKV_PRESCALE_Q
+            bfloat16 score = static_cast<bfloat16>(aie::reduce_add(acc.to_vector<float>()));
+  #else
             bfloat16 score = static_cast<bfloat16>(aie::reduce_add(acc.to_vector<float>()) * inv_sqrt_d);
+  #endif
 #endif
 
             scores_bf16[pos] = score;

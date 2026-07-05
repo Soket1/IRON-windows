@@ -53,7 +53,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         operator_dir = Path(__file__).parent
         E, H, g = self.embed_dim, self.hidden_dim, self.group_size
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc")   # _mc = multi-chunk attn fix (#70/#74)
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq")   # _mc = multi-chunk attn fix (#70/#74), _preq = prescaled Q
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -93,7 +93,8 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
             depends=[SourceArtifact.new(k2p / "flowkv.cc")],
             extra_flags=[f"-DHEAD_DIM={self.head_dim}",
                          f"-DMAX_Q_HEADS={self.attn_group}",
-                         f"-DMAX_CHUNK={self.seq_len}"],
+                         f"-DMAX_CHUNK={self.seq_len}",
+                         "-DFLOWKV_PRESCALE_Q=1"],
         )
         concat_obj = KernelObjectArtifact.new(
             "attn_concat.o",
