@@ -285,7 +285,39 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
 
         bfloat16 l_new_bf16 = static_cast<bfloat16>(c_correction * l_old);
 
-        // Compute exp2 for each score position — one at a time, no float arrays
+        // Compute exp2 for each score position.
+#ifdef FLOWKV_VEC_EXP
+        aie::vector<float, 16> m_new_vec = aie::broadcast<float, 16>(m_new);
+        aie::vector<float, 16> log2e_vec = aie::broadcast<float, 16>(1.4453125f);
+
+        for (int pos = 0; pos < eff_chunk; pos += 16) {
+            int rem = eff_chunk - pos;
+            int n = (rem < 16) ? rem : 16;
+
+            alignas(32) bfloat16 tmp_in[16];
+            for (int i = 0; i < 16; i++) {
+                tmp_in[i] = (i < n) ? scores_bf16[pos + i] : m_new_bf16;
+            }
+
+            aie::vector<bfloat16, 16> s_vec = aie::load_v<16>(tmp_in);
+            aie::accum<accfloat, 16> s_acc(s_vec);
+            aie::vector<float, 16> s_f32 = s_acc.to_vector<float>();
+            aie::vector<float, 16> diff_f32 = aie::mul(aie::sub(s_f32, m_new_vec), log2e_vec);
+            aie::vector<bfloat16, 16> exp_result = aie::exp2<bfloat16>(diff_f32);
+
+            alignas(32) bfloat16 tmp_out[16];
+            aie::store_v(tmp_out, exp_result);
+
+            for (int i = 0; i < n; i++) {
+                bfloat16 f_bf16 = tmp_out[i];
+                l_new_bf16 = static_cast<bfloat16>(static_cast<float>(l_new_bf16) + static_cast<float>(f_bf16));
+                scores_out[(pos + i) * num_q_heads + h] = f_bf16;
+            }
+        }
+#else
+        // Scalar form broadcasts one score per vector exp2. Kept as the default
+        // fallback for probes because some AIE2P codegen versions are sensitive
+        // to local vector spill buffers in this loop.
         for (int pos = 0; pos < eff_chunk; pos++) {
 #ifdef FLOWKV_NOEXP
             // PROBE (latency-only, WRONG): skip per-position exp2.
@@ -300,6 +332,7 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
             l_new_bf16 = static_cast<bfloat16>(static_cast<float>(l_new_bf16) + static_cast<float>(f_bf16));
             scores_out[pos * num_q_heads + h] = f_bf16;
         }
+#endif
         // Zero remaining scores for unused positions in this chunk.
         for (int pos = eff_chunk; pos < chunk_size; pos++) {
             scores_out[pos * num_q_heads + h] = static_cast<bfloat16>(0.0f);
