@@ -1010,7 +1010,14 @@ void layer_fused_gate_up_bf16(
 void layer_fused_gate_up_bcast_bf16(
         uint32_t j, uint32_t /*unused*/,
         const uint8_t *a, const bfloat16 *b, int phase) {
+#ifdef STUB_FFN
+    // #78 per-phase stub: skip compute. Static L1 buffers lf_left/right are
+    // overwritten by downstream SiLU anyway — safe to return.
+    (void)j; (void)a; (void)b; (void)phase;
+    return;
+#else
     _gate_up_bcast_chunk<32, GROUP_SIZE, EMBED_DIM / 256>(j, a, b, phase);
+#endif
 }
 
 // Fused SiLU*Mul: out[i] = silu(lf_left_buf[i]) * lf_right_buf[i].
@@ -1040,6 +1047,12 @@ void layer_fused_silu_mul_bf16(bfloat16 *c_out, uint32_t m_output) {
 // no IRON Buffer). Identical math to layer_fused_silu_mul_bf16. The down GEMV
 // below reads lf_silu_buf directly → silu intermediate never leaves this .o.
 void layer_fused_silu_mul_static_bf16(uint32_t m_output) {
+#ifdef STUB_FFN
+    // #78 per-phase stub: gate/up are skipped and down is zeroed, so avoid
+    // spending cycles on SiLU over stale static buffers.
+    (void)m_output;
+    return;
+#else
     constexpr int VEC = 16;
     int chunks = (int)m_output / VEC;
     aie::vector<bfloat16, VEC> r05 = aie::broadcast<bfloat16, VEC>(0.5f);
@@ -1077,6 +1090,7 @@ void layer_fused_silu_mul_static_bf16(uint32_t m_output) {
         aie::store_v(lf_silu_buf + i * VEC, fused);
     }
     (void)chunks;
+#endif
 }
 
 // D1.7 CANARY (env DECODE_DBG_CANARY): overwrite lf_silu_buf with a known
@@ -1260,7 +1274,15 @@ void layer_fused_down_v2_x4_bf16(uint32_t m, uint32_t row_offset, uint32_t nsub,
 void layer_fused_down_bcast_bf16(
         uint32_t j, uint32_t /*unused*/,
         const uint8_t *a, bfloat16 *c_out) {
+#ifdef STUB_FFN
+    // #78 per-phase stub: preserve the output stream/locks but skip down GEMV.
+    // Each down_bcast call emits one 32-row partial block.
+    (void)j; (void)a;
+    for (int i = 0; i < 32; i++) c_out[i] = (bfloat16)0;
+    return;
+#else
     _down_bcast_chunk<32, GROUP_SIZE, 4>(j, a, c_out);
+#endif
 }
 
 // ────────────────────────────────────────────────────────────────────────────

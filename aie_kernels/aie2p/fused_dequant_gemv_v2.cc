@@ -179,8 +179,18 @@ void fused_dequant_matvec_v2_bf16(uint32_t m,
                                    const bfloat16 *__restrict b_in,
                                    bfloat16 *__restrict c_out)
 {
+#if defined(STUB_QKV) || defined(STUB_OPROJ)
+    // #78 per-phase stub: zero output, skip compute. Preserves signature so
+    // MLIR call sites link unchanged; the phase's weight-DMA still flows (BDs
+    // fire, locks cycle) but the GEMV compute is elided. Delta vs full =
+    // the phase's compute cost not hidden under DMA.
+    c_out += row_offset;
+    for (uint32_t i = 0; i < m; i++) c_out[i] = (bfloat16)0;
+    return;
+#else
     c_out += row_offset;
     fused_dequant_matvec<32, GROUP_SIZE, DIM_K>(m, a_in, b_in, c_out);
+#endif
 }
 
 } // extern "C"
