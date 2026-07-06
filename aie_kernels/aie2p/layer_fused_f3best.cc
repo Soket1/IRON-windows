@@ -917,6 +917,47 @@ static void _lf_dual_gemv(uint32_t m, uint32_t row_offset,
 // block=j/NCHUNK, chunk=j%NCHUNK. Accumulates a per-block float partial across the
 // NCHUNK chunks (dense _gemv_bcast_w2 over KC cols + 2 accs), flushes to
 // lf_left/right_buf[block*32] on the last chunk. silu/down downstream unchanged.
+static float lf_qkv_bc_partial[32] __attribute__((aligned(64)));
+
+template <uint32_t N, uint32_t G, uint32_t NCHUNK>
+static void _qkv_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
+                             const bfloat16 *__restrict x, bfloat16 *__restrict c_out) {
+    constexpr uint32_t KC = EMBED_DIM / NCHUNK;
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint32_t chunk = j % NCHUNK;
+    const uint32_t block = j / NCHUNK;
+    const bfloat16 *xc = x + chunk * KC;
+    const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(a + KC * N / 2);
+    aie::accum<accfloat, N> acc = aie::zeros<accfloat, N>();
+    for (uint32_t kg = 0; kg < KC / G; kg++) {
+        aie::vector<bfloat16, G> xv = aie::load_v<G>(xc + kg * G);
+        aie::accum<accfloat, N> g0 = aie::zeros<accfloat, N>();
+        aie::accum<accfloat, N> g1 = aie::zeros<accfloat, N>();
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (uint32_t k = 0; k < G; k += 2) {
+            const int4 *wp = reinterpret_cast<const int4 *>(a + (kg * G + k) * (N / 2));
+            aie::vector<int4, 2 * N> w2 = aie::load_v<2 * N>(wp);
+            aie::vector<bfloat16, 2 * N> wbf2 = aie::to_float<bfloat16>(aie::unpack(w2), 0);
+            g0 = aie::mac(g0, wbf2.template extract<N>(0), aie::broadcast<bfloat16, N>(xv[k]));
+            g1 = aie::mac(g1, wbf2.template extract<N>(1), aie::broadcast<bfloat16, N>(xv[k + 1]));
+        }
+        aie::accum<accfloat, N> gacc = aie::add(g0, g1);
+        aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
+        acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
+    }
+    aie::vector<float, N> cur = acc.template to_vector<float>();
+    if (chunk != 0) {
+        cur = aie::add(cur, aie::load_v<N>(lf_qkv_bc_partial));
+    }
+    if (chunk == NCHUNK - 1) {
+        aie::accum<accfloat, N> facc;
+        facc.from_vector(cur);
+        aie::store_v(c_out + block * N, facc.template to_vector<bfloat16>());
+    } else {
+        aie::store_v(lf_qkv_bc_partial, cur);
+    }
+}
+
 static float lf_bc_partial[32] __attribute__((aligned(64)));
 
 template <uint32_t N, uint32_t G, uint32_t NCHUNK>
@@ -1005,6 +1046,18 @@ void layer_fused_gate_up_bf16(
         uint32_t m, uint32_t row_offset,
         const uint8_t *a, const bfloat16 *b, int phase) {
     _lf_dual_gemv<32, GROUP_SIZE, EMBED_DIM>(m, row_offset, a, b, phase);
+}
+
+void layer_fused_qkv_bcast_bf16(uint32_t j, uint32_t unused,
+                                const uint8_t *a, const bfloat16 *b, bfloat16 *c_out) {
+    (void)unused;
+    _qkv_bcast_chunk<32, GROUP_SIZE, EMBED_DIM / 256>(j, a, b, c_out);
+}
+
+void layer_fused_oproj_bcast_bf16(uint32_t j, uint32_t unused,
+                                  const uint8_t *a, const bfloat16 *b, bfloat16 *c_out) {
+    (void)unused;
+    _qkv_bcast_chunk<32, GROUP_SIZE, EMBED_DIM / 256>(j, a, b, c_out);
 }
 
 void layer_fused_gate_up_bcast_bf16(
