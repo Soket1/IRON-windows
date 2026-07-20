@@ -1,0 +1,76 @@
+From affb8d4fb2c14273d91e3aaa2d2466db30933409 Mon Sep 17 00:00:00 2001
+From: IRON Windows Port <iron-windows-port@localhost>
+Date: Fri, 8 May 2026 00:58:39 +0800
+Subject: [PATCH 02/29] =?UTF-8?q?feat:=20INT8=20GEMM=20dispatch=20in=20ggm?=
+ =?UTF-8?q?l-xdna.cpp=20(Q8=5F0=20weights=20=E2=86=92=20int8=20=E2=86=92?=
+ =?UTF-8?q?=20i32=20=E2=86=92=20f32)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Detect Q8_0 weights → compile INT8 GEMM (dtype_in=i8, dtype_out=i32)
+- Quantize bf16/f32 activations → per-tensor int8
+- Repack Q8_0 weights → per-tensor int8 [K,N] layout
+- Dequantize i32 output → f32 on CPU (act_scale * wt_scale)
+- Persist wt_scale in s_wt_scale_cache for reuse across dispatches
+- Cache key isolation: i8 vs bf16 kernels never collide
+- SwiGLU INT8 paths remain in #if 0 (need gemv_int8 operator)
+---
+ ggml-xdna.cpp | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/ggml-xdna.cpp b/ggml-xdna.cpp
+index 1d00f63..abdf3ad 100644
+--- a/ggml-xdna.cpp
++++ b/ggml-xdna.cpp
+@@ -1114,6 +1114,14 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
+         return;
+     }
+ 
++    // [INT8 GEMM] Persistent weight scale cache: src0->data → per-tensor scale.
++    // Needed because the scale is computed once during weight BO creation but
++    // must be applied on every dispatch for i32→f32 dequantization.
++    // Keyed identically to b_bo_cache (by weight data pointer).
++    // Safe as static (not thread_local): ggml graph_compute dispatches
++    // MUL_MAT nodes sequentially on a single thread.
++    static std::unordered_map<const void *, float> s_wt_scale_cache;
++
+     try {
+         size_t a_elems = M * K;
+         size_t b_elems = N * K;
+@@ -1160,7 +1168,6 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
+         // [INT8 GEMM] Q8_0 weights → repack to per-tensor int8 in [K,N] layout.
+         // Bf16 path: transpose + bf16 convert as before.
+         xrt::bo * b_bo_ptr = nullptr;
+-        float wt_scale = 1.0f;
+         {
+             std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+             auto it = entry->b_bo_cache.find(src0->data);
+@@ -1171,11 +1178,11 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
+                     // [INT8 GEMM] Repack Q8_0 → per-tensor int8 [K, N] row-major.
+                     // xdna_repack_q8_0_to_gemm_int8 transposes ggml's (N, K) to (K, N)
+                     // and returns the per-tensor scale factor.
+-                    wt_scale = xdna_repack_q8_0_to_gemm_int8(
++                    float wt_scale = xdna_repack_q8_0_to_gemm_int8(
+                         (const uint8_t *)src0->data, N, K,
+                         (int8_t *)new_b.map<void*>());
+-                    // Store weight scale in a side channel — we'll use it for
+-                    // output dequantization. For now, log it.
++                    // Persist weight scale for future dequantization.
++                    s_wt_scale_cache[src0->data] = wt_scale;
+                     fprintf(stderr, "ggml-xdna: INT8 GEMM weight scale=%.6f K=%lld N=%lld\n",
+                             wt_scale, (long long)K, (long long)N);
+                 } else if (src0->type == GGML_TYPE_F32) {
+@@ -1221,6 +1228,9 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
+             // INT8 GEMM produces: C[i,j] = sum_k(A_int8[i,k] * B_int8[k,j])
+             // The true float value is: C_f32[i,j] = C_i32[i,j] * act_scale * wt_scale
+             // Convert to f32 for ggml's downstream consumers.
++            float wt_scale = 1.0f;
++            auto sc_it = s_wt_scale_cache.find(src0->data);
++            if (sc_it != s_wt_scale_cache.end()) wt_scale = sc_it->second;
+             const int32_t * c_i32 = (const int32_t *)entry->c_bo->map<void*>();
+             float * dst_f32 = (float *)dst->data;
+             float combined_scale = act_scale * wt_scale;
+-- 
+2.45.2.windows.1
+

@@ -1,0 +1,106 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x7C00C, LENGTH = 0x3FF4
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x400; /* stack */
+/* No tile with memory exists to the south. */
+. = 0x40000;
+. += 0x10000;
+. = 0x50400;
+bq_mem_2_cons_buff_0 = .;
+. += 0x1000;
+. = 0x51400;
+Cqkv_3_buff_0 = .;
+. += 0x4;
+. = 0x54900;
+Cqkv_3_buff_1 = .;
+. += 0x4;
+. = 0x54000;
+Aqkv_3_cons_buff_0 = .;
+. += 0x900;
+. = 0x58000;
+Aqkv_3_cons_buff_1 = .;
+. += 0x900;
+. = 0x5C000;
+_anonymous3 = .;
+. += 0xC;
+. = 0x60400;
+bo_mem_4_cons_buff_0 = .;
+. += 0x1000;
+. = 0x61400;
+Co_4_buff_0 = .;
+. += 0x4;
+. = 0x64900;
+Co_4_buff_1 = .;
+. += 0x4;
+. = 0x64000;
+Ao_4_cons_buff_0 = .;
+. += 0x900;
+. = 0x68000;
+Ao_4_cons_buff_1 = .;
+. += 0x900;
+. = 0x6C000;
+_anonymous12 = .;
+. += 0xC;
+. = 0x70400;
+bq_mem_3_cons_buff_0 = .;
+. += 0x1000;
+. = 0x71400;
+Cqkv_4_buff_0 = .;
+. += 0x4;
+. = 0x74900;
+Cqkv_4_buff_1 = .;
+. += 0x4;
+. = 0x74000;
+Aqkv_4_cons_buff_0 = .;
+. += 0x900;
+. = 0x78000;
+Aqkv_4_cons_buff_1 = .;
+. += 0x900;
+. = 0x7C000;
+_anonymous4 = .;
+. += 0xC;
+  .bss : { *(.bss*) } > data
+}
+INPUT(layer_dense_e2048_h8192_c8_g32_fused.mlir.prj\op0_layer_fused_2048_8192_g32.o)
+PROVIDE(main = core_4_2);

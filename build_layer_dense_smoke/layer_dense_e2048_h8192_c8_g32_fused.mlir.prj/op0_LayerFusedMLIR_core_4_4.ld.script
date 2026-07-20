@@ -1,0 +1,94 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x7D010, LENGTH = 0x2FF0
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x400; /* stack */
+. = 0x58000;
+inter_3_buff_0 = .;
+. += 0x1000;
+. = 0x5C000;
+inter_3_buff_1 = .;
+. += 0x1000;
+. = 0x51600;
+ffi_mem_3_cons_buff_0 = .;
+. += 0x1000;
+. = 0x50400;
+Agu_3_cons_buff_0 = .;
+. += 0x1200;
+. = 0x54000;
+Agu_3_cons_buff_1 = .;
+. += 0x1200;
+. = 0x55200;
+_anonymous11 = .;
+. += 0xC;
+. = 0x70400;
+ffi_L3L2_buff_0 = .;
+. += 0x1000;
+. = 0x74000;
+anm_mem_cons_buff_0 = .;
+. += 0x1000;
+. = 0x78000;
+anm_mem_cons_buff_1 = .;
+. += 0x1000;
+. = 0x7C000;
+anm_mem_cons_buff_2 = .;
+. += 0x1000;
+. = 0x79000;
+o_out_joined_0_cons_buff_0 = .;
+. += 0x10;
+. = 0x7D000;
+o_out_joined_0_cons_buff_1 = .;
+. += 0x10;
+. = 0x71400;
+anm_oout_buf = .;
+. += 0x1000;
+. = 0x75000;
+anm_inpff_buf = .;
+. += 0x1000;
+. = 0x72400;
+_anonymous16 = .;
+. += 0xC;
+  .bss : { *(.bss*) } > data
+}
+INPUT(layer_dense_e2048_h8192_c8_g32_fused.mlir.prj\op0_layer_fused_2048_8192_g32.o)
+PROVIDE(main = core_4_4);

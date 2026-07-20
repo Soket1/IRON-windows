@@ -1,0 +1,121 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x7C200, LENGTH = 0x3E00
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x400; /* stack */
+. = 0x40400;
+out_5_buff_0 = .;
+. += 0x200;
+. = 0x44000;
+out_5_buff_1 = .;
+. += 0x200;
+. = 0x48000;
+in2_5_cons_buff_0 = .;
+. += 0x200;
+. = 0x4C000;
+in2_5_cons_buff_1 = .;
+. += 0x200;
+. = 0x40600;
+in1_5_cons_buff_0 = .;
+. += 0x200;
+. = 0x44200;
+in1_5_cons_buff_1 = .;
+. += 0x200;
+. = 0x50400;
+out_2_buff_0 = .;
+. += 0x200;
+. = 0x54000;
+out_2_buff_1 = .;
+. += 0x200;
+. = 0x58000;
+in2_2_cons_buff_0 = .;
+. += 0x200;
+. = 0x5C000;
+in2_2_cons_buff_1 = .;
+. += 0x200;
+. = 0x50600;
+in1_2_cons_buff_0 = .;
+. += 0x200;
+. = 0x54200;
+in1_2_cons_buff_1 = .;
+. += 0x200;
+. = 0x60400;
+out_7_buff_0 = .;
+. += 0x200;
+. = 0x64000;
+out_7_buff_1 = .;
+. += 0x200;
+. = 0x68000;
+in2_7_cons_buff_0 = .;
+. += 0x200;
+. = 0x6C000;
+in2_7_cons_buff_1 = .;
+. += 0x200;
+. = 0x60600;
+in1_7_cons_buff_0 = .;
+. += 0x200;
+. = 0x64200;
+in1_7_cons_buff_1 = .;
+. += 0x200;
+. = 0x70400;
+out_6_buff_0 = .;
+. += 0x200;
+. = 0x74000;
+out_6_buff_1 = .;
+. += 0x200;
+. = 0x78000;
+in2_6_cons_buff_0 = .;
+. += 0x200;
+. = 0x7C000;
+in2_6_cons_buff_1 = .;
+. += 0x200;
+. = 0x70600;
+in1_6_cons_buff_0 = .;
+. += 0x200;
+. = 0x74200;
+in1_6_cons_buff_1 = .;
+. += 0x200;
+  .bss : { *(.bss*) } > data
+}
+INPUT(smoke_fused_fused.mlir.prj\op1_mul.o)
+PROVIDE(main = core_1_4);

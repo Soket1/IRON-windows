@@ -1,0 +1,97 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x7C00C, LENGTH = 0x3FF4
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x400; /* stack */
+. = 0x44000;
+silu_mem_1_cons_buff_0 = .;
+. += 0x4000;
+. = 0x40400;
+Cd_1_buff_0 = .;
+. += 0x4;
+. = 0x4A400;
+Cd_1_buff_1 = .;
+. += 0x4;
+. = 0x48000;
+Ad_1_cons_buff_0 = .;
+. += 0x2400;
+. = 0x4C000;
+_anonymous10 = .;
+. += 0xC;
+. = 0x54000;
+ffi_mem_2_cons_buff_0 = .;
+. += 0x1000;
+. = 0x58000;
+Cgu_2_buff_0 = .;
+. += 0x10;
+. = 0x5C000;
+Cgu_2_buff_1 = .;
+. += 0x10;
+. = 0x50400;
+Agu_2_cons_buff_0 = .;
+. += 0x2400;
+. = 0x52800;
+_anonymous7 = .;
+. += 0xC;
+/* No tile with memory exists to the north. */
+. = 0x60000;
+. += 0x10000;
+. = 0x74000;
+silu_mem_2_cons_buff_0 = .;
+. += 0x4000;
+. = 0x70400;
+Cd_2_buff_0 = .;
+. += 0x4;
+. = 0x7A400;
+Cd_2_buff_1 = .;
+. += 0x4;
+. = 0x78000;
+Ad_2_cons_buff_0 = .;
+. += 0x2400;
+. = 0x7C000;
+_anonymous11 = .;
+. += 0xC;
+  .bss : { *(.bss*) } > data
+}
+INPUT(post_attn_fused_legacy_e2048_h8192_c4_g32_fused.mlir.prj\op0_post_attn_fused_2048k_g32.o)
+PROVIDE(main = core_2_5);

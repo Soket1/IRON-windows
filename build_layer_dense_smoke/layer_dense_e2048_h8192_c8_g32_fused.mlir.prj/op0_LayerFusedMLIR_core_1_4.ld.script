@@ -1,0 +1,118 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x7D000, LENGTH = 0x3000
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x400; /* stack */
+. = 0x40400;
+bo_mem_1_cons_buff_0 = .;
+. += 0x1000;
+. = 0x41400;
+Co_1_buff_0 = .;
+. += 0x4;
+. = 0x44900;
+Co_1_buff_1 = .;
+. += 0x4;
+. = 0x44000;
+Ao_1_cons_buff_0 = .;
+. += 0x900;
+. = 0x48000;
+Ao_1_cons_buff_1 = .;
+. += 0x900;
+. = 0x4C000;
+_anonymous5 = .;
+. += 0xC;
+. = 0x58000;
+inter_0_buff_0 = .;
+. += 0x1000;
+. = 0x5C000;
+inter_0_buff_1 = .;
+. += 0x1000;
+. = 0x51600;
+ffi_mem_0_cons_buff_0 = .;
+. += 0x1000;
+. = 0x50400;
+Agu_0_cons_buff_0 = .;
+. += 0x1200;
+. = 0x54000;
+Agu_0_cons_buff_1 = .;
+. += 0x1200;
+. = 0x55200;
+_anonymous8 = .;
+. += 0xC;
+. = 0x6C000;
+Cdp_1_buff_0 = .;
+. += 0x4;
+. = 0x60D00;
+Cdp_1_buff_1 = .;
+. += 0x4;
+. = 0x60400;
+Adp_1_cons_buff_0 = .;
+. += 0x900;
+. = 0x64000;
+Adp_1_cons_buff_1 = .;
+. += 0x900;
+. = 0x68000;
+_anonymous13 = .;
+. += 0xC;
+. = 0x78000;
+inter_1_buff_0 = .;
+. += 0x1000;
+. = 0x7C000;
+inter_1_buff_1 = .;
+. += 0x1000;
+. = 0x71600;
+ffi_mem_1_cons_buff_0 = .;
+. += 0x1000;
+. = 0x70400;
+Agu_1_cons_buff_0 = .;
+. += 0x1200;
+. = 0x74000;
+Agu_1_cons_buff_1 = .;
+. += 0x1200;
+. = 0x75200;
+_anonymous9 = .;
+. += 0xC;
+  .bss : { *(.bss*) } > data
+}
+INPUT(layer_dense_e2048_h8192_c8_g32_fused.mlir.prj\op0_layer_fused_2048_8192_g32.o)
+PROVIDE(main = core_1_4);
