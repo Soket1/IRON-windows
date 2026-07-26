@@ -59,6 +59,14 @@ void fused_dequant_matvec(uint32_t m,
     constexpr bool can_double_pump = (groups_per_row >= 2) && (groups_per_row % 2 == 0);
     constexpr uint32_t pump_groups = can_double_pump ? 2 : 1;
     constexpr uint32_t loop_iters = groups_per_row / pump_groups;
+    // Four groups per iteration through two independent load+unpack chains, so
+    // each chain's dequant latency hides under the other's. GEMV_V2_NO_QUAD
+    // drops back to two groups (one chain) for A/B.
+#ifdef GEMV_V2_NO_QUAD
+    constexpr bool use_quad_pump = false;
+#else
+    constexpr bool use_quad_pump = (groups_per_row >= 4) && (groups_per_row % 4 == 0);
+#endif
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
@@ -74,9 +82,57 @@ void fused_dequant_matvec(uint32_t m,
 
         aie::accum<accfloat, block_size> acc = aie::zeros<accfloat, block_size>();
 
-        if constexpr (can_double_pump && blocks_per_group == 1) {
-            // Optimized path: 2 groups per iteration, 1 block per group
-            // Two independent unpack chains for the compiler to interleave.
+        if constexpr (use_quad_pump && blocks_per_group == 1) {
+            // Four groups per iteration through TWO independent 64-nibble
+            // load+unpack chains. Folding the old pair of 32-nibble chains into
+            // one shared 64-nibble chain removed work but also removed the
+            // overlap that hid its latency -- the nop count in the object went
+            // up even as the instruction count went down. This keeps the single
+            // unpack per 64 nibbles and puts the second chain back.
+            AIE_LOOP_MIN_ITERATION_COUNT(groups_per_row / 4)
+            for (uint32_t g = 0; g < groups_per_row; g += 4)
+                AIE_PREPARE_FOR_PIPELINING
+                {
+                    aie::vector<wnib_t, 2 * block_size> I01 =
+                        aie::load_v<2 * block_size>(row_weights);
+                    row_weights += block_size;
+                    aie::vector<wnib_t, 2 * block_size> I23 =
+                        aie::load_v<2 * block_size>(row_weights);
+                    row_weights += block_size;
+
+                    aie::vector<bfloat16, 2 * block_size> d01 =
+                        aie::to_float<bfloat16>(aie::unpack(I01), 0);
+                    aie::vector<bfloat16, 2 * block_size> d23 =
+                        aie::to_float<bfloat16>(aie::unpack(I23), 0);
+
+                    aie::vector<bfloat16, block_size> w0 =
+                        aie::mul(d01.template extract<block_size>(0),
+                                 aie::broadcast<bfloat16, block_size>(row_scales[g]))
+                            .template to_vector<bfloat16>();
+                    aie::vector<bfloat16, block_size> w1 =
+                        aie::mul(d01.template extract<block_size>(1),
+                                 aie::broadcast<bfloat16, block_size>(row_scales[g + 1]))
+                            .template to_vector<bfloat16>();
+                    aie::vector<bfloat16, block_size> w2 =
+                        aie::mul(d23.template extract<block_size>(0),
+                                 aie::broadcast<bfloat16, block_size>(row_scales[g + 2]))
+                            .template to_vector<bfloat16>();
+                    aie::vector<bfloat16, block_size> w3 =
+                        aie::mul(d23.template extract<block_size>(1),
+                                 aie::broadcast<bfloat16, block_size>(row_scales[g + 3]))
+                            .template to_vector<bfloat16>();
+
+                    acc = aie::mac(acc, w0, aie::load_v<block_size>(b_ptr));
+                    b_ptr += block_size;
+                    acc = aie::mac(acc, w1, aie::load_v<block_size>(b_ptr));
+                    b_ptr += block_size;
+                    acc = aie::mac(acc, w2, aie::load_v<block_size>(b_ptr));
+                    b_ptr += block_size;
+                    acc = aie::mac(acc, w3, aie::load_v<block_size>(b_ptr));
+                    b_ptr += block_size;
+                }
+        } else if constexpr (can_double_pump && blocks_per_group == 1) {
+            // 2 groups per iteration, one shared load+unpack chain.
             AIE_LOOP_MIN_ITERATION_COUNT(loop_iters)
             for (uint32_t g = 0; g < groups_per_row; g += 2)
                 AIE_PREPARE_FOR_PIPELINING
