@@ -81,25 +81,25 @@ void fused_dequant_matvec(uint32_t m,
             for (uint32_t g = 0; g < groups_per_row; g += 2)
                 AIE_PREPARE_FOR_PIPELINING
                 {
-                    // --- Chain A: group g ---
                     bfloat16 sf_a = row_scales[g];
                     aie::vector<bfloat16, block_size> sf_a_bc =
                         aie::broadcast<bfloat16, block_size>(sf_a);
-
-                    aie::vector<wnib_t, block_size> I0_a =
-                        aie::load_v<block_size>(row_weights);
-                    row_weights += block_size / 2;
-
-                    // --- Chain B: group g+1 (interleaved) ---
                     bfloat16 sf_b = row_scales[g + 1];
                     aie::vector<bfloat16, block_size> sf_b_bc =
                         aie::broadcast<bfloat16, block_size>(sf_b);
 
+#ifdef GEMV_V2_LEGACY_UNPACK
+                    // A/B reference: two 128-bit loads, each followed by int4 -> int8
+                    // -> int16 -> bf16. Same values as the form below (the int16 hop
+                    // widens the container without changing the integer), kept so the
+                    // two can be measured against each other on one machine state.
+                    aie::vector<wnib_t, block_size> I0_a =
+                        aie::load_v<block_size>(row_weights);
+                    row_weights += block_size / 2;
                     aie::vector<wnib_t, block_size> I0_b =
                         aie::load_v<block_size>(row_weights);
                     row_weights += block_size / 2;
 
-                    // Unpack chain A
                     aie::vector<w8_t, block_size> a8_a = aie::unpack(I0_a);
                     aie::vector<w16_t, block_size> a16_a = aie::unpack(a8_a);
                     aie::vector<bfloat16, block_size> abf_a =
@@ -107,13 +107,35 @@ void fused_dequant_matvec(uint32_t m,
                     aie::vector<bfloat16, block_size> w_a =
                         aie::mul(abf_a, sf_a_bc).template to_vector<bfloat16>();
 
-                    // Unpack chain B
                     aie::vector<w8_t, block_size> a8_b = aie::unpack(I0_b);
                     aie::vector<w16_t, block_size> a16_b = aie::unpack(a8_b);
                     aie::vector<bfloat16, block_size> abf_b =
                         aie::to_float<bfloat16>(a16_b, 0);
                     aie::vector<bfloat16, block_size> w_b =
                         aie::mul(abf_b, sf_b_bc).template to_vector<bfloat16>();
+#else
+
+                    // Both groups in ONE 64-nibble load and ONE unpack: int4 -> int8
+                    // -> bf16, the same shape _lf_dual_gemv uses. The int8 -> int16
+                    // hop this used to take changed no value (same integer, wider
+                    // container) but cost an extra vunpack plus a crunpacksize
+                    // toggle per group, and the two 128-bit loads could not fuse
+                    // into vldb.unpack the way one 256-bit load does.
+                    aie::vector<wnib_t, 2 * block_size> I01 =
+                        aie::load_v<2 * block_size>(row_weights);
+                    row_weights += block_size;
+
+                    aie::vector<w8_t, 2 * block_size> a8_01 = aie::unpack(I01);
+                    aie::vector<bfloat16, 2 * block_size> abf_01 =
+                        aie::to_float<bfloat16>(a8_01, 0);
+
+                    aie::vector<bfloat16, block_size> w_a =
+                        aie::mul(abf_01.template extract<block_size>(0), sf_a_bc)
+                            .template to_vector<bfloat16>();
+                    aie::vector<bfloat16, block_size> w_b =
+                        aie::mul(abf_01.template extract<block_size>(1), sf_b_bc)
+                            .template to_vector<bfloat16>();
+#endif
 
                     // Load activation vectors and MAC
                     aie::vector<bfloat16, block_size> b_a = aie::load_v<block_size>(b_ptr);
