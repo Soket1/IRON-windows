@@ -206,7 +206,15 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
     // If this entire chunk is beyond actual_seq_len, send zero scores
     // (identity for online softmax: scores=0 → exp(0-m)=~0 when m>>0,
     //  correction=1, denominator unchanged).
+#ifdef FLOWKV_SCORE_STUB
+    // PROBE (latency-only, WRONG answer): always take the empty-chunk path, so
+    // the whole dot-product + softmax body is skipped while every output buffer
+    // is still written and every lock still released -- the fabric cannot tell
+    // the difference, so this prices the score stage without risking a stall.
+    if (true) {
+#else
     if (pos_start >= actual_seq) {
+#endif
         for (int i = 0; i < scores_size + num_q_heads * 2; i++)
             packed_out[i] = static_cast<bfloat16>(0.0f);
         // Set denominator to 1.0 to avoid division by zero in normalize.
