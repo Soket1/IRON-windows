@@ -725,6 +725,12 @@ void layer_fused_down_partial_bf16(
 // Elementwise ADD: c[i] = a[i] + b[i]  (residual: o_out + inpL → inpFF).
 void layer_fused_add_bf16(
         const bfloat16 *a, const bfloat16 *b, bfloat16 *c, int32_t n) {
+#ifdef STUB_NM
+    // PROBE (latency-only, WRONG answer): the O+residual add on the nm hub tile,
+    // which sits on the phase2->phase3 boundary. Locks/buffers unchanged.
+    (void)a; (void)b; (void)c; (void)n;
+    return;
+#endif
     constexpr int VEC = 16;
     int chunks = n / VEC;
     AIE_PREPARE_FOR_PIPELINING
@@ -809,6 +815,11 @@ void layer_fused_dump_oproj_bf16(
 void layer_fused_rms_norm2_bf16(
         const bfloat16 *input, const bfloat16 *gain,
         bfloat16 *output, int32_t n) {
+#ifdef STUB_NM
+    // PROBE (latency-only, WRONG answer): see layer_fused_add_bf16.
+    (void)input; (void)gain; (void)output; (void)n;
+    return;
+#endif
     constexpr float eps = 1e-5f;
     constexpr int VEC = 16;
     ::aie::vector<float, VEC> acc = ::aie::zeros<float, VEC>();

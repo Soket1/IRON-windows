@@ -19,6 +19,18 @@ GEMV_T, GU_T = 256 // M, H8 // M
 OPROJ_T = 256 // M                                  # Wo per-head rows = 256/M = 64 (O-fold phase2, m=4)
 DN_SUB = 2
 DN_T = (E // M) // DN_SUB
+# MEASUREMENT KNOB (default 1 = production, byte-identical MLIR). Divides only the
+# FFN part of the weight stream: the three FFN loop bounds and WT_BYTES shrink
+# together while every phase boundary, relay hop and lock protocol stays exactly
+# as it is. Sweeping it separates a FIXED per-boundary cost (the fitted intercept)
+# from raw stream bandwidth (the slope) -- the two explanations for the layer floor
+# sitting above its byte budget. The layer computes a WRONG answer under it, so it
+# is only ever run together with the compute stubs, as a measurement.
+_FFN_DIV = int(__import__("os").environ.get('F3BEST_FFN_DIV', '1'))
+assert GU_T % _FFN_DIV == 0 and DN_T % _FFN_DIV == 0, 'F3BEST_FFN_DIV must divide 256'
+GU_T //= _FFN_DIV
+DN_T //= _FFN_DIV
+assert GU_T == DN_T, 'emitter shares one %cF loop bound for gate/up/down'
 WT_TILES = GEMV_T + OPROJ_T + 2 * GU_T + DN_T       # 64+64+512+256 = 896 (Wq|Wo|gate|up|down)
 WT_BYTES = WT_TILES * PACKED
 O_TILES = E // M
@@ -88,7 +100,7 @@ def center(h):
       %c1 = arith.constant 1 : index
       %c2 = arith.constant 2 : index
       %c64 = arith.constant 64 : index
-      %c256 = arith.constant 256 : index
+      %cF = arith.constant {GU_T} : index
       %m4 = arith.constant 4 : i32
       %qr = arith.constant 256 : i32
       %hc = arith.constant 1024 : i32
@@ -135,7 +147,7 @@ def center(h):
         aie.use_lock(%{p}_Oc, Release, 1)
         // ---- phase 3: FFN (B = ffn_in, A = gate|up|down) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
-        scf.for %j = %c0 to %c256 step %c2 {{
+        scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
           %ro0 = arith.muli %ji0, %m4 : i32
@@ -148,7 +160,7 @@ def center(h):
           func.call @layer_fused_gate_up_bcast_bf16(%ji1, %g0, %{p}_A1, %{p}_B, %g0) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        scf.for %j = %c0 to %c256 step %c2 {{
+        scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
           %ro0 = arith.muli %ji0, %m4 : i32
@@ -164,7 +176,7 @@ def center(h):
         aie.use_lock(%{p}_Bp, Release, 1)
         func.call @layer_fused_silu_mul_static_bf16(%hc) : (i32) -> ()
         aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
-        scf.for %j = %c0 to %c256 step %c2 {{
+        scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
           func.call @layer_fused_down_bcast_bf16(%ji0, %g0, %{p}_A0, %{p}_P) : (i32, i32, memref<4608xi8>, memref<2320xbf16>) -> ()

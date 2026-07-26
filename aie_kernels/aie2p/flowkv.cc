@@ -387,6 +387,14 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
                              int32_t head_dim,
                              int32_t chunk_size)
 {
+#ifdef FLOWKV_VALUE_STUB
+    // PROBE (latency-only, WRONG answer): skip the value accumulation. Its output
+    // buffer is still emitted by flowkv_value_normalize_bf16 and every lock still
+    // cycles, so the fabric is unchanged and the delta prices this stage alone.
+    // Companion to FLOWKV_SCORE_STUB -- score was measured at ~0, value never was.
+    (void)packed_in; (void)v_chunk; (void)num_q_heads; (void)head_dim; (void)chunk_size;
+    return;
+#endif
     event0();
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
@@ -402,15 +410,18 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
         // Save denominator for final normalization
         saved_denom[h] = static_cast<float>(denom_in[h]);
 
-        // Apply correction to accumulated output: Y = C_c * Y_old
         aie::vector<float, 16> corr_vec = aie::broadcast<float, 16>(correction);
+
+#ifdef FLOWKV_VALUE_LEGACY
+        // Memory-resident accumulator: y_head is reloaded and restored on EVERY
+        // position. Kept behind a flag as the A/B reference -- the register form
+        // below is bit-identical (float32 store/reload is exact), so any numeric
+        // difference between the two would mean a codegen bug, not a math change.
         for (int d = 0; d < head_dim; d += 16) {
             aie::vector<float, 16> y_vec = aie::load_v<16>(y_head + d);
             y_vec = aie::mul(y_vec, corr_vec);
             aie::store_v(y_head + d, y_vec);
         }
-
-        // Accumulate: Y += sum_pos( F_c[pos, h] * V[pos, :] )
         for (int pos = 0; pos < chunk_size; pos++) {
             float f = static_cast<float>(scores_in[pos * num_q_heads + h]);
             const bfloat16 *v_pos = v_chunk + pos * head_dim;
@@ -428,6 +439,65 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
             }
 #endif
         }
+#else
+        // value_accum must survive BETWEEN chunk calls, but within one call there
+        // is no reason to spill it once per position: 64 dims = 4 vectors, so the
+        // running output stays in registers for the whole position loop and is
+        // written back once. Same arithmetic, same order, same rounding.
+        // Blocked by 64 dims so register pressure is fixed for HEAD_DIM 64/128/256.
+        int d0 = 0;
+        for (; d0 + 64 <= head_dim; d0 += 64) {
+            aie::vector<float, 16> y0 = aie::mul(aie::load_v<16>(y_head + d0 +  0), corr_vec);
+            aie::vector<float, 16> y1 = aie::mul(aie::load_v<16>(y_head + d0 + 16), corr_vec);
+            aie::vector<float, 16> y2 = aie::mul(aie::load_v<16>(y_head + d0 + 32), corr_vec);
+            aie::vector<float, 16> y3 = aie::mul(aie::load_v<16>(y_head + d0 + 48), corr_vec);
+
+#ifndef FLOWKV_NOVALUE
+            const bfloat16 *v_col = v_chunk + d0;
+            AIE_PREPARE_FOR_PIPELINING
+            for (int pos = 0; pos < chunk_size; pos++) {
+                float f = static_cast<float>(scores_in[pos * num_q_heads + h]);
+                aie::vector<float, 16> f_vec = aie::broadcast<float, 16>(f);
+                const bfloat16 *v_pos = v_col + pos * head_dim;
+
+                aie::accum<accfloat, 16> a0(aie::load_v<16>(v_pos +  0));
+                aie::accum<accfloat, 16> a1(aie::load_v<16>(v_pos + 16));
+                aie::accum<accfloat, 16> a2(aie::load_v<16>(v_pos + 32));
+                aie::accum<accfloat, 16> a3(aie::load_v<16>(v_pos + 48));
+                // aie::mul yields an accum; materialise it into a vector exactly
+                // as the legacy path does, so the arithmetic stays identical.
+                aie::vector<float, 16> p0 = aie::mul(f_vec, a0.to_vector<float>());
+                aie::vector<float, 16> p1 = aie::mul(f_vec, a1.to_vector<float>());
+                aie::vector<float, 16> p2 = aie::mul(f_vec, a2.to_vector<float>());
+                aie::vector<float, 16> p3 = aie::mul(f_vec, a3.to_vector<float>());
+                y0 = aie::add(y0, p0);
+                y1 = aie::add(y1, p1);
+                y2 = aie::add(y2, p2);
+                y3 = aie::add(y3, p3);
+            }
+#endif
+            aie::store_v(y_head + d0 +  0, y0);
+            aie::store_v(y_head + d0 + 16, y1);
+            aie::store_v(y_head + d0 + 32, y2);
+            aie::store_v(y_head + d0 + 48, y3);
+        }
+        // Tail, never taken for HEAD_DIM 64/128/256. Present so a head_dim that
+        // is not a multiple of 64 degrades to the slow form instead of writing
+        // past the 64-block -- silent overrun of value_accum is the same failure
+        // class the MAX_Q_HEADS note above warns about.
+        for (; d0 < head_dim; d0 += 16) {
+            aie::vector<float, 16> y = aie::mul(aie::load_v<16>(y_head + d0), corr_vec);
+#ifndef FLOWKV_NOVALUE
+            for (int pos = 0; pos < chunk_size; pos++) {
+                float f = static_cast<float>(scores_in[pos * num_q_heads + h]);
+                aie::accum<accfloat, 16> a(aie::load_v<16>(v_chunk + pos * head_dim + d0));
+                aie::vector<float, 16> p = aie::mul(aie::broadcast<float, 16>(f), a.to_vector<float>());
+                y = aie::add(y, p);
+            }
+#endif
+            aie::store_v(y_head + d0, y);
+        }
+#endif
     }
 
     event1();
