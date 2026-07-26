@@ -36,6 +36,23 @@ KCH = CHUNK * HD                                    # per-chunk K/V buffer elems
 ITC = CHUNK * AG + 2 * AG                           # per-chunk packed score FIFO
 POS = 5; INV = np.float32(0.125); L2E = np.float32(1.4453125)
 
+# P6 MemTile weight relay: which center columns route weights shim->MemTile(col,1)->core
+# instead of shim->core direct. "" = off (baseline), "0" = col2 only, "0,1,2,3" = all four.
+# Column c owns MemTile ['jA','jB','oJ','oK'][c] at (c+2, 1) and feeds centers t{c} (row2,
+# via S2MM4/MM2S1) and t{c+4} (row3, via S2MM5/MM2S2). Shim assignment is UNCHANGED --
+# @A{h} stays on sh{h} because every shim MM2S1 is already taken by X/R/K/V.
+import os as _os
+_rc = _os.environ.get('F3BEST_MT_RELAY', '').strip()
+RELAY_COLS = sorted({int(x) for x in _rc.split(',') if x.strip() != ''}) if _rc else []
+assert all(0 <= c <= 3 for c in RELAY_COLS), 'F3BEST_MT_RELAY entries must be 0..3'
+# Slots per relay path = the MemTile lookahead depth. depth=2 is bare ping-pong (no
+# lookahead, just an extra store-and-forward hop); the whole point of P6 is a DEEP
+# queue so the core pulls from SRAM while DDR refills behind it. FFLM budgets ~128KB
+# per column for this. Cost per relay MemTile: 2*D slots x 4608B buffer, 4*D locks
+# (cap 64), 4*D BDs (cap 48) on top of the join's 8 locks / 8 BDs.
+RELAY_DEPTH = int(_os.environ.get('F3BEST_MT_DEPTH', '2'))
+assert 2 <= RELAY_DEPTH <= 10, 'F3BEST_MT_DEPTH must be 2..10 (4*D locks <= 64, 4*D+8 BDs <= 48)'
+
 # --- MLIR generation, verbatim from build_ofold8_f3best.py (returns MLIRTXT) ---
 CENTER_COLS = [(2, 2), (3, 2), (4, 2), (5, 2), (2, 3), (3, 3), (4, 3), (5, 3)]
 SCORE_COLS = [(0, 2), (1, 2), (6, 2), (7, 2), (0, 3), (1, 3), (6, 3), (7, 3)]
@@ -350,44 +367,73 @@ def value(h):
     }}"""
 
 
-def join_memtile(name, tile):
+def join_memtile(name, tile, with_weight_relay=False):
+    """Join MemTile: 4 S2MM gather -> 1 MM2S output.
+
+    When with_weight_relay=True (cols 2-5), also adds weight relay channels:
+    - S2MM4-5: receive weight chunks from 2 shim tiles
+    - MM2S1-2: forward weight chunks to 2 core tiles
+    Uses lock indices 8-15 for weight relay (4 lock pairs × 2 paths).
+    """
+    SL = 4608                     # per-weight-chunk bytes (one GEMV tile i8)
     s = f"""
     %{name}_buf = aie.buffer(%{tile}) {{sym_name = "{name}_buf"}} : memref<2048xbf16>"""
     for k in range(4):
         s += f"""
     %{name}_p{k} = aie.lock(%{tile}, {2*k}) {{init = 1 : i32, sym_name = "{name}_p{k}"}}
     %{name}_c{k} = aie.lock(%{tile}, {2*k+1}) {{init = 0 : i32, sym_name = "{name}_c{k}"}}"""
+    D = RELAY_DEPTH
+    if with_weight_relay:
+        # Weight relay buffer: 2 paths x D slots x SL bytes. Deeper D = more lookahead
+        # held in MemTile SRAM while DDR refills behind the core.
+        s += f"""
+    %{name}_wt = aie.buffer(%{tile}) {{sym_name = "{name}_wt"}} : memref<{2*D*SL}xi8>"""
+        # Locks 8.. : per path p in {A,B}, per slot k, a producer/consumer pair.
+        for p in range(2):
+            for k in range(D):
+                base = 8 + 2 * (p * D + k)
+                s += f"""
+    %{name}_w{p}s{k}p = aie.lock(%{tile}, {base}) {{init = 1 : i32, sym_name = "{name}_w{p}s{k}p"}}
+    %{name}_w{p}s{k}c = aie.lock(%{tile}, {base+1}) {{init = 0 : i32, sym_name = "{name}_w{p}s{k}c"}}"""
     s += f"""
-    %{name}_dma = aie.memtile_dma(%{tile}) {{
-      %s0 = aie.dma_start(S2MM, 0, ^{name}g0, ^{name}s1)
-    ^{name}g0:
-      aie.use_lock(%{name}_p0, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<2048xbf16>, 0, {QI})
-      aie.use_lock(%{name}_c0, Release, 1)
-      aie.next_bd ^{name}g0
-    ^{name}s1:
-      %s1 = aie.dma_start(S2MM, 1, ^{name}g1, ^{name}s2)
-    ^{name}g1:
-      aie.use_lock(%{name}_p1, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<2048xbf16>, {QI}, {QI})
-      aie.use_lock(%{name}_c1, Release, 1)
-      aie.next_bd ^{name}g1
-    ^{name}s2:
-      %s2 = aie.dma_start(S2MM, 2, ^{name}g2, ^{name}s3)
-    ^{name}g2:
-      aie.use_lock(%{name}_p2, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<2048xbf16>, {2*QI}, {QI})
-      aie.use_lock(%{name}_c2, Release, 1)
-      aie.next_bd ^{name}g2
-    ^{name}s3:
-      %s3 = aie.dma_start(S2MM, 3, ^{name}g3, ^{name}m0)
-    ^{name}g3:
-      aie.use_lock(%{name}_p3, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<2048xbf16>, {3*QI}, {QI})
-      aie.use_lock(%{name}_c3, Release, 1)
-      aie.next_bd ^{name}g3
+    %{name}_dma = aie.memtile_dma(%{tile}) {{"""
+    # S2MM0-3: join receivers — each subsequent channel needs a label for the previous
+    # channel's next-channel pointer.
+    for ch in range(4):
+        if ch == 3:
+            nxt = f"^{name}w0" if with_weight_relay else f"^{name}m0"
+        else:
+            nxt = f"^{name}s{ch+1}"
+        if ch > 0:
+            s += f"""
+    ^{name}s{ch}:"""
+        s += f"""
+      %s{ch} = aie.dma_start(S2MM, {ch}, ^{name}g{ch}, {nxt})
+    ^{name}g{ch}:
+      aie.use_lock(%{name}_p{ch}, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{name}_buf : memref<2048xbf16>, {ch*QI}, {QI})
+      aie.use_lock(%{name}_c{ch}, Release, 1)
+      aie.next_bd ^{name}g{ch}"""
+    if with_weight_relay:
+        # S2MM4/5: fill path A (-> center row2) and path B (-> center row3), D-slot
+        # cyclic BD chain each. Deeper chain = more weight chunks buffered ahead.
+        for p in range(2):
+            nxt = f"^{name}w1" if p == 0 else f"^{name}m0"
+            s += f"""
+    ^{name}w{p}:
+      %w{p} = aie.dma_start(S2MM, {4+p}, ^{name}w{p}s0, {nxt})"""
+            for k in range(D):
+                s += f"""
+    ^{name}w{p}s{k}:
+      aie.use_lock(%{name}_w{p}s{k}p, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{name}_wt : memref<{2*D*SL}xi8>, {(p*D+k)*SL}, {SL})
+      aie.use_lock(%{name}_w{p}s{k}c, Release, 1)
+      aie.next_bd ^{name}w{p}s{(k+1) % D}"""
+    nxt_mm2s0 = f"^{name}x0" if with_weight_relay else f"^{name}e"
+    # MM2S0: join output
+    s += f"""
     ^{name}m0:
-      %m0 = aie.dma_start(MM2S, 0, ^{name}o0, ^{name}e)
+      %m0 = aie.dma_start(MM2S, 0, ^{name}o0, {nxt_mm2s0})
     ^{name}o0:
       aie.use_lock(%{name}_c0, AcquireGreaterEqual, 1)
       aie.dma_bd(%{name}_buf : memref<2048xbf16>, 0, {QI})
@@ -407,7 +453,22 @@ def join_memtile(name, tile):
       aie.use_lock(%{name}_c3, AcquireGreaterEqual, 1)
       aie.dma_bd(%{name}_buf : memref<2048xbf16>, {3*QI}, {QI})
       aie.use_lock(%{name}_p3, Release, 1)
-      aie.next_bd ^{name}o0
+      aie.next_bd ^{name}o0"""
+    if with_weight_relay:
+        # MM2S1/2: drain path A -> center row2, path B -> center row3 (mirrors the fill chain).
+        for p in range(2):
+            nxt = f"^{name}x1" if p == 0 else f"^{name}e"
+            s += f"""
+    ^{name}x{p}:
+      %x{p} = aie.dma_start(MM2S, {1+p}, ^{name}x{p}s0, {nxt})"""
+            for k in range(D):
+                s += f"""
+    ^{name}x{p}s{k}:
+      aie.use_lock(%{name}_w{p}s{k}c, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{name}_wt : memref<{2*D*SL}xi8>, {(p*D+k)*SL}, {SL})
+      aie.use_lock(%{name}_w{p}s{k}p, Release, 1)
+      aie.next_bd ^{name}x{p}s{(k+1) % D}"""
+    s += f"""
     ^{name}e:
       aie.end
     }}"""
@@ -520,7 +581,17 @@ flows.append("    aie.packet_flow(1) { aie.packet_source<%nm, DMA : 0> aie.packe
 for h in range(NH):
     oj = 'oJ' if h < 4 else 'oK'
     osl = h if h < 4 else h - 4
-    flows.append(f"    aie.flow(%sh{h}, DMA : 0, %t{h}, DMA : 0)   // A{h}")
+    # Weight delivery. Relay columns go shim -> MemTile(col,1) -> core (P6 decoupling);
+    # the rest keep the direct shim -> core flow.
+    rc = h % 4 if h % 4 in RELAY_COLS else None
+    if rc is not None:
+        mt_name = ['jA', 'jB', 'oJ', 'oK'][rc]   # jA(2,1) jB(3,1) oJ(4,1) oK(5,1)
+        s2mm_ch = 4 if h < 4 else 5               # S2MM4/MM2S1 -> row2, S2MM5/MM2S2 -> row3
+        mm2s_ch = 1 if h < 4 else 2
+        flows.append(f"    aie.flow(%sh{h}, DMA : 0, %{mt_name}, DMA : {s2mm_ch})   // A{h} shim -> {mt_name}")
+        flows.append(f"    aie.flow(%{mt_name}, DMA : {mm2s_ch}, %t{h}, DMA : 0)   // A{h} {mt_name} -> center")
+    else:
+        flows.append(f"    aie.flow(%sh{h}, DMA : 0, %t{h}, DMA : 0)   // A{h}")
     flows.append(f"    aie.flow(%mx, DMA : 0, %t{h}, DMA : 1)   // mux 3-bcast -> center {h}")
     flows.append(f"    aie.flow(%t{h}, DMA : 0, %sh{h}, DMA : 0)   // Pf{h} -> drain (circuit)")
     flows.append(f"    aie.flow(%t{h}, DMA : 1, %sc{h}, DMA : 0)   // [Qi,O_h]{h} 2-BD -> score{h} (circuit)")
@@ -916,8 +987,8 @@ rt_args = (f"%arg0: memref<{P_TY}>, %arg1: memref<6416xbf16>, %arg2: memref<{WT_
 centers = "".join(center(h) for h in range(NH))
 scores = "".join(score(h) for h in range(NH))
 values = "".join(value(h) for h in range(NH))
-joins = (join_memtile('jA', 'jA') + join_memtile('jB', 'jB')
-         + join_memtile('oJ', 'oJ') + join_memtile('oK', 'oK'))
+joins = "".join(join_memtile(n, n, with_weight_relay=(c in RELAY_COLS))
+                for c, n in enumerate(['jA', 'jB', 'oJ', 'oK']))
 ksplit = split_memtile('Klo', 'Klo') + split_memtile('Khi', 'Khi') + split_memtile('Vlo', 'Vlo') + split_memtile('Vhi', 'Vhi')
 MLIRTXT = (f"module {{\n  aie.device(npu2) {{\n{tile_decls}{shim_decls}\n{funcs}\n"
            f"{flows_txt}\n{centers}\n{scores}\n{values}\n{joins}\n{ksplit}\n{relay}\n{op}\n{nm}\n{mux}\n"
