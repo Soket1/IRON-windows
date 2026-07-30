@@ -64,6 +64,11 @@ assert all(0 <= c <= 3 for c in RELAY_COLS), 'F3BEST_MT_RELAY entries must be 0.
 # (cap 64), 4*D BDs (cap 48) on top of the join's 8 locks / 8 BDs.
 RELAY_DEPTH = int(_os.environ.get('F3BEST_MT_DEPTH', '2'))
 assert 2 <= RELAY_DEPTH <= 10, 'F3BEST_MT_DEPTH must be 2..10 (4*D locks <= 64, 4*D+8 BDs <= 48)'
+# #138: MemTile decoupling on edge columns. Adds D-slot weight relay on edge
+# MemTiles (Klo/Khi/Vlo/Vhi) WITHOUT removing K/V split. Weight relay uses
+# S2MM4 (fill) and MM2S4 (drain) — no channel conflict with K/V split
+# (S2MM0, MM2S0-3). Locks 8+ for weight relay (split_memtile uses 0-7).
+DECOUPLE = _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != ''
 
 # --- MLIR generation, verbatim from build_ofold8_f3best.py (returns MLIRTXT) ---
 CENTER_COLS = [(2, 2), (3, 2), (4, 2), (5, 2), (2, 3), (3, 3), (4, 3), (5, 3)]
@@ -486,8 +491,12 @@ def join_memtile(name, tile, with_weight_relay=False):
     return s
 
 
-def split_memtile(name, tile):
-    """1 shim stream (4*2048) -> 4 MM2S slices (2048 each). F3split per-slice locks + 4-BD fill."""
+def split_memtile(name, tile, with_weight_relay=False):
+    """1 shim stream (4*KVN) -> 4 MM2S slices (KVN each). F3split per-slice locks + 4-BD fill.
+
+    When with_weight_relay=True (#138), also adds weight relay on S2MM4/MM2S4
+    with D-slot cyclic BD chain. Uses locks 8+ (split uses 0-7).
+    """
     SL = KVN
     s = f"""
     %{name}_buf = aie.buffer(%{tile}) {{sym_name = "{name}_buf"}} : memref<{4*KVN}xbf16>"""
@@ -495,57 +504,64 @@ def split_memtile(name, tile):
         s += f"""
     %{name}_p{k} = aie.lock(%{tile}, {2*k}) {{init = 1 : i32, sym_name = "{name}_p{k}"}}
     %{name}_c{k} = aie.lock(%{tile}, {2*k+1}) {{init = 0 : i32, sym_name = "{name}_c{k}"}}"""
+    if with_weight_relay:
+        D = RELAY_DEPTH
+        WS = 4608  # per-weight-chunk bytes
+        s += f"""
+    %{name}_wt = aie.buffer(%{tile}) {{sym_name = "{name}_wt"}} : memref<{D*WS}xi8>"""
+        for k in range(D):
+            s += f"""
+    %{name}_wsp{k} = aie.lock(%{tile}, {8+2*k}) {{init = 1 : i32, sym_name = "{name}_wsp{k}"}}
+    %{name}_wsc{k} = aie.lock(%{tile}, {8+2*k+1}) {{init = 0 : i32, sym_name = "{name}_wsc{k}"}}"""
+    # Next label after fill chain: m0 (=MM2S0 start) if no weight relay, else w0 (=S2MM4 start)
+    fill_nxt = f"^{name}w0" if with_weight_relay else f"^{name}m0"
     s += f"""
     %{name}_dma = aie.memtile_dma(%{tile}) {{
-      %s0 = aie.dma_start(S2MM, 0, ^{name}f0, ^{name}m0)
-    ^{name}f0:
-      aie.use_lock(%{name}_p0, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, 0, {SL})
-      aie.use_lock(%{name}_c0, Release, 1)
-      aie.next_bd ^{name}f1
-    ^{name}f1:
-      aie.use_lock(%{name}_p1, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {SL}, {SL})
-      aie.use_lock(%{name}_c1, Release, 1)
-      aie.next_bd ^{name}f2
-    ^{name}f2:
-      aie.use_lock(%{name}_p2, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {2*SL}, {SL})
-      aie.use_lock(%{name}_c2, Release, 1)
-      aie.next_bd ^{name}f3
-    ^{name}f3:
-      aie.use_lock(%{name}_p3, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {3*SL}, {SL})
-      aie.use_lock(%{name}_c3, Release, 1)
-      aie.next_bd ^{name}f0
-    ^{name}m0:
-      %m0 = aie.dma_start(MM2S, 0, ^{name}o0, ^{name}m1)
-    ^{name}o0:
-      aie.use_lock(%{name}_c0, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, 0, {SL})
-      aie.use_lock(%{name}_p0, Release, 1)
-      aie.next_bd ^{name}o0
-    ^{name}m1:
-      %m1 = aie.dma_start(MM2S, 1, ^{name}o1, ^{name}m2)
-    ^{name}o1:
-      aie.use_lock(%{name}_c1, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {SL}, {SL})
-      aie.use_lock(%{name}_p1, Release, 1)
-      aie.next_bd ^{name}o1
-    ^{name}m2:
-      %m2 = aie.dma_start(MM2S, 2, ^{name}o2, ^{name}m3)
-    ^{name}o2:
-      aie.use_lock(%{name}_c2, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {2*SL}, {SL})
-      aie.use_lock(%{name}_p2, Release, 1)
-      aie.next_bd ^{name}o2
-    ^{name}m3:
-      %m3 = aie.dma_start(MM2S, 3, ^{name}o3, ^{name}e)
-    ^{name}o3:
-      aie.use_lock(%{name}_c3, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {3*SL}, {SL})
-      aie.use_lock(%{name}_p3, Release, 1)
-      aie.next_bd ^{name}o3
+      %s0 = aie.dma_start(S2MM, 0, ^{name}f0, {fill_nxt})"""
+    for k in range(4):
+        s += f"""
+    ^{name}f{k}:
+      aie.use_lock(%{name}_p{k}, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {k*SL}, {SL})
+      aie.use_lock(%{name}_c{k}, Release, 1)
+      aie.next_bd ^{name}f{(k+1) % 4}"""
+    if with_weight_relay:
+        # S2MM4: weight fill, D-slot cyclic
+        nxt_mm2s = f"^{name}m0"
+        s += f"""
+    ^{name}w0:
+      %w = aie.dma_start(S2MM, 4, ^{name}ws0, {nxt_mm2s})"""
+        for k in range(D):
+            s += f"""
+    ^{name}ws{k}:
+      aie.use_lock(%{name}_wsp{k}, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{name}_wt : memref<{D*WS}xi8>, {k*WS}, {WS})
+      aie.use_lock(%{name}_wsc{k}, Release, 1)
+      aie.next_bd ^{name}ws{(k+1) % D}"""
+    # MM2S0..3: K/V drain (4 slices, each cyclic)
+    for ch in range(4):
+        nxt = f"^{name}m{ch+1}" if ch < 3 else (f"^{name}wrel" if with_weight_relay else f"^{name}e")
+        s += f"""
+    ^{name}m{ch}:
+      %m{ch} = aie.dma_start(MM2S, {ch}, ^{name}o{ch}, {nxt})
+    ^{name}o{ch}:
+      aie.use_lock(%{name}_c{ch}, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{name}_buf : memref<{4*KVN}xbf16>, {ch*SL}, {SL})
+      aie.use_lock(%{name}_p{ch}, Release, 1)
+      aie.next_bd ^{name}o{ch}"""
+    if with_weight_relay:
+        # MM2S4: weight drain, D-slot cyclic
+        s += f"""
+    ^{name}wrel:
+      %x = aie.dma_start(MM2S, 4, ^{name}xs0, ^{name}e)"""
+        for k in range(D):
+            s += f"""
+    ^{name}xs{k}:
+      aie.use_lock(%{name}_wsc{k}, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{name}_wt : memref<{D*WS}xi8>, {k*WS}, {WS})
+      aie.use_lock(%{name}_wsp{k}, Release, 1)
+      aie.next_bd ^{name}xs{(k+1) % D}"""
+    s += f"""
     ^{name}e:
       aie.end
     }}"""
@@ -592,13 +608,23 @@ flows.append("    aie.flow(%sh0, DMA : 1, %mx, DMA : 0)   // x_bundle -> mux S2M
 # Use F3e-1 packet arbitration: rl pkt0 -> mx.mxa, nm pkt1 -> mx.mxf.
 flows.append("    aie.packet_flow(0) { aie.packet_source<%rl, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // attn_out -> mux S2MM1")
 flows.append("    aie.packet_flow(1) { aie.packet_source<%nm, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // ffn_in -> mux S2MM1")
+# Edge weight relay mapping (DECOUPLE). Edge columns 0,1,6,7 relay weights through
+# Klo/Khi/Vlo/Vhi MemTiles alongside K/V split. Weight relay uses S2MM4 + MM2S4
+# (no conflict with K/V split S2MM0 + MM2S0-3). Uses locks 8+ (split uses 0-7).
+EDGE_RELAY = {0: 'Klo', 1: 'Khi', 6: 'Vlo', 7: 'Vhi'} if DECOUPLE else {}
 for h in range(NH):
     oj = 'oJ' if h < 4 else 'oK'
     osl = h if h < 4 else h - 4
     # Weight delivery. Relay columns go shim -> MemTile(col,1) -> core (P6 decoupling);
     # the rest keep the direct shim -> core flow.
     rc = h % 4 if h % 4 in RELAY_COLS else None
-    if rc is not None:
+    edge_mt = EDGE_RELAY.get(h)  # edge weight relay MemTile name or None
+    if edge_mt is not None:
+        # Edge weight relay: shim -> edge MemTile S2MM4 -> MM2S4 -> center core
+        # (MM2S4 avoids conflict with K/V split MM2S0-3)
+        flows.append(f"    aie.flow(%sh{h}, DMA : 0, %{edge_mt}, DMA : 4)   // A{h} shim -> {edge_mt} (edge relay)")
+        flows.append(f"    aie.flow(%{edge_mt}, DMA : 4, %t{h}, DMA : 0)   // A{h} {edge_mt} -> center")
+    elif rc is not None:
         mt_name = ['jA', 'jB', 'oJ', 'oK'][rc]   # jA(2,1) jB(3,1) oJ(4,1) oK(5,1)
         s2mm_ch = 4 if h < 4 else 5               # S2MM4/MM2S1 -> row2, S2MM5/MM2S2 -> row3
         mm2s_ch = 1 if h < 4 else 2
@@ -1003,7 +1029,13 @@ scores = "".join(score(h) for h in range(NH))
 values = "".join(value(h) for h in range(NH))
 joins = "".join(join_memtile(n, n, with_weight_relay=(c in RELAY_COLS))
                 for c, n in enumerate(['jA', 'jB', 'oJ', 'oK']))
-ksplit = split_memtile('Klo', 'Klo') + split_memtile('Khi', 'Khi') + split_memtile('Vlo', 'Vlo') + split_memtile('Vhi', 'Vhi')
+if DECOUPLE:
+    ksplit = split_memtile('Klo', 'Klo', with_weight_relay=True) \
+           + split_memtile('Khi', 'Khi', with_weight_relay=True) \
+           + split_memtile('Vlo', 'Vlo', with_weight_relay=True) \
+           + split_memtile('Vhi', 'Vhi', with_weight_relay=True)
+else:
+    ksplit = split_memtile('Klo', 'Klo') + split_memtile('Khi', 'Khi') + split_memtile('Vlo', 'Vlo') + split_memtile('Vhi', 'Vhi')
 MLIRTXT = (f"module {{\n  aie.device(npu2) {{\n{tile_decls}{shim_decls}\n{funcs}\n"
            f"{flows_txt}\n{centers}\n{scores}\n{values}\n{joins}\n{ksplit}\n{relay}\n{op}\n{nm}\n{mux}\n"
            f"{shim_allocs}\n    aie.runtime_sequence({rt_args}) {{\n{rt_body}    }}\n  }}\n}}\n")
