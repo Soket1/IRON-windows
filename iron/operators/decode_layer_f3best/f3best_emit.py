@@ -69,6 +69,9 @@ assert 2 <= RELAY_DEPTH <= 10, 'F3BEST_MT_DEPTH must be 2..10 (4*D locks <= 64, 
 # S2MM4 (fill) and MM2S4 (drain) — no channel conflict with K/V split
 # (S2MM0, MM2S0-3). Locks 8+ for weight relay (split_memtile uses 0-7).
 DECOUPLE = _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != ''
+# #139b: remove relay (rl) bottleneck. Connect jA/jB directly to mx via packet_flow
+# instead of jA+jB→rl→mx. mx S2MM1 receives 3 packet sources: jA(pkt 0), nm(pkt 1), jB(pkt 2).
+RL_FIX = _os.environ.get('F3BEST_RL_FIX', '').strip() != ''
 
 # --- MLIR generation, verbatim from build_ofold8_f3best.py (returns MLIRTXT) ---
 CENTER_COLS = [(2, 2), (3, 2), (4, 2), (5, 2), (2, 3), (3, 3), (4, 3), (5, 3)]
@@ -383,13 +386,16 @@ def value(h):
     }}"""
 
 
-def join_memtile(name, tile, with_weight_relay=False):
+def join_memtile(name, tile, with_weight_relay=False, packet_id=None):
     """Join MemTile: 4 S2MM gather -> 1 MM2S output.
 
     When with_weight_relay=True (cols 2-5), also adds weight relay channels:
     - S2MM4-5: receive weight chunks from 2 shim tiles
     - MM2S1-2: forward weight chunks to 2 core tiles
     Uses lock indices 8-15 for weight relay (4 lock pairs × 2 paths).
+
+    When packet_id is set (#139b), MM2S0 emits a packet header on the output
+    (jA→mx pkt_id=0, jB→mx pkt_id=2).
     """
     SL = 4608                     # per-weight-chunk bytes (one GEMV tile i8)
     s = f"""
@@ -450,7 +456,11 @@ def join_memtile(name, tile, with_weight_relay=False):
     s += f"""
     ^{name}m0:
       %m0 = aie.dma_start(MM2S, 0, ^{name}o0, {nxt_mm2s0})
-    ^{name}o0:
+    ^{name}o0:"""
+    if packet_id is not None:
+        s += f"""
+      aie.dma_bd_packet(0, {packet_id})"""
+    s += f"""
       aie.use_lock(%{name}_c0, AcquireGreaterEqual, 1)
       aie.dma_bd(%{name}_buf : memref<2048xbf16>, 0, {QI})
       aie.use_lock(%{name}_p0, Release, 1)
@@ -576,7 +586,10 @@ tile_decls += "".join(f"    %va{h} = aie.tile({VALUE_COLS[h][0]}, {VALUE_COLS[h]
 tile_decls += "    %jA = aie.tile(2, 1)\n    %jB = aie.tile(3, 1)\n"
 tile_decls += "    %Klo = aie.tile(0, 1)\n    %Khi = aie.tile(1, 1)\n    %Vlo = aie.tile(6, 1)\n    %Vhi = aie.tile(7, 1)\n"
 tile_decls += "    %oJ = aie.tile(4, 1)\n    %oK = aie.tile(5, 1)\n"
-tile_decls += "    %rl = aie.tile(2, 4)\n    %op = aie.tile(3, 4)\n    %nm = aie.tile(4, 4)\n    %mx = aie.tile(5, 4)\n"
+if RL_FIX:
+    tile_decls += "    %op = aie.tile(3, 4)\n    %nm = aie.tile(4, 4)\n    %mx = aie.tile(5, 4)\n"
+else:
+    tile_decls += "    %rl = aie.tile(2, 4)\n    %op = aie.tile(3, 4)\n    %nm = aie.tile(4, 4)\n    %mx = aie.tile(5, 4)\n"
 # no extra pre-merge tile: all 32 compute tiles are already occupied (router failed with 36th tile).
 shim_decls = "".join(f"    %sh{h} = aie.tile({h}, 0)\n" for h in range(NH))
 
@@ -606,8 +619,13 @@ flows = []
 flows.append("    aie.flow(%sh0, DMA : 1, %mx, DMA : 0)   // x_bundle -> mux S2MM0")
 # mux S2MM1 needs two producers (attn_out, ffn_in) and no extra compute tile is available.
 # Use F3e-1 packet arbitration: rl pkt0 -> mx.mxa, nm pkt1 -> mx.mxf.
-flows.append("    aie.packet_flow(0) { aie.packet_source<%rl, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // attn_out -> mux S2MM1")
-flows.append("    aie.packet_flow(1) { aie.packet_source<%nm, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // ffn_in -> mux S2MM1")
+if RL_FIX:
+    flows.append("    aie.packet_flow(0) { aie.packet_source<%jA, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // attnA -> mux S2MM1")
+    flows.append("    aie.packet_flow(1) { aie.packet_source<%nm, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // ffn_in -> mux S2MM1")
+    flows.append("    aie.packet_flow(2) { aie.packet_source<%jB, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // attnB -> mux S2MM1")
+else:
+    flows.append("    aie.packet_flow(0) { aie.packet_source<%rl, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // attn_out -> mux S2MM1")
+    flows.append("    aie.packet_flow(1) { aie.packet_source<%nm, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // ffn_in -> mux S2MM1")
 # Edge weight relay mapping (DECOUPLE). Edge columns 0,1,6,7 relay weights through
 # Klo/Khi/Vlo/Vhi MemTiles alongside K/V split. Weight relay uses S2MM4 + MM2S4
 # (no conflict with K/V split S2MM0 + MM2S0-3). Uses locks 8+ (split uses 0-7).
@@ -651,9 +669,10 @@ for k in range(4):
 for k in range(4):
     flows.append(f"    aie.flow(%va{k}, DMA : 0, %jA, DMA : {k})   // Of{k} -> joinA")
     flows.append(f"    aie.flow(%va{k+4}, DMA : 0, %jB, DMA : {k})   // Of{k+4} -> joinB")
-flows.append("    aie.flow(%jA, DMA : 0, %rl, DMA : 0)   // attn Half0 -> relay")
-flows.append("    aie.flow(%jB, DMA : 0, %rl, DMA : 1)   // attn Half1 -> relay")
-# rl drains attn_out -> mux via packet_flow(16) above (no circuit flow to op)
+if not RL_FIX:
+    flows.append("    aie.flow(%jA, DMA : 0, %rl, DMA : 0)   // attn Half0 -> relay")
+    flows.append("    aie.flow(%jB, DMA : 0, %rl, DMA : 1)   // attn Half1 -> relay")
+# rl drains attn_out -> mux via packet_flow(0) above (no circuit flow to op)
 # O-join: oJ/oK (center O_h) -> op (O-relay) -> nm (ANM)
 flows.append("    aie.flow(%oJ, DMA : 0, %op, DMA : 0)   // O Half0 -> orelay")
 flows.append("    aie.flow(%oK, DMA : 0, %op, DMA : 1)   // O Half1 -> orelay")
@@ -833,7 +852,94 @@ nm = """
       aie.end
     }"""
 
-mux = """
+mux = ""
+if RL_FIX:
+    # #139b: no relay. mx receives jA(pkt 0, 1024 bf16) + nm(pkt 1, 2048) + jB(pkt 2, 1024 bf16)
+    # on S2MM1. Core concatenates a0+a1 into full attn_out then forwards.
+    mux = """
+    %mx_x = aie.buffer(%mx) {sym_name = "mx_x"} : memref<2320xbf16>
+    %mx_a = aie.buffer(%mx) {sym_name = "mx_a"} : memref<2320xbf16>
+    %mx_f = aie.buffer(%mx) {sym_name = "mx_f"} : memref<2320xbf16>
+    %mx_o = aie.buffer(%mx) {sym_name = "mx_o"} : memref<2320xbf16>
+    %mx_xp = aie.lock(%mx, 0) {init = 1 : i32, sym_name = "mx_xp"}
+    %mx_xc = aie.lock(%mx, 1) {init = 0 : i32, sym_name = "mx_xc"}
+    %mx_a0p = aie.lock(%mx, 2) {init = 1 : i32, sym_name = "mx_a0p"}
+    %mx_a0c = aie.lock(%mx, 3) {init = 0 : i32, sym_name = "mx_a0c"}
+    %mx_fp = aie.lock(%mx, 4) {init = 1 : i32, sym_name = "mx_fp"}
+    %mx_fc = aie.lock(%mx, 5) {init = 0 : i32, sym_name = "mx_fc"}
+    %mx_a1p = aie.lock(%mx, 6) {init = 1 : i32, sym_name = "mx_a1p"}
+    %mx_a1c = aie.lock(%mx, 7) {init = 0 : i32, sym_name = "mx_a1c"}
+    %mx_op = aie.lock(%mx, 8) {init = 1 : i32, sym_name = "mx_op"}
+    %mx_oc = aie.lock(%mx, 9) {init = 0 : i32, sym_name = "mx_oc"}
+    %core_mx = aie.core(%mx) {
+      %z = arith.constant 0 : index
+      %N = arith.constant 9223372036854775807 : index
+      %one = arith.constant 1 : index
+      %nx = arith.constant 2320 : i32
+      %ne = arith.constant 2048 : i32
+      scf.for %it = %z to %N step %one {
+        // phase 1: x_bundle (circuit S2MM0) -> mx_o
+        aie.use_lock(%mx_xc, AcquireGreaterEqual, 1)
+        aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
+        func.call @attn_copy_bf16(%mx_x, %mx_o, %nx) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        aie.use_lock(%mx_xp, Release, 1)
+        aie.use_lock(%mx_oc, Release, 1)
+        // phase 2: attn_out — wait BOTH halves (jA pkt0 + jB pkt2) then copy full
+        aie.use_lock(%mx_a0c, AcquireGreaterEqual, 1)
+        aie.use_lock(%mx_a1c, AcquireGreaterEqual, 1)
+        aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
+        func.call @attn_copy_bf16(%mx_a, %mx_o, %ne) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        aie.use_lock(%mx_a0p, Release, 1)
+        aie.use_lock(%mx_a1p, Release, 1)
+        aie.use_lock(%mx_oc, Release, 1)
+        // phase 3: ffn_in (pkt 1, S2MM1) -> mx_o
+        aie.use_lock(%mx_fc, AcquireGreaterEqual, 1)
+        aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
+        func.call @attn_copy_bf16(%mx_f, %mx_o, %ne) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        aie.use_lock(%mx_fp, Release, 1)
+        aie.use_lock(%mx_oc, Release, 1)
+      }
+      aie.end
+    }
+    %mem_mx = aie.mem(%mx) {
+      %s0 = aie.dma_start(S2MM, 0, ^mxi, ^mxs1)
+    ^mxi:
+      aie.use_lock(%mx_xp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%mx_x : memref<2320xbf16>, 0, 2320)
+      aie.use_lock(%mx_xc, Release, 1)
+      aie.next_bd ^mxi
+    ^mxs1:
+      %s1 = aie.dma_start(S2MM, 1, ^mxa0, ^mxm0)
+    ^mxa0:
+      aie.use_lock(%mx_a0p, AcquireGreaterEqual, 1)
+      aie.dma_bd_packet(0, 0)
+      aie.dma_bd(%mx_a : memref<2320xbf16>, 0, 1024)
+      aie.use_lock(%mx_a0c, Release, 1)
+      aie.next_bd ^mxf
+    ^mxf:
+      aie.use_lock(%mx_fp, AcquireGreaterEqual, 1)
+      aie.dma_bd_packet(0, 1)
+      aie.dma_bd(%mx_f : memref<2320xbf16>, 0, 2048)
+      aie.use_lock(%mx_fc, Release, 1)
+      aie.next_bd ^mxa1
+    ^mxa1:
+      aie.use_lock(%mx_a1p, AcquireGreaterEqual, 1)
+      aie.dma_bd_packet(0, 2)
+      aie.dma_bd(%mx_a : memref<2320xbf16>, 1024, 1024)
+      aie.use_lock(%mx_a1c, Release, 1)
+      aie.next_bd ^mxa0
+    ^mxm0:
+      %m0 = aie.dma_start(MM2S, 0, ^mxo, ^mxe)
+    ^mxo:
+      aie.use_lock(%mx_oc, AcquireGreaterEqual, 1)
+      aie.dma_bd(%mx_o : memref<2320xbf16>, 0, 2320)
+      aie.use_lock(%mx_op, Release, 1)
+      aie.next_bd ^mxo
+    ^mxe:
+      aie.end
+    }"""
+else:
+    mux = """
     %mx_x = aie.buffer(%mx) {sym_name = "mx_x"} : memref<2320xbf16>
     %mx_a = aie.buffer(%mx) {sym_name = "mx_a"} : memref<2320xbf16>
     %mx_f = aie.buffer(%mx) {sym_name = "mx_f"} : memref<2320xbf16>
@@ -1027,8 +1133,14 @@ rt_args = (f"%arg0: memref<{P_TY}>, %arg1: memref<6416xbf16>, %arg2: memref<{WT_
 centers = "".join(center(h) for h in range(NH))
 scores = "".join(score(h) for h in range(NH))
 values = "".join(value(h) for h in range(NH))
-joins = "".join(join_memtile(n, n, with_weight_relay=(c in RELAY_COLS))
-                for c, n in enumerate(['jA', 'jB', 'oJ', 'oK']))
+if RL_FIX:
+    joins = (join_memtile('jA', 'jA', with_weight_relay=(0 in RELAY_COLS), packet_id=0)
+           + join_memtile('jB', 'jB', with_weight_relay=(1 in RELAY_COLS), packet_id=2)
+           + join_memtile('oJ', 'oJ', with_weight_relay=(2 in RELAY_COLS))
+           + join_memtile('oK', 'oK', with_weight_relay=(3 in RELAY_COLS)))
+else:
+    joins = "".join(join_memtile(n, n, with_weight_relay=(c in RELAY_COLS))
+                    for c, n in enumerate(['jA', 'jB', 'oJ', 'oK']))
 if DECOUPLE:
     ksplit = split_memtile('Klo', 'Klo', with_weight_relay=True) \
            + split_memtile('Khi', 'Khi', with_weight_relay=True) \
@@ -1036,8 +1148,9 @@ if DECOUPLE:
            + split_memtile('Vhi', 'Vhi', with_weight_relay=True)
 else:
     ksplit = split_memtile('Klo', 'Klo') + split_memtile('Khi', 'Khi') + split_memtile('Vlo', 'Vlo') + split_memtile('Vhi', 'Vhi')
+_relay_block = "" if RL_FIX else relay
 MLIRTXT = (f"module {{\n  aie.device(npu2) {{\n{tile_decls}{shim_decls}\n{funcs}\n"
-           f"{flows_txt}\n{centers}\n{scores}\n{values}\n{joins}\n{ksplit}\n{relay}\n{op}\n{nm}\n{mux}\n"
+           f"{flows_txt}\n{centers}\n{scores}\n{values}\n{joins}\n{ksplit}\n{_relay_block}\n{op}\n{nm}\n{mux}\n"
            f"{shim_allocs}\n    aie.runtime_sequence({rt_args}) {{\n{rt_body}    }}\n  }}\n}}\n")
 
 
