@@ -113,36 +113,33 @@ def center(h):
         // ---- phase 1: Q-GEMV + rope (B = x_bundle, A = Wq 64 tiles) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+        // #131B: Q-GEMV broadcast (column-major, j encodes block+chunk)
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          %ro0 = arith.muli %ji0, %m4 : i32
-          func.call @fused_dequant_matvec_v2_bf16(%m4, %ro0, %{p}_A0, %{p}_B, %{p}_Q) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) -> ()
+          func.call @layer_fused_qkv_bcast_bf16(%ji0, %g0, %{p}_A0, %{p}_B, %{p}_Q) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          %ro1 = arith.muli %ji1, %m4 : i32
-          func.call @fused_dequant_matvec_v2_bf16(%m4, %ro1, %{p}_A1, %{p}_B, %{p}_Q) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) -> ()
+          func.call @layer_fused_qkv_bcast_bf16(%ji1, %g0, %{p}_A1, %{p}_B, %{p}_Q) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
         aie.use_lock(%{p}_Bp, Release, 1)
-        // ---- phase 2: O-proj (B = attn_out 2048, A = Wo 64 tiles -> O[256]) ----
+        // ---- phase 2: O-proj broadcast (B = attn_out 2048, A = Wo 64 tiles -> O[256]) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          %ro0 = arith.muli %ji0, %m4 : i32
-          func.call @oproj_matvec_v2_bf16(%m4, %ro0, %{p}_A0, %{p}_B, %{p}_O) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) -> ()
+          func.call @layer_fused_oproj_bcast_bf16(%ji0, %g0, %{p}_A0, %{p}_B, %{p}_O) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          %ro1 = arith.muli %ji1, %m4 : i32
-          func.call @oproj_matvec_v2_bf16(%m4, %ro1, %{p}_A1, %{p}_B, %{p}_O) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) -> ()
+          func.call @layer_fused_oproj_bcast_bf16(%ji1, %g0, %{p}_A1, %{p}_B, %{p}_O) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_Bp, Release, 1)
@@ -572,6 +569,8 @@ funcs = (
     '    func.func private @rope_bundled(memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) attributes {link_with = "rope_il.o"}\n'
     '    func.func private @layer_fused_gate_up_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'
     '    func.func private @_ha_noop() -> () attributes {link_with = "layer_fused_bcast_kc256.o"}\n'
+    '    func.func private @layer_fused_qkv_bcast_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) attributes {link_with = "layer_fused_bcast_wrapper.o"}\n'
+    '    func.func private @layer_fused_oproj_bcast_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) attributes {link_with = "layer_fused_bcast_wrapper.o"}\n'
     '    func.func private @layer_fused_gate_up_bcast_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_bcast_wrapper.o"}\n'
     '    func.func private @layer_fused_silu_mul_static_bf16(i32) attributes {link_with = "layer_fused_relay.o"}\n'
     '    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<4608xi8>, memref<2320xbf16>) attributes {link_with = "layer_fused_relay.o"}\n'
