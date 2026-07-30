@@ -108,6 +108,8 @@ def center(h):
       %g1 = arith.constant 1 : i32
       %ds = arith.constant 2 : i32
       scf.for %tok = %c0 to %cN step %c1 {{
+        // #131: no-op call to force aiecc to link kc256.o (called by C++ wrapper on this core)
+        func.call @_ha_noop() : () -> ()
         // ---- phase 1: Q-GEMV + rope (B = x_bundle, A = Wq 64 tiles) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
@@ -569,10 +571,11 @@ funcs = (
     '    func.func private @fused_dequant_matvec_v2_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) attributes {link_with = "fused_dequant_gemv_v2_signed_2048k_g32.o"}\n'
     '    func.func private @rope_bundled(memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) attributes {link_with = "rope_il.o"}\n'
     '    func.func private @layer_fused_gate_up_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'
-    '    func.func private @layer_fused_gate_up_bcast_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'
+    '    func.func private @_ha_noop() -> () attributes {link_with = "layer_fused_bcast_kc256.o"}\n'
+    '    func.func private @layer_fused_gate_up_bcast_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_bcast_wrapper.o"}\n'
     '    func.func private @layer_fused_silu_mul_static_bf16(i32) attributes {link_with = "layer_fused_relay.o"}\n'
     '    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<4608xi8>, memref<2320xbf16>) attributes {link_with = "layer_fused_relay.o"}\n'
-    '    func.func private @layer_fused_down_bcast_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>) attributes {link_with = "layer_fused_relay.o"}\n'
+    '    func.func private @layer_fused_down_bcast_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>) attributes {link_with = "layer_fused_bcast_wrapper.o"}\n'
     '    func.func private @attn_copy_bf16(memref<2320xbf16>, memref<2320xbf16>, i32) attributes {link_with = "attn_concat.o"}\n'
     '    func.func private @oproj_matvec_v2_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) attributes {link_with = "fused_dequant_gemv_v2_oproj_signed_2048k_g32.o"}\n'
     '    func.func private @layer_fused_add_bf16(memref<2048xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'

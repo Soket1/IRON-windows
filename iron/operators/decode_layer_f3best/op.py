@@ -106,6 +106,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         )
         # Fused relay: the phase-blind center body (Q-GEMV+RoPE / O-proj / FFN) +
         # rms hub + mux, built for the 8-center-column f3best layout.
+        # Guard C++ bcast functions so the hand-asm .o provides them instead (#131).
         relay_obj = KernelObjectArtifact.new(
             "layer_fused_relay.o",
             depends=[SourceArtifact.new(k2p / "layer_fused_f3best.cc")],
@@ -114,13 +115,32 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
                 f"-DHEAD_DIM={self.head_dim}", f"-DNUM_HEADS={self.num_q_heads}",
                 f"-DNUM_KV_HEADS={self.num_kv_heads}", f"-DMAX_SEQ_LEN=2048",
                 "-DNUM_AIE_COLUMNS=8", "-DM_OUTPUT_MAX=1024",
+                "-DUSE_HAND_ASM_BCAST",
             ],
+        )
+
+        # #131: C++ wrapper that calls hand-asm kernel for gate/up/down bcast GEMV.
+        bcast_wrapper_obj = KernelObjectArtifact.new(
+            "layer_fused_bcast_wrapper.o",
+            depends=[SourceArtifact.new(k2p / "layer_fused_bcast_wrapper.cc")],
+            extra_flags=[
+                f"-DEMBED_DIM={E}", f"-DHIDDEN_DIM={H}", f"-DGROUP_SIZE={g}",
+                f"-DHEAD_DIM={self.head_dim}", f"-DNUM_HEADS={self.num_q_heads}",
+                f"-DNUM_KV_HEADS={self.num_kv_heads}", f"-DMAX_SEQ_LEN=2048",
+                "-DNUM_AIE_COLUMNS=8", "-DM_OUTPUT_MAX=1024",
+            ],
+        )
+        # #131: KC=256 hand-asm kernel (bcast_gemv adapted for chunk mode)
+        bcast_kc256_obj = KernelObjectArtifact.new(
+            "layer_fused_bcast_kc256.o",
+            depends=[SourceArtifact.new(k2p / "layer_fused_bcast_kc256.s")],
+            extra_flags=[],
         )
 
         xclbin_artifact = XclbinArtifact.new(
             f"{base}.xclbin",
             depends=[mlir_artifact, gemv_obj, oproj_obj, rope_obj, flowkv_obj,
-                     concat_obj, relay_obj],
+                     concat_obj, relay_obj, bcast_wrapper_obj, bcast_kc256_obj],
         )
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
         return xclbin_artifact, insts_artifact
@@ -131,7 +151,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
 
     def set_up_runtime(self):
         NH, E, g, m = self.NH, self.embed_dim, self.group_size, self.m_input
-        PACKED = m * E // 2 + m * (E // g) * 2
+        PACKED = m * E # 2 + m * (E # g) * 2
         WT_BYTES = self.WT_TILES * PACKED
         KVN = self.seq_len * self.head_dim
 

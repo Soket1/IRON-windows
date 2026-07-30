@@ -652,8 +652,8 @@ extern "C" void layer_fused_rope_apply_bf16(
 #define M_OUTPUT_MAX 4096
 #endif
 
-static bfloat16 lf_left_buf[M_OUTPUT_MAX]  __attribute__((aligned(64)));
-static bfloat16 lf_right_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
+bfloat16 lf_left_buf[M_OUTPUT_MAX]  __attribute__((aligned(64)));
+bfloat16 lf_right_buf[M_OUTPUT_MAX] __attribute__((aligned(64)));
 // D1.7 (reference-faithful): SwiGLU intermediate as a FILE-SCOPE STATIC in THIS .o,
 // co-laid by the compiler with lf_left/lf_right (no overlap). Replaces the IRON
 // `Buffer` silu_scratch, whose L1 address (chosen by the IRON/MLIR allocator,
@@ -928,7 +928,8 @@ static void _lf_dual_gemv(uint32_t m, uint32_t row_offset,
 // block=j/NCHUNK, chunk=j%NCHUNK. Accumulates a per-block float partial across the
 // NCHUNK chunks (dense _gemv_bcast_w2 over KC cols + 2 accs), flushes to
 // lf_left/right_buf[block*32] on the last chunk. silu/down downstream unchanged.
-static float lf_qkv_bc_partial[32] __attribute__((aligned(64)));
+// #131: exposed (non-static) for hand-asm wrapper
+    float lf_qkv_bc_partial[32] __attribute__((aligned(64)));
 
 template <uint32_t N, uint32_t G, uint32_t NCHUNK>
 static void _qkv_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
@@ -969,7 +970,8 @@ static void _qkv_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
     }
 }
 
-static float lf_bc_partial[32] __attribute__((aligned(64)));
+// #131: exposed (non-static) for hand-asm wrapper
+    float lf_bc_partial[32] __attribute__((aligned(64)));
 
 template <uint32_t N, uint32_t G, uint32_t NCHUNK>
 static void _gate_up_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
@@ -1011,7 +1013,7 @@ static void _gate_up_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
 }
 
 
-static float lf_down_bc_partial[32] __attribute__((aligned(64)));
+float lf_down_bc_partial[32] __attribute__((aligned(64)));
 
 template <uint32_t N, uint32_t G, uint32_t NCHUNK>
 static void _down_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
@@ -1059,6 +1061,7 @@ void layer_fused_gate_up_bf16(
     _lf_dual_gemv<32, GROUP_SIZE, EMBED_DIM>(m, row_offset, a, b, phase);
 }
 
+#ifndef USE_HAND_ASM_BCAST
 void layer_fused_qkv_bcast_bf16(uint32_t j, uint32_t unused,
                                 const uint8_t *a, const bfloat16 *b, bfloat16 *c_out) {
     (void)unused;
@@ -1075,14 +1078,13 @@ void layer_fused_gate_up_bcast_bf16(
         uint32_t j, uint32_t /*unused*/,
         const uint8_t *a, const bfloat16 *b, int phase) {
 #ifdef STUB_FFN
-    // #78 per-phase stub: skip compute. Static L1 buffers lf_left/right are
-    // overwritten by downstream SiLU anyway — safe to return.
     (void)j; (void)a; (void)b; (void)phase;
     return;
 #else
     _gate_up_bcast_chunk<32, GROUP_SIZE, EMBED_DIM / 256>(j, a, b, phase);
 #endif
 }
+#endif  // USE_HAND_ASM_BCAST
 
 // Fused SiLU*Mul: out[i] = silu(lf_left_buf[i]) * lf_right_buf[i].
 // silu(x) = x * sigmoid(x), sigmoid(x) = 0.5*(1 + tanh(x/2)).
@@ -1335,6 +1337,7 @@ void layer_fused_down_v2_x4_bf16(uint32_t m, uint32_t row_offset, uint32_t nsub,
         layer_fused_down_v2_static_bf16(m, row_offset + k * m, a_in + k * sub_bytes, c_out);
 }
 
+#ifndef USE_HAND_ASM_BCAST
 void layer_fused_down_bcast_bf16(
         uint32_t j, uint32_t /*unused*/,
         const uint8_t *a, bfloat16 *c_out) {
@@ -1348,6 +1351,7 @@ void layer_fused_down_bcast_bf16(
     _down_bcast_chunk<32, GROUP_SIZE, 4>(j, a, c_out);
 #endif
 }
+#endif  // USE_HAND_ASM_BCAST
 
 // ────────────────────────────────────────────────────────────────────────────
 // MONOLITHIC register-resident FFN (#12 / fix #11.1b): one function, NO L1
