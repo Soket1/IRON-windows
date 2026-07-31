@@ -162,7 +162,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
 
     def set_up_runtime(self):
         NH, E, g, m = self.NH, self.embed_dim, self.group_size, self.m_input
-        PACKED = m * E # 2 + m * (E # g) * 2
+        PACKED = m * E // 2 + m * (E // g) * 2
         WT_BYTES = self.WT_TILES * PACKED
         KVN = self.seq_len * self.head_dim
 
