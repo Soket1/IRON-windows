@@ -1179,11 +1179,13 @@ else:
       %s1 = aie.dma_start(S2MM, 1, ^mxa, ^mxm0)
     ^mxa:
       aie.use_lock(%mx_ap, AcquireGreaterEqual, 1)
+      aie.dma_bd_packet(0, 0)
       aie.dma_bd(%mx_a : memref<2320xbf16>, 0, 2048)
       aie.use_lock(%mx_ac, Release, 1)
       aie.next_bd ^mxf
     ^mxf:
       aie.use_lock(%mx_fp, AcquireGreaterEqual, 1)
+      aie.dma_bd_packet(0, 1)
       aie.dma_bd(%mx_f : memref<2320xbf16>, 0, 2048)
       aie.use_lock(%mx_fc, Release, 1)
       aie.next_bd ^mxa
