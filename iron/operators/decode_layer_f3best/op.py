@@ -56,8 +56,9 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         _ffn_div = _os.environ.get('F3BEST_FFN_DIV', '1')
         _div_suffix = f'_d{_ffn_div}' if _ffn_div != '1' else ''
         _decouple = '_decouple' if _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != '' else ''
+        _triple_b = '_tb' if _os.environ.get('F3BEST_TRIPLE_B', '').strip() != '' else ''
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp{_div_suffix}{_decouple}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp{_div_suffix}{_decouple}{_triple_b}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",

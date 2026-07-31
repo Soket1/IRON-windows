@@ -72,6 +72,9 @@ DECOUPLE = _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != ''
 # #139b: remove relay (rl) bottleneck. Connect jA/jB directly to mx via packet_flow
 # instead of jA+jB→rl→mx. mx S2MM1 receives 3 packet sources: jA(pkt 0), nm(pkt 1), jB(pkt 2).
 RL_FIX = _os.environ.get('F3BEST_RL_FIX', '').strip() != ''
+# #144: triple B-buffer on center tiles. B0(x_bundle), B1(attn_out), B2(ffn_in)
+# instead of single shared B. DMA pre-fills B1/B2 while core in earlier phases.
+TRIPLE_B = _os.environ.get('F3BEST_TRIPLE_B', '').strip() != ''
 
 # --- MLIR generation, verbatim from build_ofold8_f3best.py (returns MLIRTXT) ---
 CENTER_COLS = [(2, 2), (3, 2), (4, 2), (5, 2), (2, 3), (3, 3), (4, 3), (5, 3)]
@@ -81,6 +84,188 @@ VALUE_COLS = [(0, 4), (1, 4), (6, 4), (7, 4), (0, 5), (1, 5), (6, 5), (7, 5)]
 
 def center(h):
     p = f"c{h}"
+    if TRIPLE_B:
+        return _center_triple_b(h, p)
+    return _center_single_b(h, p)
+
+
+def _center_triple_b(h, p):
+    """Triple B-buffer: B0(x_bundle), B1(attn_out), B2(ffn_in). DMA pre-fills B1/B2 while core in earlier phases."""
+    return f"""
+    %{p}_A0 = aie.buffer(%t{h}) {{sym_name = "{p}_A0"}} : memref<4608xi8>
+    %{p}_A1 = aie.buffer(%t{h}) {{sym_name = "{p}_A1"}} : memref<4608xi8>
+    %{p}_B0 = aie.buffer(%t{h}) {{sym_name = "{p}_B0"}} : memref<2320xbf16>
+    %{p}_B1 = aie.buffer(%t{h}) {{sym_name = "{p}_B1"}} : memref<2320xbf16>
+    %{p}_B2 = aie.buffer(%t{h}) {{sym_name = "{p}_B2"}} : memref<2320xbf16>
+    %{p}_Q = aie.buffer(%t{h}) {{sym_name = "{p}_Q"}} : memref<322xbf16>
+    %{p}_O = aie.buffer(%t{h}) {{sym_name = "{p}_O"}} : memref<2048xbf16>
+    %{p}_P = aie.buffer(%t{h}) {{sym_name = "{p}_P"}} : memref<2320xbf16>
+    %{p}_A0p = aie.lock(%t{h}, 0) {{init = 1 : i32, sym_name = "{p}_A0p"}}
+    %{p}_A0c = aie.lock(%t{h}, 1) {{init = 0 : i32, sym_name = "{p}_A0c"}}
+    %{p}_B0p = aie.lock(%t{h}, 2) {{init = 1 : i32, sym_name = "{p}_B0p"}}
+    %{p}_B0c = aie.lock(%t{h}, 3) {{init = 0 : i32, sym_name = "{p}_B0c"}}
+    %{p}_Qp = aie.lock(%t{h}, 4) {{init = 1 : i32, sym_name = "{p}_Qp"}}
+    %{p}_Qc = aie.lock(%t{h}, 5) {{init = 0 : i32, sym_name = "{p}_Qc"}}
+    %{p}_Op = aie.lock(%t{h}, 6) {{init = 1 : i32, sym_name = "{p}_Op"}}
+    %{p}_Oc = aie.lock(%t{h}, 7) {{init = 0 : i32, sym_name = "{p}_Oc"}}
+    %{p}_Pp = aie.lock(%t{h}, 8) {{init = 1 : i32, sym_name = "{p}_Pp"}}
+    %{p}_Pc = aie.lock(%t{h}, 9) {{init = 0 : i32, sym_name = "{p}_Pc"}}
+    %{p}_A1p = aie.lock(%t{h}, 10) {{init = 1 : i32, sym_name = "{p}_A1p"}}
+    %{p}_A1c = aie.lock(%t{h}, 11) {{init = 0 : i32, sym_name = "{p}_A1c"}}
+    %{p}_B1p = aie.lock(%t{h}, 12) {{init = 1 : i32, sym_name = "{p}_B1p"}}
+    %{p}_B1c = aie.lock(%t{h}, 13) {{init = 0 : i32, sym_name = "{p}_B1c"}}
+    %{p}_B2p = aie.lock(%t{h}, 14) {{init = 1 : i32, sym_name = "{p}_B2p"}}
+    %{p}_B2c = aie.lock(%t{h}, 15) {{init = 0 : i32, sym_name = "{p}_B2c"}}
+    %core{h} = aie.core(%t{h}) {{
+      %c0 = arith.constant 0 : index
+      %cN = arith.constant 9223372036854775807 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c64 = arith.constant 64 : index
+      %cF = arith.constant {GU_T} : index
+      %m4 = arith.constant 4 : i32
+      %qr = arith.constant 256 : i32
+      %hc = arith.constant 1024 : i32
+      %g0 = arith.constant 0 : i32
+      %g1 = arith.constant 1 : i32
+      %ds = arith.constant 2 : i32
+      scf.for %tok = %c0 to %cN step %c1 {{
+        func.call @_ha_noop() : () -> ()
+        // ---- phase 1: Q-GEMV + rope (B0 = x_bundle) ----
+        aie.use_lock(%{p}_B0c, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %c64 step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @layer_fused_qkv_bcast_bf16(%ji0, %g0, %{p}_A0, %{p}_B0, %{p}_Q) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @layer_fused_qkv_bcast_bf16(%ji1, %g0, %{p}_A1, %{p}_B0, %{p}_Q) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
+        aie.use_lock(%{p}_Qc, Release, 1)
+        aie.use_lock(%{p}_B0p, Release, 1)
+        // ---- phase 2: O-proj (B1 = attn_out) ----
+        aie.use_lock(%{p}_B1c, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %c64 step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @layer_fused_oproj_bcast_bf16(%ji0, %g0, %{p}_A0, %{p}_B1, %{p}_O) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @layer_fused_oproj_bcast_bf16(%ji1, %g0, %{p}_A1, %{p}_B1, %{p}_O) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        aie.use_lock(%{p}_B1p, Release, 1)
+        aie.use_lock(%{p}_Oc, Release, 1)
+        // ---- phase 3: FFN (B2 = ffn_in) ----
+        aie.use_lock(%{p}_B2c, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          %ro0 = arith.muli %ji0, %m4 : i32
+          func.call @layer_fused_gate_up_bcast_bf16(%ji0, %g0, %{p}_A0, %{p}_B2, %g0) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          %ro1 = arith.muli %ji1, %m4 : i32
+          func.call @layer_fused_gate_up_bcast_bf16(%ji1, %g0, %{p}_A1, %{p}_B2, %g0) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          %ro0 = arith.muli %ji0, %m4 : i32
+          func.call @layer_fused_gate_up_bcast_bf16(%ji0, %g1, %{p}_A0, %{p}_B2, %g1) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          %ro1 = arith.muli %ji1, %m4 : i32
+          func.call @layer_fused_gate_up_bcast_bf16(%ji1, %g1, %{p}_A1, %{p}_B2, %g1) : (i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        aie.use_lock(%{p}_B2p, Release, 1)
+        func.call @layer_fused_silu_mul_static_bf16(%hc) : (i32) -> ()
+        aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          %ro0 = arith.muli %ji0, %ds : i32
+          func.call @layer_fused_down_bcast_bf16(%ji0, %g0, %{p}_A0, %{p}_P) : (i32, i32, memref<4608xi8>, memref<2320xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          %ro1 = arith.muli %ji1, %ds : i32
+          func.call @layer_fused_down_bcast_bf16(%ji1, %g0, %{p}_A1, %{p}_P) : (i32, i32, memref<4608xi8>, memref<2320xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        aie.use_lock(%{p}_Pc, Release, 1)
+      }}
+      aie.end
+    }}
+    %mem_t{h} = aie.mem(%t{h}) {{
+      %s0 = aie.dma_start(S2MM, 0, ^a0{h}, ^bs{h})
+    ^a0{h}:
+      aie.use_lock(%{p}_A0p, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_A0 : memref<4608xi8>, 0, 4608)
+      aie.use_lock(%{p}_A0c, Release, 1)
+      aie.next_bd ^a1{h}
+    ^a1{h}:
+      aie.use_lock(%{p}_A1p, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_A1 : memref<4608xi8>, 0, 4608)
+      aie.use_lock(%{p}_A1c, Release, 1)
+      aie.next_bd ^a0{h}
+    ^bs{h}:
+      %s1 = aie.dma_start(S2MM, 1, ^b0{h}, ^m0{h})
+    ^b0{h}:
+      aie.use_lock(%{p}_B0p, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_B0 : memref<2320xbf16>, 0, 2320)
+      aie.use_lock(%{p}_B0c, Release, 1)
+      aie.next_bd ^b1{h}
+    ^b1{h}:
+      aie.use_lock(%{p}_B1p, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_B1 : memref<2320xbf16>, 0, 2320)
+      aie.use_lock(%{p}_B1c, Release, 1)
+      aie.next_bd ^b2{h}
+    ^b2{h}:
+      aie.use_lock(%{p}_B2p, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_B2 : memref<2320xbf16>, 0, 2320)
+      aie.use_lock(%{p}_B2c, Release, 1)
+      aie.next_bd ^b0{h}
+    ^m0{h}:
+      %m0 = aie.dma_start(MM2S, 0, ^pf{h}, ^qo{h})
+    ^pf{h}:
+      aie.use_lock(%{p}_Pc, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_P : memref<2320xbf16>, 0, 2048)
+      aie.use_lock(%{p}_Pp, Release, 1)
+      aie.next_bd ^pf{h}
+    ^qo{h}:
+      %m1 = aie.dma_start(MM2S, 1, ^qi{h}, ^e{h})
+    ^qi{h}:
+      aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Q : memref<322xbf16>, 0, 322)
+      aie.use_lock(%{p}_Qp, Release, 1)
+      aie.next_bd ^oh{h}
+    ^oh{h}:
+      aie.use_lock(%{p}_Oc, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_O : memref<2048xbf16>, 0, 256)
+      aie.use_lock(%{p}_Op, Release, 1)
+      aie.next_bd ^qi{h}
+    ^e{h}:
+      aie.end
+    }}"""
+
+
+def _center_single_b(h, p):
     # ALL-CIRCUIT outputs (no packet): MM2S0 = Pf -> shim ; MM2S1 = 2-BD [Qi, O_h] -> score (single
     # dest). score relays O_h onward to oJ/oK, so the center never demuxes -> no packet congestion.
     return f"""
