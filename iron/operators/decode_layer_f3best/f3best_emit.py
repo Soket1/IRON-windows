@@ -74,7 +74,7 @@ DECOUPLE = _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != ''
 RL_FIX = _os.environ.get('F3BEST_RL_FIX', '').strip() != ''
 # #144: triple B-buffer on center tiles. B0(x_bundle), B1(attn_out), B2(ffn_in)
 # instead of single shared B. DMA pre-fills B1/B2 while core in earlier phases.
-TRIPLE_B = _os.environ.get('F3BEST_TRIPLE_B', '').strip() != ''
+TRIPLE_B = _os.environ.get('F3BEST_TRIPLE_B', '1').strip() != ''
 
 # --- MLIR generation, verbatim from build_ofold8_f3best.py (returns MLIRTXT) ---
 CENTER_COLS = [(2, 2), (3, 2), (4, 2), (5, 2), (2, 3), (3, 3), (4, 3), (5, 3)]
