@@ -1159,6 +1159,42 @@ void layer_fused_silu_mul_static_bf16(uint32_t m_output) {
 #endif
 }
 
+// Level 1: Explicit-buffer SiLU*Mul — reads gate/up from explicit pointers,
+// writes silu to an explicit out pointer. No file-scope statics referenced.
+// Identical math to layer_fused_silu_mul_static_bf16 (exp2-based sigmoid,
+// clamp arg ≤ 80 to avoid bf16 overflow). Used by the phase-blind unified
+// bcast GEMV call graph where all buffers are IRON/MLIR-allocated.
+void layer_fused_silu_mul_explicit_bf16(
+        const bfloat16 *gate,
+        const bfloat16 *up,
+        bfloat16 *out,
+        uint32_t m_output) {
+#ifdef STUB_FFN
+    (void)gate; (void)up; (void)out; (void)m_output;
+    return;
+#else
+    constexpr int VEC = 16;
+    int chunks = (int)m_output / VEC;
+    aie::vector<bfloat16, VEC> r1     = aie::broadcast<bfloat16, VEC>(1.0f);
+    AIE_PREPARE_FOR_PIPELINING
+    for (int i = 0; i < chunks; i++) {
+        aie::vector<bfloat16, VEC> l = aie::load_v<VEC>(gate + i * VEC);
+        aie::vector<bfloat16, VEC> r = aie::load_v<VEC>(up   + i * VEC);
+        aie::vector<bfloat16, VEC> mlog2e = aie::broadcast<bfloat16, VEC>(-1.4426950408f);
+        aie::vector<float, VEC> exp_arg = aie::mul(l, mlog2e).template to_vector<float>();
+        aie::vector<float, VEC> arg_cap = aie::broadcast<float, VEC>(80.0f);
+        exp_arg = aie::min(exp_arg, arg_cap);
+        aie::vector<bfloat16, VEC> exp_neg = aie::exp2<bfloat16>(exp_arg);
+        aie::vector<bfloat16, VEC> denom = aie::add(r1, exp_neg);
+        aie::vector<bfloat16, VEC> sig   = aie::inv(denom);
+        aie::vector<bfloat16, VEC> silu  = aie::mul(l, sig).template to_vector<bfloat16>();
+        aie::vector<bfloat16, VEC> fused = aie::mul(silu, r).template to_vector<bfloat16>();
+        aie::store_v(out + i * VEC, fused);
+    }
+    (void)chunks;
+#endif
+}
+
 // D1.7 CANARY (env DECODE_DBG_CANARY): overwrite lf_silu_buf with a known
 // constant (1.0), ignoring gate/up/silu. Decisive test of whether down reads
 // lf_silu_buf correctly in the FULL live chain: if NPU down output == CPU

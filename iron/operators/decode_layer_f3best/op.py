@@ -59,7 +59,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         _triple_b = '_tb' if _os.environ.get('F3BEST_TRIPLE_B', '1').strip() != '' else ''
         _handasm_rr = '_rr' if _os.environ.get('F3BEST_HANDASM_RR', '').strip() != '' else ''
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142)
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}_ub")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#L1)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -122,10 +122,11 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
             ],
         )
 
-        # #131: C++ wrapper that calls hand-asm kernel for gate/up/down bcast GEMV.
-        bcast_wrapper_obj = KernelObjectArtifact.new(
-            "layer_fused_bcast_wrapper.o",
-            depends=[SourceArtifact.new(k2p / "layer_fused_bcast_wrapper.cc")],
+        # #131: C++ wrapper that calls hand-asm kernel for unified broadcast GEMV.
+        # Level 1: single generic_bcast_gemv_bf16 replaces 4 per-phase wrappers.
+        unified_bcast_obj = KernelObjectArtifact.new(
+            "layer_fused_unified_bcast.o",
+            depends=[SourceArtifact.new(k2p / "layer_fused_unified_bcast.cc")],
             extra_flags=[
                 f"-DEMBED_DIM={E}", f"-DHIDDEN_DIM={H}", f"-DGROUP_SIZE={g}",
                 f"-DHEAD_DIM={self.head_dim}", f"-DNUM_HEADS={self.num_q_heads}",
@@ -151,7 +152,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         xclbin_artifact = XclbinArtifact.new(
             f"{base}.xclbin",
             depends=[mlir_artifact, gemv_obj, oproj_obj, rope_obj, flowkv_obj,
-                     concat_obj, relay_obj, bcast_wrapper_obj, _bcast_obj],
+                     concat_obj, relay_obj, unified_bcast_obj, _bcast_obj],
         )
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
         return xclbin_artifact, insts_artifact
