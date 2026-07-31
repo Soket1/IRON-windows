@@ -56,9 +56,10 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         _ffn_div = _os.environ.get('F3BEST_FFN_DIV', '1')
         _div_suffix = f'_d{_ffn_div}' if _ffn_div != '1' else ''
         _decouple = '_decouple' if _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != '' else ''
-        _triple_b = '_tb' if _os.environ.get('F3BEST_TRIPLE_B', '').strip() != '' else ''
+        _triple_b = '_tb' if _os.environ.get('F3BEST_TRIPLE_B', '1').strip() != '' else ''
+        _handasm_rr = '_rr' if _os.environ.get('F3BEST_HANDASM_RR', '').strip() != '' else ''
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp{_div_suffix}{_decouple}{_triple_b}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -138,11 +139,19 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
             depends=[SourceArtifact.new(k2p / "layer_fused_bcast_kc256.s")],
             extra_flags=[],
         )
+        # #135: ppbase-density RR kernel (1.5 bundles/vmac)
+        bcast_kc256_rr_obj = KernelObjectArtifact.new(
+            "layer_fused_bcast_kc256_rr.o",
+            depends=[SourceArtifact.new(k2p / "layer_fused_bcast_kc256_rr.s")],
+            extra_flags=[],
+        )
+        _use_rr = _os.environ.get('F3BEST_HANDASM_RR', '').strip() != ''
+        _bcast_obj = bcast_kc256_rr_obj if _use_rr else bcast_kc256_obj
 
         xclbin_artifact = XclbinArtifact.new(
             f"{base}.xclbin",
             depends=[mlir_artifact, gemv_obj, oproj_obj, rope_obj, flowkv_obj,
-                     concat_obj, relay_obj, bcast_wrapper_obj, bcast_kc256_obj],
+                     concat_obj, relay_obj, bcast_wrapper_obj, _bcast_obj],
         )
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
         return xclbin_artifact, insts_artifact
