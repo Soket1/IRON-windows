@@ -29,7 +29,7 @@ from iron.common import (
 class AIEDecodeLayerF3Best(AIEOperatorBase):
     # f3best center layout is fixed: 8 center tiles, 896 weight tiles, npu2.
     NH = 8
-    WT_TILES = 896
+    WT_TILES = 928
     WO_BYTES = 2359296          # unused arg3 placeholder (Wo lives inside A)
 
     def __init__(self, embed_dim=2048, hidden_dim=8192, K_gemv=2048, head_dim=64,
@@ -59,7 +59,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         _triple_b = '_tb' if _os.environ.get('F3BEST_TRIPLE_B', '1').strip() != '' else ''
         _handasm_rr = '_rr' if _os.environ.get('F3BEST_HANDASM_RR', '').strip() != '' else ''
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1)
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kv{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _kv = on-chip K/V projections
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -167,10 +167,12 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         WT_BYTES = self.WT_TILES * PACKED
         KVN = self.seq_len * self.head_dim
 
-        # bo0 output [NH FFN partials | s=O+resid attn-residual] = (NH+1) x E;
+        # bo0 output [NH*(P|K|V) | s=O+resid attn-residual] = NH*(E+KV_M+KV_M)+E;
+        # KV_M = KV_T*M = 64 bf16 per head per projection
         # bo1 [X(XB) | residual(E) | ffn_norm gain(E)]; bo2 weights A;
         # bo3 unused Wo placeholder; bo4 KV cache (K then V, NH heads).
-        self.add_buffer("output", (NH + 1) * E, dtype=bfloat16)
+        KV_M = 64
+        self.add_buffer("output", NH * (E + 2*KV_M) + E, dtype=bfloat16)
         self.add_buffer("XR", (E + 256 + 16) + E + E, dtype=bfloat16)
         self.add_buffer("A", NH * WT_BYTES, dtype=np.uint8)
         self.add_buffer("Wo", self.WO_BYTES, dtype=np.uint8)

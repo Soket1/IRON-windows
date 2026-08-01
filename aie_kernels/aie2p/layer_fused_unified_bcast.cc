@@ -124,6 +124,9 @@ extern "C" void generic_bcast_gemv_bf16_o(uint32_t j, const uint8_t *w, const bf
 extern "C" void generic_bcast_gemv_bf16_g(uint32_t j, const uint8_t *w, const bfloat16 *a, float *p, uint32_t n, bfloat16 *o) {
     generic_bcast_gemv_bf16(j, w, a, p, n, o);
 }
+extern "C" void generic_bcast_gemv_bf16_kv(uint32_t j, const uint8_t *w, const bfloat16 *a, float *p, uint32_t n, bfloat16 *o) {
+    generic_bcast_gemv_bf16(j, w, a, p, n, o);
+}
 extern "C" void generic_bcast_gemv_bf16_d(uint32_t j, const uint8_t *w, const bfloat16 *a, float *p, uint32_t n, bfloat16 *o) {
     generic_bcast_gemv_bf16(j, w, a, p, n, o);
 }

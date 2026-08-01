@@ -107,5 +107,12 @@ void rope_bundled(bfloat16 *qin, bfloat16 *vec_lut, bfloat16 *output, int32_t di
 #endif
     event1();
 }
+
+// Alias for K/V RoPE (per-head dims=64 instead of 256).
+// Reuses the same rope_bundled implementation with a smaller dims param.
+void rope_kv_bundled(bfloat16 *kv, bfloat16 *vec_lut, bfloat16 *output, int32_t dims)
+{
+    rope_bundled(kv, vec_lut, output, dims);
+}
 #endif
 }
