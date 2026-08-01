@@ -29,7 +29,7 @@ from iron.common import (
 class AIEDecodeLayerF3Best(AIEOperatorBase):
     # f3best center layout is fixed: 8 center tiles, 896 weight tiles, npu2.
     NH = 8
-    WT_TILES = 928
+    WT_TILES = 960
     WO_BYTES = 2359296          # unused arg3 placeholder (Wo lives inside A)
 
     def __init__(self, embed_dim=2048, hidden_dim=8192, K_gemv=2048, head_dim=64,
