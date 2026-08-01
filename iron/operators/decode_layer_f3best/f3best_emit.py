@@ -19,7 +19,6 @@ GEMV_T, GU_T = 256 // M, H8 // M
 OPROJ_T = 256 // M                                  # Wo per-head rows = 256/M = 64 (O-fold phase2, m=4)
 KV_T = 128 // M                                      # K/V per-head rows = 64/M = 16 (one KV head: head_dim=64)
 KV_M = KV_T * M  # K/V outputs per head = 128 bf16
-KV_LOOP = KV_T * 2                                   # interleaved K/V loop bound (64 tiles)
 DN_SUB = 2
 DN_T = (E // M) // DN_SUB
 # MEASUREMENT KNOB (default 1 = production, byte-identical MLIR). Divides only the
@@ -34,7 +33,7 @@ assert GU_T % _FFN_DIV == 0 and DN_T % _FFN_DIV == 0, 'F3BEST_FFN_DIV must divid
 GU_T //= _FFN_DIV
 DN_T //= _FFN_DIV
 assert GU_T == DN_T, 'emitter shares one %cF loop bound for gate/up/down'
-WT_TILES = GEMV_T + KV_LOOP + OPROJ_T + 2 * GU_T + DN_T   # 64+64+64+512+256 = 960 (Wq|KV_interleaved|Wo|gate|up|down)
+WT_TILES = GEMV_T + 2 * KV_T + OPROJ_T + 2 * GU_T + DN_T  # 64+32+64+512+256 = 928 (Wq|Wk|Wv|Wo|gate|up|down)
 WT_BYTES = WT_TILES * PACKED
 O_TILES = E // M
 WO_BYTES = O_TILES * PACKED                         # full Wo BO = UNUSED arg3 placeholder (O now in A)
@@ -127,15 +126,12 @@ def _center_triple_b(h, p):
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<1024xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<1024xbf16>
     %{p}_uni_partial = aie.buffer(%t{h}) {{sym_name = "{p}_uni_partial"}} : memref<128xi8>
-    %{p}_K_partial = aie.buffer(%t{h}) {{sym_name = "{p}_K_partial"}} : memref<128xi8>
-    %{p}_V_partial = aie.buffer(%t{h}) {{sym_name = "{p}_V_partial"}} : memref<128xi8>
     %core{h} = aie.core(%t{h}) {{
       %c0 = arith.constant 0 : index
       %cN = arith.constant 9223372036854775807 : index
       %c1 = arith.constant 1 : index
       %c2 = arith.constant 2 : index
       %c64 = arith.constant 64 : index
-      %cKV_loop = arith.constant {KV_LOOP} : index
       %cKV = arith.constant {KV_T} : index
       %cF = arith.constant {GU_T} : index
       %c4 = arith.constant 4 : i32
@@ -163,22 +159,33 @@ def _center_triple_b(h, p):
         }}
         func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
-        // ---- phase 1b: interleaved K/V-GEMV (B0 = x_bundle) ----
-        // K and V tiles interleaved: K0,V0,K1,V1,...,K31,V31
-        // (no K/V lock — output written to P buffer later via scalar copy)
-        scf.for %j_kv = %c0 to %cKV_loop step %c2 {{
-          %j_phase = arith.divui %j_kv, %c2 : index
-          %ji = arith.index_cast %j_phase : index to i32
-          // K tile (A0)
+        // ---- phase 1b: K-GEMV + K-RoPE (B0 = x_bundle, output -> K_buf) ----
+        // (no K lock — output written to P buffer later via scalar copy)
+        scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
-          func.call @generic_bcast_gemv_bf16_kv(%ji, %{p}_A0, %{p}_B0, %{p}_K_partial, %c8, %{p}_K) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_kv(%ji0, %{p}_A0, %{p}_B0, %{p}_uni_partial, %c8, %{p}_K) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
-          // V tile (A1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
-          func.call @generic_bcast_gemv_bf16_kv(%ji, %{p}_A1, %{p}_B0, %{p}_V_partial, %c8, %{p}_V) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_kv(%ji1, %{p}_A1, %{p}_B0, %{p}_uni_partial, %c8, %{p}_K) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_kv_bundled(%{p}_K, %{p}_B0, %{p}_K, %kr) : (memref<130xbf16>, memref<2320xbf16>, memref<130xbf16>, i32) -> ()
+        // ---- phase 1c: V-GEMV (B0 = x_bundle, output -> V_buf) ----
+        // (no V lock — output written to P buffer later via scalar copy)
+        scf.for %j = %c0 to %cKV step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_kv(%ji0, %{p}_A0, %{p}_B0, %{p}_uni_partial, %c8, %{p}_V) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_kv(%ji1, %{p}_A1, %{p}_B0, %{p}_uni_partial, %c8, %{p}_V) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
         aie.use_lock(%{p}_B0p, Release, 1)
         // ---- phase 2: O-proj (B1 = attn_out, nchunk=8) ----
         aie.use_lock(%{p}_B1c, AcquireGreaterEqual, 1)
@@ -335,15 +342,12 @@ def _center_single_b(h, p):
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<1024xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<1024xbf16>
     %{p}_uni_partial = aie.buffer(%t{h}) {{sym_name = "{p}_uni_partial"}} : memref<128xi8>
-    %{p}_K_partial = aie.buffer(%t{h}) {{sym_name = "{p}_K_partial"}} : memref<128xi8>
-    %{p}_V_partial = aie.buffer(%t{h}) {{sym_name = "{p}_V_partial"}} : memref<128xi8>
     %core{h} = aie.core(%t{h}) {{
       %c0 = arith.constant 0 : index
       %cN = arith.constant 9223372036854775807 : index
       %c1 = arith.constant 1 : index
       %c2 = arith.constant 2 : index
       %c64 = arith.constant 64 : index
-      %cKV_loop = arith.constant {KV_LOOP} : index
       %cKV = arith.constant {KV_T} : index
       %cF = arith.constant {GU_T} : index
       %c4 = arith.constant 4 : i32
@@ -373,22 +377,33 @@ def _center_single_b(h, p):
         }}
         func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
-        // ---- phase 1b: interleaved K/V-GEMV (B = x_bundle) ----
-        // K and V tiles interleaved: K0,V0,K1,V1,...,K31,V31
-        // (no K/V lock — output written to P buffer later via scalar copy)
-        scf.for %j_kv = %c0 to %cKV_loop step %c2 {{
-          %j_phase = arith.divui %j_kv, %c2 : index
-          %ji = arith.index_cast %j_phase : index to i32
-          // K tile (A0)
+        // ---- phase 1b: K-GEMV + K-RoPE (B = x_bundle, output -> K_buf) ----
+        // (no K lock — output written to P buffer later via scalar copy)
+        scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
-          func.call @generic_bcast_gemv_bf16_kv(%ji, %{p}_A0, %{p}_B, %{p}_K_partial, %c8, %{p}_K) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_kv(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_K) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
-          // V tile (A1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
-          func.call @generic_bcast_gemv_bf16_kv(%ji, %{p}_A1, %{p}_B, %{p}_V_partial, %c8, %{p}_V) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_kv(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_K) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_kv_bundled(%{p}_K, %{p}_B, %{p}_K, %kr) : (memref<130xbf16>, memref<2320xbf16>, memref<130xbf16>, i32) -> ()
+        // ---- phase 1c: V-GEMV (B = x_bundle, output -> V_buf) ----
+        // (no V lock — output written to P buffer later via scalar copy)
+        scf.for %j = %c0 to %cKV step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_kv(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_V) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_kv(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_V) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
         aie.use_lock(%{p}_Bp, Release, 1)
         // ---- phase 2: O-proj broadcast (B = attn_out, nchunk=8) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
