@@ -127,95 +127,87 @@ def _center_triple_b(h, p):
       %cN = arith.constant 9223372036854775807 : index
       %c1 = arith.constant 1 : index
       %c2 = arith.constant 2 : index
-      %c64 = arith.constant {GEMV_T} : index
-      %c128 = arith.constant {GEMV_T + OPROJ_T} : index
-      %c384 = arith.constant {GEMV_T + OPROJ_T + GU_T} : index
-      %c640 = arith.constant {GEMV_T + OPROJ_T + GU_T + GU_T} : index
-      %c896 = arith.constant {WT_TILES} : index
+      %c64 = arith.constant 64 : index
+      %cF = arith.constant {GU_T} : index
       %c4 = arith.constant 4 : i32
       %c8 = arith.constant 8 : i32
       %qr = arith.constant 256 : i32
       %hc = arith.constant 1024 : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         func.call @_ha_noop() : () -> ()
-        // ==== Level 2: unified phase-blind loop over all 896 tiles ====
-        scf.for %j = %c0 to %c896 step %c2 {{
-          // -- Phase-boundary actions (j==0, j==64, j==128, j==384, j==640) --
-          %j_eq_0 = arith.cmpi eq, %j, %c0 : index
-          scf.if %j_eq_0 {{
-            aie.use_lock(%{p}_B0c, AcquireGreaterEqual, 1)
-            aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
-          }}
-          %j_eq_64 = arith.cmpi eq, %j, %c64 : index
-          scf.if %j_eq_64 {{
-            func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
-            aie.use_lock(%{p}_Qc, Release, 1)
-            aie.use_lock(%{p}_B0p, Release, 1)
-            aie.use_lock(%{p}_B1c, AcquireGreaterEqual, 1)
-            aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
-          }}
-          %j_eq_128 = arith.cmpi eq, %j, %c128 : index
-          scf.if %j_eq_128 {{
-            aie.use_lock(%{p}_B1p, Release, 1)
-            aie.use_lock(%{p}_Oc, Release, 1)
-            aie.use_lock(%{p}_B2c, AcquireGreaterEqual, 1)
-          }}
-          %j_eq_640 = arith.cmpi eq, %j, %c640 : index
-          scf.if %j_eq_640 {{
-            func.call @layer_fused_silu_mul_explicit_bf16(%{p}_gate, %{p}_up, %{p}_silu, %hc) : (memref<1024xbf16>, memref<1024xbf16>, memref<1024xbf16>, i32) -> ()
-            aie.use_lock(%{p}_B2p, Release, 1)
-            aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
-          }}
-          // -- A0 tile (weight index = j) --
+        // ---- phase 1: Q-GEMV + rope (B0 = x_bundle, nchunk=8) ----
+        aie.use_lock(%{p}_B0c, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          %j_lt_64 = arith.cmpi slt, %j, %c64 : index
-          scf.if %j_lt_64 {{
-            func.call @generic_bcast_gemv_bf16_q(%ji0, %{p}_A0, %{p}_B0, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
-          }} else {{
-            %j_lt_128 = arith.cmpi slt, %j, %c128 : index
-            scf.if %j_lt_128 {{
-              func.call @generic_bcast_gemv_bf16_o(%ji0, %{p}_A0, %{p}_B1, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
-            }} else {{
-              %j_lt_384 = arith.cmpi slt, %j, %c384 : index
-              scf.if %j_lt_384 {{
-                func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B2, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
-              }} else {{
-                %j_lt_640 = arith.cmpi slt, %j, %c640 : index
-                scf.if %j_lt_640 {{
-                  func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B2, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
-                }} else {{
-                  func.call @generic_bcast_gemv_bf16_d(%ji0, %{p}_A0, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
-                }}
-              }}
-            }}
-          }}
+          func.call @generic_bcast_gemv_bf16_q(%ji0, %{p}_A0, %{p}_B0, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
-          // -- A1 tile (weight index = j+1) --
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          %j1_lt_64 = arith.cmpi slt, %j1, %c64 : index
-          scf.if %j1_lt_64 {{
-            func.call @generic_bcast_gemv_bf16_q(%ji1, %{p}_A1, %{p}_B0, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
-          }} else {{
-            %j1_lt_128 = arith.cmpi slt, %j1, %c128 : index
-            scf.if %j1_lt_128 {{
-              func.call @generic_bcast_gemv_bf16_o(%ji1, %{p}_A1, %{p}_B1, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
-            }} else {{
-              %j1_lt_384 = arith.cmpi slt, %j1, %c384 : index
-              scf.if %j1_lt_384 {{
-                func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B2, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
-              }} else {{
-                %j1_lt_640 = arith.cmpi slt, %j1, %c640 : index
-                scf.if %j1_lt_640 {{
-                  func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B2, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
-                }} else {{
-                  func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
-                }}
-              }}
-            }}
-          }}
+          func.call @generic_bcast_gemv_bf16_q(%ji1, %{p}_A1, %{p}_B0, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
+        aie.use_lock(%{p}_Qc, Release, 1)
+        aie.use_lock(%{p}_B0p, Release, 1)
+        // ---- phase 2: O-proj (B1 = attn_out, nchunk=8) ----
+        aie.use_lock(%{p}_B1c, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %c64 step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_o(%ji0, %{p}_A0, %{p}_B1, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_o(%ji1, %{p}_A1, %{p}_B1, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        aie.use_lock(%{p}_B1p, Release, 1)
+        aie.use_lock(%{p}_Oc, Release, 1)
+        // ---- phase 3: FFN (B2 = ffn_in) ----
+        // 3a: gate GEMV (nchunk=8, output -> gate_buf)
+        aie.use_lock(%{p}_B2c, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B2, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B2, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        // 3b: up GEMV (nchunk=8, output -> up_buf)
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B2, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B2, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        aie.use_lock(%{p}_B2p, Release, 1)
+        // 3c: SiLU(gate) * up -> silu_buf (explicit pointers)
+        func.call @layer_fused_silu_mul_explicit_bf16(%{p}_gate, %{p}_up, %{p}_silu, %hc) : (memref<1024xbf16>, memref<1024xbf16>, memref<1024xbf16>, i32) -> ()
+        // 3d: down GEMV (nchunk=4, activation = silu_buf)
+        aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_d(%ji0, %{p}_A0, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_Pc, Release, 1)
@@ -306,95 +298,89 @@ def _center_single_b(h, p):
       %cN = arith.constant 9223372036854775807 : index
       %c1 = arith.constant 1 : index
       %c2 = arith.constant 2 : index
-      %c64 = arith.constant {GEMV_T} : index
-      %c128 = arith.constant {GEMV_T + OPROJ_T} : index
-      %c384 = arith.constant {GEMV_T + OPROJ_T + GU_T} : index
-      %c640 = arith.constant {GEMV_T + OPROJ_T + GU_T + GU_T} : index
-      %c896 = arith.constant {WT_TILES} : index
+      %c64 = arith.constant 64 : index
+      %cF = arith.constant {GU_T} : index
       %c4 = arith.constant 4 : i32
       %c8 = arith.constant 8 : i32
       %qr = arith.constant 256 : i32
       %hc = arith.constant 1024 : i32
       scf.for %tok = %c0 to %cN step %c1 {{
+        // #131: no-op call to force aiecc to link kc256.o (called by C++ wrapper on this core)
         func.call @_ha_noop() : () -> ()
-        // ==== Level 2: unified phase-blind loop over all 896 tiles ====
-        scf.for %j = %c0 to %c896 step %c2 {{
-          // -- Phase-boundary actions --
-          %j_eq_0 = arith.cmpi eq, %j, %c0 : index
-          scf.if %j_eq_0 {{
-            aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
-            aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
-          }}
-          %j_eq_64 = arith.cmpi eq, %j, %c64 : index
-          scf.if %j_eq_64 {{
-            func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
-            aie.use_lock(%{p}_Qc, Release, 1)
-            aie.use_lock(%{p}_Bp, Release, 1)
-            aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
-            aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
-          }}
-          %j_eq_128 = arith.cmpi eq, %j, %c128 : index
-          scf.if %j_eq_128 {{
-            aie.use_lock(%{p}_Bp, Release, 1)
-            aie.use_lock(%{p}_Oc, Release, 1)
-            aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
-          }}
-          %j_eq_640 = arith.cmpi eq, %j, %c640 : index
-          scf.if %j_eq_640 {{
-            func.call @layer_fused_silu_mul_explicit_bf16(%{p}_gate, %{p}_up, %{p}_silu, %hc) : (memref<1024xbf16>, memref<1024xbf16>, memref<1024xbf16>, i32) -> ()
-            aie.use_lock(%{p}_Bp, Release, 1)
-            aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
-          }}
-          // -- A0 tile (weight index = j) --
+        // ---- phase 1: Q-GEMV + rope (B = x_bundle, nchunk=8) ----
+        aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+        // #131B: Q-GEMV broadcast (column-major, j encodes block+chunk)
+        scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          %j_lt_64 = arith.cmpi slt, %j, %c64 : index
-          scf.if %j_lt_64 {{
-            func.call @generic_bcast_gemv_bf16_q(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
-          }} else {{
-            %j_lt_128 = arith.cmpi slt, %j, %c128 : index
-            scf.if %j_lt_128 {{
-              func.call @generic_bcast_gemv_bf16_o(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
-            }} else {{
-              %j_lt_384 = arith.cmpi slt, %j, %c384 : index
-              scf.if %j_lt_384 {{
-                func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
-              }} else {{
-                %j_lt_640 = arith.cmpi slt, %j, %c640 : index
-                scf.if %j_lt_640 {{
-                  func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
-                }} else {{
-                  func.call @generic_bcast_gemv_bf16_d(%ji0, %{p}_A0, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
-                }}
-              }}
-            }}
-          }}
+          func.call @generic_bcast_gemv_bf16_q(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
-          // -- A1 tile (weight index = j+1) --
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          %j1_lt_64 = arith.cmpi slt, %j1, %c64 : index
-          scf.if %j1_lt_64 {{
-            func.call @generic_bcast_gemv_bf16_q(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
-          }} else {{
-            %j1_lt_128 = arith.cmpi slt, %j1, %c128 : index
-            scf.if %j1_lt_128 {{
-              func.call @generic_bcast_gemv_bf16_o(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
-            }} else {{
-              %j1_lt_384 = arith.cmpi slt, %j1, %c384 : index
-              scf.if %j1_lt_384 {{
-                func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
-              }} else {{
-                %j1_lt_640 = arith.cmpi slt, %j1, %c640 : index
-                scf.if %j1_lt_640 {{
-                  func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
-                }} else {{
-                  func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
-                }}
-              }}
-            }}
-          }}
+          func.call @generic_bcast_gemv_bf16_q(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
+        aie.use_lock(%{p}_Qc, Release, 1)
+        aie.use_lock(%{p}_Bp, Release, 1)
+        // ---- phase 2: O-proj broadcast (B = attn_out, nchunk=8) ----
+        aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %c64 step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_o(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_o(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        aie.use_lock(%{p}_Bp, Release, 1)
+        aie.use_lock(%{p}_Oc, Release, 1)
+        // ---- phase 3: FFN (B = ffn_in) ----
+        // 3a: gate GEMV (nchunk=8, output -> gate_buf)
+        aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        // 3b: up GEMV (nchunk=8, output -> up_buf)
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<1024xbf16>) -> ()
+          aie.use_lock(%{p}_A1p, Release, 1)
+        }}
+        aie.use_lock(%{p}_Bp, Release, 1)
+        // 3c: SiLU(gate) * up -> silu_buf (explicit buffers)
+        func.call @layer_fused_silu_mul_explicit_bf16(%{p}_gate, %{p}_up, %{p}_silu, %hc) : (memref<1024xbf16>, memref<1024xbf16>, memref<1024xbf16>, i32) -> ()
+        // 3d: down GEMV (nchunk=4, activation = silu_buf)
+        aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
+        scf.for %j = %c0 to %cF step %c2 {{
+          aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+          %ji0 = arith.index_cast %j : index to i32
+          func.call @generic_bcast_gemv_bf16_d(%ji0, %{p}_A0, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
+          aie.use_lock(%{p}_A0p, Release, 1)
+          aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
+          %j1 = arith.addi %j, %c1 : index
+          %ji1 = arith.index_cast %j1 : index to i32
+          func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_Pc, Release, 1)
