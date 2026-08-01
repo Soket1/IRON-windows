@@ -122,10 +122,6 @@ def _center_triple_b(h, p):
     %{p}_B1c = aie.lock(%t{h}, 13) {{init = 0 : i32, sym_name = "{p}_B1c"}}
     %{p}_B2p = aie.lock(%t{h}, 14) {{init = 1 : i32, sym_name = "{p}_B2p"}}
     %{p}_B2c = aie.lock(%t{h}, 15) {{init = 0 : i32, sym_name = "{p}_B2c"}}
-    %{p}_Kp = aie.lock(%t{h}, 16) {{init = 1 : i32, sym_name = "{p}_Kp"}}
-    %{p}_Kc = aie.lock(%t{h}, 17) {{init = 0 : i32, sym_name = "{p}_Kc"}}
-    %{p}_Vp = aie.lock(%t{h}, 18) {{init = 1 : i32, sym_name = "{p}_Vp"}}
-    %{p}_Vc = aie.lock(%t{h}, 19) {{init = 0 : i32, sym_name = "{p}_Vc"}}
     %{p}_gate = aie.buffer(%t{h}) {{sym_name = "{p}_gate"}} : memref<1024xbf16>
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<1024xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<1024xbf16>
@@ -143,6 +139,10 @@ def _center_triple_b(h, p):
       %qr = arith.constant 256 : i32
       %kr = arith.constant 64 : i32
       %hc = arith.constant 1024 : i32
+      %{p}_Kbig = memref.reinterpret_cast %{p}_K to offset: [0], sizes: [2320], strides: [1] : memref<130xbf16> to memref<2320xbf16>
+      %{p}_Vbig = memref.reinterpret_cast %{p}_V to offset: [0], sizes: [2320], strides: [1] : memref<130xbf16> to memref<2320xbf16>
+      %{p}_Pk = memref.reinterpret_cast %{p}_P to offset: [{E}], sizes: [2320], strides: [1] : memref<2320xbf16> to memref<2320xbf16>
+      %{p}_Pv = memref.reinterpret_cast %{p}_P to offset: [{E+KV_M}], sizes: [2320], strides: [1] : memref<2320xbf16> to memref<2320xbf16>
       scf.for %tok = %c0 to %cN step %c1 {{
         func.call @_ha_noop() : () -> ()
         // ---- phase 1: Q-GEMV + rope + K-GEMV + K-RoPE + V-GEMV (B0 = x_bundle, nchunk=8) ----
@@ -162,7 +162,7 @@ def _center_triple_b(h, p):
         func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
         // ---- phase 1b: K-GEMV + K-RoPE (B0 = x_bundle, output -> K_buf) ----
-        aie.use_lock(%{p}_Kp, AcquireGreaterEqual, 1)
+        // (no K lock — output written to P buffer later via attn_copy)
         scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -175,9 +175,8 @@ def _center_triple_b(h, p):
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_kv_bundled(%{p}_K, %{p}_B0, %{p}_K, %kr) : (memref<130xbf16>, memref<2320xbf16>, memref<130xbf16>, i32) -> ()
-        aie.use_lock(%{p}_Kc, Release, 1)
         // ---- phase 1c: V-GEMV (B0 = x_bundle, output -> V_buf) ----
-        aie.use_lock(%{p}_Vp, AcquireGreaterEqual, 1)
+        // (no V lock — output written to P buffer later via attn_copy)
         scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -189,7 +188,6 @@ def _center_triple_b(h, p):
           func.call @generic_bcast_gemv_bf16_kv(%ji1, %{p}_A1, %{p}_B0, %{p}_uni_partial, %c8, %{p}_V) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        aie.use_lock(%{p}_Vc, Release, 1)
         aie.use_lock(%{p}_B0p, Release, 1)
         // ---- phase 2: O-proj (B1 = attn_out, nchunk=8) ----
         aie.use_lock(%{p}_B1c, AcquireGreaterEqual, 1)
@@ -249,6 +247,8 @@ def _center_triple_b(h, p):
           func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
+        func.call @attn_copy_bf16(%{p}_Pk, %{p}_Kbig, %kr) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%{p}_Pv, %{p}_Vbig, %kr) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
         aie.use_lock(%{p}_Pc, Release, 1)
       }}
       aie.end
@@ -286,18 +286,8 @@ def _center_triple_b(h, p):
       %m0 = aie.dma_start(MM2S, 0, ^pf{h}, ^qo{h})
     ^pf{h}:
       aie.use_lock(%{p}_Pc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_P : memref<2320xbf16>, 0, 2048)
+      aie.dma_bd(%{p}_P : memref<2320xbf16>, 0, {PH_STRIDE})
       aie.use_lock(%{p}_Pp, Release, 1)
-      aie.next_bd ^kf{h}
-    ^kf{h}:
-      aie.use_lock(%{p}_Kc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_K : memref<130xbf16>, 0, 64)
-      aie.use_lock(%{p}_Kp, Release, 1)
-      aie.next_bd ^vf{h}
-    ^vf{h}:
-      aie.use_lock(%{p}_Vc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_V : memref<130xbf16>, 0, 64)
-      aie.use_lock(%{p}_Vp, Release, 1)
       aie.next_bd ^pf{h}
     ^qo{h}:
       %m1 = aie.dma_start(MM2S, 1, ^qi{h}, ^e{h})
@@ -340,10 +330,6 @@ def _center_single_b(h, p):
     %{p}_Pc = aie.lock(%t{h}, 9) {{init = 0 : i32, sym_name = "{p}_Pc"}}
     %{p}_A1p = aie.lock(%t{h}, 10) {{init = 1 : i32, sym_name = "{p}_A1p"}}
     %{p}_A1c = aie.lock(%t{h}, 11) {{init = 0 : i32, sym_name = "{p}_A1c"}}
-    %{p}_Kp = aie.lock(%t{h}, 12) {{init = 1 : i32, sym_name = "{p}_Kp"}}
-    %{p}_Kc = aie.lock(%t{h}, 13) {{init = 0 : i32, sym_name = "{p}_Kc"}}
-    %{p}_Vp = aie.lock(%t{h}, 14) {{init = 1 : i32, sym_name = "{p}_Vp"}}
-    %{p}_Vc = aie.lock(%t{h}, 15) {{init = 0 : i32, sym_name = "{p}_Vc"}}
     %{p}_gate = aie.buffer(%t{h}) {{sym_name = "{p}_gate"}} : memref<1024xbf16>
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<1024xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<1024xbf16>
@@ -361,6 +347,10 @@ def _center_single_b(h, p):
       %qr = arith.constant 256 : i32
       %kr = arith.constant 64 : i32
       %hc = arith.constant 1024 : i32
+      %{p}_Kbig = memref.reinterpret_cast %{p}_K to offset: [0], sizes: [2320], strides: [1] : memref<130xbf16> to memref<2320xbf16>
+      %{p}_Vbig = memref.reinterpret_cast %{p}_V to offset: [0], sizes: [2320], strides: [1] : memref<130xbf16> to memref<2320xbf16>
+      %{p}_Pk = memref.reinterpret_cast %{p}_P to offset: [{E}], sizes: [2320], strides: [1] : memref<2320xbf16> to memref<2320xbf16>
+      %{p}_Pv = memref.reinterpret_cast %{p}_P to offset: [{E+KV_M}], sizes: [2320], strides: [1] : memref<2320xbf16> to memref<2320xbf16>
       scf.for %tok = %c0 to %cN step %c1 {{
         // #131: no-op call to force aiecc to link kc256.o (called by C++ wrapper on this core)
         func.call @_ha_noop() : () -> ()
@@ -382,7 +372,7 @@ def _center_single_b(h, p):
         func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
         // ---- phase 1b: K-GEMV + K-RoPE (B = x_bundle, output -> K_buf) ----
-        aie.use_lock(%{p}_Kp, AcquireGreaterEqual, 1)
+        // (no K lock — output written to P buffer later via attn_copy)
         scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -395,9 +385,8 @@ def _center_single_b(h, p):
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_kv_bundled(%{p}_K, %{p}_B, %{p}_K, %kr) : (memref<130xbf16>, memref<2320xbf16>, memref<130xbf16>, i32) -> ()
-        aie.use_lock(%{p}_Kc, Release, 1)
         // ---- phase 1c: V-GEMV (B = x_bundle, output -> V_buf) ----
-        aie.use_lock(%{p}_Vp, AcquireGreaterEqual, 1)
+        // (no V lock — output written to P buffer later via attn_copy)
         scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -409,7 +398,6 @@ def _center_single_b(h, p):
           func.call @generic_bcast_gemv_bf16_kv(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_V) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<130xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        aie.use_lock(%{p}_Vc, Release, 1)
         aie.use_lock(%{p}_Bp, Release, 1)
         // ---- phase 2: O-proj broadcast (B = attn_out, nchunk=8) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
@@ -469,6 +457,8 @@ def _center_single_b(h, p):
           func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
+        func.call @attn_copy_bf16(%{p}_Pk, %{p}_Kbig, %kr) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%{p}_Pv, %{p}_Vbig, %kr) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
         aie.use_lock(%{p}_Pc, Release, 1)
       }}
       aie.end
@@ -496,18 +486,8 @@ def _center_single_b(h, p):
       %m0 = aie.dma_start(MM2S, 0, ^pf{h}, ^m1{h})
     ^pf{h}:
       aie.use_lock(%{p}_Pc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_P : memref<2320xbf16>, 0, 2048)
+      aie.dma_bd(%{p}_P : memref<2320xbf16>, 0, {PH_STRIDE})
       aie.use_lock(%{p}_Pp, Release, 1)
-      aie.next_bd ^kf{h}
-    ^kf{h}:
-      aie.use_lock(%{p}_Kc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_K : memref<130xbf16>, 0, 64)
-      aie.use_lock(%{p}_Kp, Release, 1)
-      aie.next_bd ^vf{h}
-    ^vf{h}:
-      aie.use_lock(%{p}_Vc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_V : memref<130xbf16>, 0, 64)
-      aie.use_lock(%{p}_Vp, Release, 1)
       aie.next_bd ^pf{h}
     ^m1{h}:
       %m1 = aie.dma_start(MM2S, 1, ^qo{h}, ^e{h})
