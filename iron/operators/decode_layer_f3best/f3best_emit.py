@@ -120,6 +120,8 @@ def _center_triple_b(h, p):
     %{p}_A1c = aie.lock(%t{h}, 11) {{init = 0 : i32, sym_name = "{p}_A1c"}}
     %{p}_B1p = aie.lock(%t{h}, 12) {{init = 1 : i32, sym_name = "{p}_B1p"}}
     %{p}_B1c = aie.lock(%t{h}, 13) {{init = 0 : i32, sym_name = "{p}_B1c"}}
+    %{p}_B2p = aie.lock(%t{h}, 14) {{init = 1 : i32, sym_name = "{p}_B2p"}}
+    %{p}_B2c = aie.lock(%t{h}, 15) {{init = 0 : i32, sym_name = "{p}_B2c"}}
     %{p}_Kp = aie.lock(%t{h}, 16) {{init = 1 : i32, sym_name = "{p}_Kp"}}
     %{p}_Kc = aie.lock(%t{h}, 17) {{init = 0 : i32, sym_name = "{p}_Kc"}}
     %{p}_Vp = aie.lock(%t{h}, 18) {{init = 1 : i32, sym_name = "{p}_Vp"}}
