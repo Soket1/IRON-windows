@@ -139,10 +139,8 @@ def _center_triple_b(h, p):
       %qr = arith.constant 256 : i32
       %kr = arith.constant 64 : i32
       %hc = arith.constant 1024 : i32
-      %{p}_Kbig = memref.reinterpret_cast %{p}_K to offset: [0], sizes: [2320], strides: [1] : memref<130xbf16> to memref<2320xbf16>
-      %{p}_Vbig = memref.reinterpret_cast %{p}_V to offset: [0], sizes: [2320], strides: [1] : memref<130xbf16> to memref<2320xbf16>
-      %{p}_Pk = memref.reinterpret_cast %{p}_P to offset: [{E}], sizes: [2320], strides: [1] : memref<2320xbf16> to memref<2320xbf16>
-      %{p}_Pv = memref.reinterpret_cast %{p}_P to offset: [{E+KV_M}], sizes: [2320], strides: [1] : memref<2320xbf16> to memref<2320xbf16>
+      %{p}_Pk = memref.subview %{p}_P[{E}] [64] [1] : memref<2320xbf16> to memref<64xbf16, strided<[1], offset: {E}>>
+      %{p}_Pv = memref.subview %{p}_P[{E+KV_M}] [64] [1] : memref<2320xbf16> to memref<64xbf16, strided<[1], offset: {E+KV_M}>>
       scf.for %tok = %c0 to %cN step %c1 {{
         func.call @_ha_noop() : () -> ()
         // ---- phase 1: Q-GEMV + rope + K-GEMV + K-RoPE + V-GEMV (B0 = x_bundle, nchunk=8) ----
@@ -247,8 +245,8 @@ def _center_triple_b(h, p):
           func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        func.call @attn_copy_bf16(%{p}_Pk, %{p}_Kbig, %kr) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
-        func.call @attn_copy_bf16(%{p}_Pv, %{p}_Vbig, %kr) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%{p}_Pk, %{p}_K, %kr) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%{p}_Pv, %{p}_V, %kr) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%{p}_Pc, Release, 1)
       }}
       aie.end
@@ -347,10 +345,8 @@ def _center_single_b(h, p):
       %qr = arith.constant 256 : i32
       %kr = arith.constant 64 : i32
       %hc = arith.constant 1024 : i32
-      %{p}_Kbig = memref.reinterpret_cast %{p}_K to offset: [0], sizes: [2320], strides: [1] : memref<130xbf16> to memref<2320xbf16>
-      %{p}_Vbig = memref.reinterpret_cast %{p}_V to offset: [0], sizes: [2320], strides: [1] : memref<130xbf16> to memref<2320xbf16>
-      %{p}_Pk = memref.reinterpret_cast %{p}_P to offset: [{E}], sizes: [2320], strides: [1] : memref<2320xbf16> to memref<2320xbf16>
-      %{p}_Pv = memref.reinterpret_cast %{p}_P to offset: [{E+KV_M}], sizes: [2320], strides: [1] : memref<2320xbf16> to memref<2320xbf16>
+      %{p}_Pk = memref.subview %{p}_P[{E}] [64] [1] : memref<2320xbf16> to memref<64xbf16, strided<[1], offset: {E}>>
+      %{p}_Pv = memref.subview %{p}_P[{E+KV_M}] [64] [1] : memref<2320xbf16> to memref<64xbf16, strided<[1], offset: {E+KV_M}>>
       scf.for %tok = %c0 to %cN step %c1 {{
         // #131: no-op call to force aiecc to link kc256.o (called by C++ wrapper on this core)
         func.call @_ha_noop() : () -> ()
@@ -457,8 +453,8 @@ def _center_single_b(h, p):
           func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        func.call @attn_copy_bf16(%{p}_Pk, %{p}_Kbig, %kr) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
-        func.call @attn_copy_bf16(%{p}_Pv, %{p}_Vbig, %kr) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%{p}_Pk, %{p}_K, %kr) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%{p}_Pv, %{p}_V, %kr) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%{p}_Pc, Release, 1)
       }}
       aie.end
@@ -872,7 +868,7 @@ funcs = (
     '    func.func private @generic_bcast_gemv_bf16_d(i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) attributes {link_with = "layer_fused_unified_bcast.o"}\n'
     '    func.func private @layer_fused_silu_mul_explicit_bf16(memref<1024xbf16>, memref<1024xbf16>, memref<1024xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'
     '    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<4608xi8>, memref<2320xbf16>) attributes {link_with = "layer_fused_relay.o"}\n'
-    '    func.func private @attn_copy_bf16(memref<2320xbf16>, memref<2320xbf16>, i32) attributes {link_with = "attn_concat.o"}\n'
+    '    func.func private @attn_copy_bf16(memref<*xbf16>, memref<*xbf16>, i32) attributes {link_with = "attn_concat.o"}\n'
     '    func.func private @oproj_matvec_v2_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) attributes {link_with = "fused_dequant_gemv_v2_oproj_signed_2048k_g32.o"}\n'
     '    func.func private @layer_fused_add_bf16(memref<2048xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'
     '    func.func private @layer_fused_rms_norm2_bf16(memref<2320xbf16>, memref<2048xbf16>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}\n'
@@ -1149,21 +1145,21 @@ if RL_FIX:
         // phase 1: x_bundle (circuit S2MM0) -> mx_o
         aie.use_lock(%mx_xc, AcquireGreaterEqual, 1)
         aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
-        func.call @attn_copy_bf16(%mx_x, %mx_o, %nx) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%mx_x, %mx_o, %nx) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%mx_xp, Release, 1)
         aie.use_lock(%mx_oc, Release, 1)
         // phase 2: attn_out — wait BOTH halves (jA pkt0 + jB pkt2) then copy full
         aie.use_lock(%mx_a0c, AcquireGreaterEqual, 1)
         aie.use_lock(%mx_a1c, AcquireGreaterEqual, 1)
         aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
-        func.call @attn_copy_bf16(%mx_a, %mx_o, %ne) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%mx_a, %mx_o, %ne) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%mx_a0p, Release, 1)
         aie.use_lock(%mx_a1p, Release, 1)
         aie.use_lock(%mx_oc, Release, 1)
         // phase 3: ffn_in (pkt 1, S2MM1) -> mx_o
         aie.use_lock(%mx_fc, AcquireGreaterEqual, 1)
         aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
-        func.call @attn_copy_bf16(%mx_f, %mx_o, %ne) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%mx_f, %mx_o, %ne) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%mx_fp, Release, 1)
         aie.use_lock(%mx_oc, Release, 1)
       }
@@ -1230,19 +1226,19 @@ else:
         // phase1 bcast: x (2320)
         aie.use_lock(%mx_xc, AcquireGreaterEqual, 1)
         aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
-        func.call @attn_copy_bf16(%mx_x, %mx_o, %nx) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%mx_x, %mx_o, %nx) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%mx_xp, Release, 1)
         aie.use_lock(%mx_oc, Release, 1)
         // phase2 bcast: attn_out (2048, tail keeps x LUT)
         aie.use_lock(%mx_ac, AcquireGreaterEqual, 1)
         aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
-        func.call @attn_copy_bf16(%mx_a, %mx_o, %ne) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%mx_a, %mx_o, %ne) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%mx_ap, Release, 1)
         aie.use_lock(%mx_oc, Release, 1)
         // phase3 bcast: ffn_in (2048)
         aie.use_lock(%mx_fc, AcquireGreaterEqual, 1)
         aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
-        func.call @attn_copy_bf16(%mx_f, %mx_o, %ne) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%mx_f, %mx_o, %ne) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%mx_fp, Release, 1)
         aie.use_lock(%mx_oc, Release, 1)
       }
@@ -1298,12 +1294,12 @@ prea = """
       scf.for %it = %z to %N step %one {
         aie.use_lock(%pa_ac, AcquireGreaterEqual, 1)
         aie.use_lock(%pa_op, AcquireGreaterEqual, 1)
-        func.call @attn_copy_bf16(%pa_a, %pa_o, %ne) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%pa_a, %pa_o, %ne) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%pa_ap, Release, 1)
         aie.use_lock(%pa_oc, Release, 1)
         aie.use_lock(%pa_fc, AcquireGreaterEqual, 1)
         aie.use_lock(%pa_op, AcquireGreaterEqual, 1)
-        func.call @attn_copy_bf16(%pa_f, %pa_o, %ne) : (memref<2320xbf16>, memref<2320xbf16>, i32) -> ()
+        func.call @attn_copy_bf16(%pa_f, %pa_o, %ne) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
         aie.use_lock(%pa_fp, Release, 1)
         aie.use_lock(%pa_oc, Release, 1)
       }
