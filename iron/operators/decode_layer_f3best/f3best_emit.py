@@ -139,8 +139,8 @@ def _center_triple_b(h, p):
       %qr = arith.constant 256 : i32
       %kr = arith.constant 64 : i32
       %hc = arith.constant 1024 : i32
-      %{p}_Pk = memref.subview %{p}_P[{E}] [64] [1] : memref<2320xbf16> to memref<64xbf16, strided<[1], offset: {E}>>
-      %{p}_Pv = memref.subview %{p}_P[{E+KV_M}] [64] [1] : memref<2320xbf16> to memref<64xbf16, strided<[1], offset: {E+KV_M}>>
+      %c2048 = arith.constant 2048 : index
+      %c2112 = arith.constant 2112 : index
       scf.for %tok = %c0 to %cN step %c1 {{
         func.call @_ha_noop() : () -> ()
         // ---- phase 1: Q-GEMV + rope + K-GEMV + K-RoPE + V-GEMV (B0 = x_bundle, nchunk=8) ----
@@ -160,7 +160,7 @@ def _center_triple_b(h, p):
         func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
         // ---- phase 1b: K-GEMV + K-RoPE (B0 = x_bundle, output -> K_buf) ----
-        // (no K lock — output written to P buffer later via attn_copy)
+        // (no K lock — output written to P buffer later via scalar copy)
         scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -174,7 +174,7 @@ def _center_triple_b(h, p):
         }}
         func.call @rope_kv_bundled(%{p}_K, %{p}_B0, %{p}_K, %kr) : (memref<130xbf16>, memref<2320xbf16>, memref<130xbf16>, i32) -> ()
         // ---- phase 1c: V-GEMV (B0 = x_bundle, output -> V_buf) ----
-        // (no V lock — output written to P buffer later via attn_copy)
+        // (no V lock — output written to P buffer later via scalar copy)
         scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -245,8 +245,18 @@ def _center_triple_b(h, p):
           func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        func.call @attn_copy_bf16(%{p}_Pk, %{p}_K, %kr) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
-        func.call @attn_copy_bf16(%{p}_Pv, %{p}_V, %kr) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
+        // Copy K_buf[0:64] to P[2048:2112]
+        scf.for %i = %c0 to %c64 step %c1 {{
+          %val = memref.load %{p}_K[%i] : memref<130xbf16>
+          %dst = arith.addi %i, %c2048 : index
+          memref.store %val, %{p}_P[%dst] : memref<2320xbf16>
+        }}
+        // Copy V_buf[0:64] to P[2112:2176]
+        scf.for %i = %c0 to %c64 step %c1 {{
+          %val = memref.load %{p}_V[%i] : memref<130xbf16>
+          %dst = arith.addi %i, %c2112 : index
+          memref.store %val, %{p}_P[%dst] : memref<2320xbf16>
+        }}
         aie.use_lock(%{p}_Pc, Release, 1)
       }}
       aie.end
@@ -345,8 +355,8 @@ def _center_single_b(h, p):
       %qr = arith.constant 256 : i32
       %kr = arith.constant 64 : i32
       %hc = arith.constant 1024 : i32
-      %{p}_Pk = memref.subview %{p}_P[{E}] [64] [1] : memref<2320xbf16> to memref<64xbf16, strided<[1], offset: {E}>>
-      %{p}_Pv = memref.subview %{p}_P[{E+KV_M}] [64] [1] : memref<2320xbf16> to memref<64xbf16, strided<[1], offset: {E+KV_M}>>
+      %c2048 = arith.constant 2048 : index
+      %c2112 = arith.constant 2112 : index
       scf.for %tok = %c0 to %cN step %c1 {{
         // #131: no-op call to force aiecc to link kc256.o (called by C++ wrapper on this core)
         func.call @_ha_noop() : () -> ()
@@ -368,7 +378,7 @@ def _center_single_b(h, p):
         func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
         // ---- phase 1b: K-GEMV + K-RoPE (B = x_bundle, output -> K_buf) ----
-        // (no K lock — output written to P buffer later via attn_copy)
+        // (no K lock — output written to P buffer later via scalar copy)
         scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -382,7 +392,7 @@ def _center_single_b(h, p):
         }}
         func.call @rope_kv_bundled(%{p}_K, %{p}_B, %{p}_K, %kr) : (memref<130xbf16>, memref<2320xbf16>, memref<130xbf16>, i32) -> ()
         // ---- phase 1c: V-GEMV (B = x_bundle, output -> V_buf) ----
-        // (no V lock — output written to P buffer later via attn_copy)
+        // (no V lock — output written to P buffer later via scalar copy)
         scf.for %j = %c0 to %cKV step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -453,8 +463,18 @@ def _center_single_b(h, p):
           func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<4608xi8>, memref<1024xbf16>, memref<128xi8>, i32, memref<2320xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        func.call @attn_copy_bf16(%{p}_Pk, %{p}_K, %kr) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
-        func.call @attn_copy_bf16(%{p}_Pv, %{p}_V, %kr) : (memref<*xbf16>, memref<*xbf16>, i32) -> ()
+        // Copy K_buf[0:64] to P[2048:2112]
+        scf.for %i = %c0 to %c64 step %c1 {{
+          %val = memref.load %{p}_K[%i] : memref<130xbf16>
+          %dst = arith.addi %i, %c2048 : index
+          memref.store %val, %{p}_P[%dst] : memref<2320xbf16>
+        }}
+        // Copy V_buf[0:64] to P[2112:2176]
+        scf.for %i = %c0 to %c64 step %c1 {{
+          %val = memref.load %{p}_V[%i] : memref<130xbf16>
+          %dst = arith.addi %i, %c2112 : index
+          memref.store %val, %{p}_P[%dst] : memref<2320xbf16>
+        }}
         aie.use_lock(%{p}_Pc, Release, 1)
       }}
       aie.end
