@@ -17,8 +17,8 @@ GROUPS = E // G
 PACKED = M * E // 2 + M * GROUPS * 2
 GEMV_T, GU_T = 256 // M, H8 // M
 OPROJ_T = 256 // M                                  # Wo per-head rows = 256/M = 64 (O-fold phase2, m=4)
-KV_T = 64 // M                                      # K/V per-head rows = 64/M = 16 (one KV head: head_dim=64)
-KV_M = KV_T * M                                     # K/V outputs per head = 64 bf16
+KV_T = 128 // M                                      # K/V per-head rows = 64/M = 16 (one KV head: head_dim=64)
+KV_M = KV_T * M  # K/V outputs per head = 128 bf16
 DN_SUB = 2
 DN_T = (E // M) // DN_SUB
 # MEASUREMENT KNOB (default 1 = production, byte-identical MLIR). Divides only the
@@ -132,7 +132,7 @@ def _center_triple_b(h, p):
       %c1 = arith.constant 1 : index
       %c2 = arith.constant 2 : index
       %c64 = arith.constant 64 : index
-      %cKV = arith.constant {KV_T*2} : index
+      %cKV = arith.constant {KV_T} : index
       %cF = arith.constant {GU_T} : index
       %c4 = arith.constant 4 : i32
       %c8 = arith.constant 8 : i32
@@ -348,7 +348,7 @@ def _center_single_b(h, p):
       %c1 = arith.constant 1 : index
       %c2 = arith.constant 2 : index
       %c64 = arith.constant 64 : index
-      %cKV = arith.constant {KV_T*2} : index
+      %cKV = arith.constant {KV_T} : index
       %cF = arith.constant {GU_T} : index
       %c4 = arith.constant 4 : i32
       %c8 = arith.constant 8 : i32
