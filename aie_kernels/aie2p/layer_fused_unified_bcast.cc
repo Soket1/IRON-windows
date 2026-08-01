@@ -111,3 +111,19 @@ void generic_bcast_gemv_bf16(
         aie::store_v(partial, cur);
     }
 }
+
+// Thin aliases for MLIR type dispatch. MLIR requires exact type matches, so the
+// emitter declares 4 type-specific names. The C++ kernel body is identical for
+// all callers — the alias just forwards to the real implementation.
+extern "C" void generic_bcast_gemv_bf16_q(uint32_t j, const uint8_t *w, const bfloat16 *a, float *p, uint32_t n, bfloat16 *o) {
+    generic_bcast_gemv_bf16(j, w, a, p, n, o);
+}
+extern "C" void generic_bcast_gemv_bf16_o(uint32_t j, const uint8_t *w, const bfloat16 *a, float *p, uint32_t n, bfloat16 *o) {
+    generic_bcast_gemv_bf16(j, w, a, p, n, o);
+}
+extern "C" void generic_bcast_gemv_bf16_g(uint32_t j, const uint8_t *w, const bfloat16 *a, float *p, uint32_t n, bfloat16 *o) {
+    generic_bcast_gemv_bf16(j, w, a, p, n, o);
+}
+extern "C" void generic_bcast_gemv_bf16_d(uint32_t j, const uint8_t *w, const bfloat16 *a, float *p, uint32_t n, bfloat16 *o) {
+    generic_bcast_gemv_bf16(j, w, a, p, n, o);
+}
