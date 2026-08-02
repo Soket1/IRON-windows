@@ -448,15 +448,16 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
         int d0 = 0;
         for (; d0 + 64 <= head_dim; d0 += 64) {
 #ifdef FLOWKV_VALUE_AMAC
-            // AMAC path: accumulate in accums via aie::mac (native VMAC).
-            // Replaces the to_vector+mul+add chain (3 ops per vector) with
-            // one fused multiply-accumulate instruction.  f is truncated to
-            // bf16 for the VMAC; rel_L2 difference < 0.05 vs. float32 path.
-            aie::accum<accfloat, 16> y0_acc, y1_acc, y2_acc, y3_acc;
-            y0_acc.from_vector(aie::mul(aie::load_v<16>(y_head + d0 +  0), corr_vec));
-            y1_acc.from_vector(aie::mul(aie::load_v<16>(y_head + d0 + 16), corr_vec));
-            y2_acc.from_vector(aie::mul(aie::load_v<16>(y_head + d0 + 32), corr_vec));
-            y3_acc.from_vector(aie::mul(aie::load_v<16>(y_head + d0 + 48), corr_vec));
+            // Register-resident accumulator path: y stays in aie::accum (accfloat),
+            // V is loaded as bf16 vector (no accum round-trip → no to_vector<float>),
+            // product via mul(bf16, bf16)→accum, accumulation via add(accum,
+            // accum).  Saves 1 VLIW slot per vector per position vs. the legacy
+            // float32 path (4 slots → 3: load + mul + add instead of load→accum +
+            // to_vector + mul + add).
+            aie::accum<accfloat, 16> y0_acc = aie::mul(aie::load_v<16>(y_head + d0 +  0), corr_vec);
+            aie::accum<accfloat, 16> y1_acc = aie::mul(aie::load_v<16>(y_head + d0 + 16), corr_vec);
+            aie::accum<accfloat, 16> y2_acc = aie::mul(aie::load_v<16>(y_head + d0 + 32), corr_vec);
+            aie::accum<accfloat, 16> y3_acc = aie::mul(aie::load_v<16>(y_head + d0 + 48), corr_vec);
   #ifndef FLOWKV_NOVALUE
             const bfloat16 *v_col = v_chunk + d0;
             AIE_PREPARE_FOR_PIPELINING
@@ -466,10 +467,15 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
                 aie::vector<bfloat16, 16> f_vec = aie::broadcast<bfloat16, 16>(f_bf16);
                 const bfloat16 *v_pos = v_col + pos * head_dim;
 
-                y0_acc = aie::mac(y0_acc, aie::load_v<16>(v_pos +  0), f_vec);
-                y1_acc = aie::mac(y1_acc, aie::load_v<16>(v_pos + 16), f_vec);
-                y2_acc = aie::mac(y2_acc, aie::load_v<16>(v_pos + 32), f_vec);
-                y3_acc = aie::mac(y3_acc, aie::load_v<16>(v_pos + 48), f_vec);
+                    aie::vector<bfloat16, 16> v0 = aie::load_v<16>(v_pos +  0);
+                aie::vector<bfloat16, 16> v1 = aie::load_v<16>(v_pos + 16);
+                aie::vector<bfloat16, 16> v2 = aie::load_v<16>(v_pos + 32);
+                aie::vector<bfloat16, 16> v3 = aie::load_v<16>(v_pos + 48);
+                // bf16 * bf16 → accum, then accum + accum (no to_vector<float>)
+                y0_acc = aie::add(y0_acc, aie::mul(v0, f_vec));
+                y1_acc = aie::add(y1_acc, aie::mul(v1, f_vec));
+                y2_acc = aie::add(y2_acc, aie::mul(v2, f_vec));
+                y3_acc = aie::add(y3_acc, aie::mul(v3, f_vec));
             }
   #endif
             aie::store_v(y_head + d0 +  0, y0_acc.to_vector<float>());
