@@ -447,6 +447,36 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
         // Blocked by 64 dims so register pressure is fixed for HEAD_DIM 64/128/256.
         int d0 = 0;
         for (; d0 + 64 <= head_dim; d0 += 64) {
+#ifdef FLOWKV_VALUE_AMAC
+            // AMAC path: accumulate in accums via aie::mac (native VMAC).
+            // Replaces the to_vector+mul+add chain (3 ops per vector) with
+            // one fused multiply-accumulate instruction.  f is truncated to
+            // bf16 for the VMAC; rel_L2 difference < 0.05 vs. float32 path.
+            aie::accum<accfloat, 16> y0_acc, y1_acc, y2_acc, y3_acc;
+            y0_acc.from_vector(aie::mul(aie::load_v<16>(y_head + d0 +  0), corr_vec));
+            y1_acc.from_vector(aie::mul(aie::load_v<16>(y_head + d0 + 16), corr_vec));
+            y2_acc.from_vector(aie::mul(aie::load_v<16>(y_head + d0 + 32), corr_vec));
+            y3_acc.from_vector(aie::mul(aie::load_v<16>(y_head + d0 + 48), corr_vec));
+  #ifndef FLOWKV_NOVALUE
+            const bfloat16 *v_col = v_chunk + d0;
+            AIE_PREPARE_FOR_PIPELINING
+            for (int pos = 0; pos < chunk_size; pos++) {
+                float f = static_cast<float>(scores_in[pos * num_q_heads + h]);
+                bfloat16 f_bf16 = static_cast<bfloat16>(f);
+                aie::vector<bfloat16, 16> f_vec = aie::broadcast<bfloat16, 16>(f_bf16);
+                const bfloat16 *v_pos = v_col + pos * head_dim;
+
+                y0_acc = aie::mac(y0_acc, aie::load_v<16>(v_pos +  0), f_vec);
+                y1_acc = aie::mac(y1_acc, aie::load_v<16>(v_pos + 16), f_vec);
+                y2_acc = aie::mac(y2_acc, aie::load_v<16>(v_pos + 32), f_vec);
+                y3_acc = aie::mac(y3_acc, aie::load_v<16>(v_pos + 48), f_vec);
+            }
+  #endif
+            aie::store_v(y_head + d0 +  0, y0_acc.to_vector<float>());
+            aie::store_v(y_head + d0 + 16, y1_acc.to_vector<float>());
+            aie::store_v(y_head + d0 + 32, y2_acc.to_vector<float>());
+            aie::store_v(y_head + d0 + 48, y3_acc.to_vector<float>());
+#else
             aie::vector<float, 16> y0 = aie::mul(aie::load_v<16>(y_head + d0 +  0), corr_vec);
             aie::vector<float, 16> y1 = aie::mul(aie::load_v<16>(y_head + d0 + 16), corr_vec);
             aie::vector<float, 16> y2 = aie::mul(aie::load_v<16>(y_head + d0 + 32), corr_vec);
@@ -480,6 +510,7 @@ void flowkv_value_accum_bf16(const bfloat16 *__restrict packed_in,
             aie::store_v(y_head + d0 + 16, y1);
             aie::store_v(y_head + d0 + 32, y2);
             aie::store_v(y_head + d0 + 48, y3);
+#endif
         }
         // Tail, never taken for HEAD_DIM 64/128/256. Present so a head_dim that
         // is not a multiple of 64 degrades to the slow form instead of writing
