@@ -14,7 +14,8 @@ any other shape rather than silently generalizing.
 
 
 def my_decode_layer_f3best(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
-                           head_dim=64, num_kv_heads=8, attn_group=4, seq_len=32):
+                           head_dim=64, num_kv_heads=8, attn_group=4, seq_len=32,
+                           with_npu_kv=False):
     import os
     import sys
 
@@ -22,7 +23,10 @@ def my_decode_layer_f3best(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
         raise ValueError("decode_layer_f3best targets npu2 (AIE2P); device_type 'npu' (NPU1) unsupported")
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from f3best_emit import OFold8F3BestEmitter
+    if with_npu_kv:
+        from f3best_emit import OFold8F3BestEmitter
+    else:
+        from f3best_emit_nokv import OFold8F3BestEmitter
 
     return OFold8F3BestEmitter(
         NH=8, E=embed_dim, G=group_size, M=4, HD=head_dim,
