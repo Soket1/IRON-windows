@@ -953,36 +953,36 @@ class OFold8F3BestEmitter:
       %N = arith.constant 9223372036854775807 : index
       %one = arith.constant 1 : index
       scf.for %it = %z to %N step %one {{
-        aie.use_lock(%rl_c0, AcquireGreaterEqual, 1)
-        aie.use_lock(%rl_c1, AcquireGreaterEqual, 1)
-        aie.use_lock(%rl_op, AcquireGreaterEqual, 1)
-        aie.use_lock(%rl_p0, Release, 1)
-        aie.use_lock(%rl_p1, Release, 1)
-        aie.use_lock(%rl_oc, Release, 1)
+        aie.use_lock(%rl_p0c, AcquireGreaterEqual, 1)
+        aie.use_lock(%rl_p1c, AcquireGreaterEqual, 1)
+        aie.use_lock(%rl_opp, AcquireGreaterEqual, 1)
+        aie.use_lock(%rl_p0p, Release, 1)
+        aie.use_lock(%rl_p1p, Release, 1)
+        aie.use_lock(%rl_opc, Release, 1)
       }}
       aie.end
     }}
     %mem_rl = aie.mem(%rl) {{
       %s0 = aie.dma_start(S2MM, {_s2mm_0}, ^rh0, ^rs1)
     ^rh0:
-      aie.use_lock(%rl_p0, AcquireGreaterEqual, 1)
+      aie.use_lock(%rl_p0p, AcquireGreaterEqual, 1)
       aie.dma_bd(%rl_A : memref<{E}xbf16>, 0, {E2})
-      aie.use_lock(%rl_c0, Release, 1)
+      aie.use_lock(%rl_p0c, Release, 1)
       aie.next_bd ^rh0
     ^rs1:
       %s1 = aie.dma_start(S2MM, {_s2mm_1}, ^rh1, ^rm0)
     ^rh1:
-      aie.use_lock(%rl_p1, AcquireGreaterEqual, 1)
+      aie.use_lock(%rl_p1p, AcquireGreaterEqual, 1)
       aie.dma_bd(%rl_A : memref<{E}xbf16>, {E2}, {E2})
-      aie.use_lock(%rl_c1, Release, 1)
+      aie.use_lock(%rl_p1c, Release, 1)
       aie.next_bd ^rh1
     ^rm0:
       %m0 = aie.dma_start(MM2S, {_mm2s}, ^ro, ^re)
     ^ro:
-      aie.use_lock(%rl_oc, AcquireGreaterEqual, 1)
+      aie.use_lock(%rl_opc, AcquireGreaterEqual, 1)
       aie.dma_bd_packet(0, 0)
       aie.dma_bd(%rl_A : memref<{E}xbf16>, 0, {E})
-      aie.use_lock(%rl_op, Release, 1)
+      aie.use_lock(%rl_opp, Release, 1)
       aie.next_bd ^ro
     ^re:
       aie.end
