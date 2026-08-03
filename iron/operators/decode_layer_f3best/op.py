@@ -61,7 +61,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         _handasm_rr = '_rr' if _os.environ.get('F3BEST_HANDASM_RR', '').strip() != '' else ''
         _kv_abi = '_kv' if self.with_npu_kv else '_nokv'
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_pad{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC (#176), _pad = pipeline drain padding (#177)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",

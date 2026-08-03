@@ -72,10 +72,8 @@ void generic_bcast_gemv_bf16(
     const uint32_t chunk = j_phase % nchunk;
     const uint32_t block = j_phase / nchunk;
 
-    // The hand-asm kernel sets crrnd internally. Set it here too so the
-    // wrapper's own float32 accumulation (aie::add, aie::store_v,
-    // accum<->float conversions) uses consistent rounding.
-    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    // The hand-asm kernel sets crrnd=conv_even internally; no need to
+    // re-set it here since no other code runs on this tile between calls.
 
     // Scratch buffer for hand-asm output (32 bf16 values, AIE-vector aligned).
     alignas(64) bfloat16 scratch[N];

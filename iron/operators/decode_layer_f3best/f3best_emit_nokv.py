@@ -31,7 +31,8 @@ assert GU_T % _FFN_DIV == 0 and DN_T % _FFN_DIV == 0, 'F3BEST_FFN_DIV must divid
 GU_T //= _FFN_DIV
 DN_T //= _FFN_DIV
 assert GU_T == DN_T, 'emitter shares one %cF loop bound for gate/up/down'
-WT_TILES = GEMV_T + OPROJ_T + 2 * GU_T + DN_T       # 64+64+512+256 = 896 (Wq|Wo|gate|up|down)
+PAD_TILES = 1  # #177: sentinel tiles keep DDR stream alive across phase boundaries
+WT_TILES = GEMV_T + OPROJ_T + 2 * GU_T + DN_T + 2 * PAD_TILES  # 64+64+512+256+2=898
 WT_BYTES = WT_TILES * PACKED
 O_TILES = E // M
 WO_BYTES = O_TILES * PACKED                         # full Wo BO = UNUSED arg3 placeholder (O now in A)
@@ -149,6 +150,9 @@ def _center_triple_b(h, p):
           func.call @generic_bcast_gemv_bf16_q(%ji1, %{p}_A1, %{p}_B0, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<322xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
+        // #177: consume padding tile — keep DDR stream alive during rope gap
+        aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_A0p, Release, 1)
         func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<322xbf16>, memref<2320xbf16>, memref<322xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
         aie.use_lock(%{p}_B0p, Release, 1)
@@ -166,6 +170,9 @@ def _center_triple_b(h, p):
           func.call @generic_bcast_gemv_bf16_o(%ji1, %{p}_A1, %{p}_B1, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<4608xi8>, memref<2320xbf16>, memref<128xi8>, i32, memref<2048xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
+        // #177: consume padding tile — keep DDR stream alive during attn_out→ffn_in gap
+        aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_A0p, Release, 1)
         aie.use_lock(%{p}_B1p, Release, 1)
         aie.use_lock(%{p}_Oc, Release, 1)
         // ---- phase 3: FFN (B2 = ffn_in) ----
