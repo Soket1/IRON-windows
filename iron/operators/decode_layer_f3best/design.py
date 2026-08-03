@@ -29,6 +29,6 @@ def my_decode_layer_f3best(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
         from f3best_emit_nokv import OFold8F3BestEmitter
 
     return OFold8F3BestEmitter(
-        NH=8, E=embed_dim, G=group_size, M=4, HD=head_dim,
+        NH=8, E=embed_dim, H=hidden_dim, G=group_size, M=4, HD=head_dim,
         AG=attn_group, SEQ=seq_len,
     ).emit_mlir()
