@@ -7,6 +7,7 @@ on center tiles (Wk, Wv in weight stream; K/V scalar copy into P tail).
 import os as _os
 
 from f3best_emit_nokv import OFold8F3BestEmitter as _BaseEmitter, CENTER_COLS, SCORE_COLS, VALUE_COLS
+from f3best_emit_nokv import _LockAlloc, _DmaAlloc
 
 
 class OFold8F3BestEmitter(_BaseEmitter):
@@ -50,6 +51,23 @@ class OFold8F3BestEmitter(_BaseEmitter):
         PT = self.PER_TILE; UNI = self.UNI_SZ; KSZ = self.KV_SZ; KT = self.KV_T
         PH = self.PH_STRIDE; KV2 = self.KV_M // 2
 
+        # Auto-allocate locks and DMA channels (#154)
+        L = _LockAlloc('core')
+        D = _DmaAlloc('core')
+        _a0 = L.pair('A0'); _b0 = L.pair('B0'); _q = L.pair('Q')
+        _o = L.pair('O');   _p = L.pair('P');   _a1 = L.pair('A1')
+        _b1 = L.pair('B1'); _b2 = L.pair('B2')
+        _s2mm_w  = D.s2mm('weight')
+        _s2mm_b  = D.s2mm('bcast')
+        _mm2s_p  = D.mm2s('drain')
+        _mm2s_qo = D.mm2s('qo')
+
+        _ld = lambda name, ids: _LockAlloc.mlir_decl(f't{h}', f'{p}', name, *ids)
+        _lock_decls = '\n'.join([
+            _ld('A0', _a0), _ld('B0', _b0), _ld('Q', _q), _ld('O', _o),
+            _ld('P', _p), _ld('A1', _a1), _ld('B1', _b1), _ld('B2', _b2),
+        ])
+
         return f"""
     %{p}_A0 = aie.buffer(%t{h}) {{sym_name = "{p}_A0"}} : memref<{PK}xi8>
     %{p}_A1 = aie.buffer(%t{h}) {{sym_name = "{p}_A1"}} : memref<{PK}xi8>
@@ -61,22 +79,7 @@ class OFold8F3BestEmitter(_BaseEmitter):
     %{p}_V = aie.buffer(%t{h}) {{sym_name = "{p}_V"}} : memref<{KSZ}xbf16>
     %{p}_O = aie.buffer(%t{h}) {{sym_name = "{p}_O"}} : memref<{OSZ}xbf16>
     %{p}_P = aie.buffer(%t{h}) {{sym_name = "{p}_P"}} : memref<{PSZ}xbf16>
-    %{p}_A0p = aie.lock(%t{h}, 0) {{init = 1 : i32, sym_name = "{p}_A0p"}}
-    %{p}_A0c = aie.lock(%t{h}, 1) {{init = 0 : i32, sym_name = "{p}_A0c"}}
-    %{p}_B0p = aie.lock(%t{h}, 2) {{init = 1 : i32, sym_name = "{p}_B0p"}}
-    %{p}_B0c = aie.lock(%t{h}, 3) {{init = 0 : i32, sym_name = "{p}_B0c"}}
-    %{p}_Qp = aie.lock(%t{h}, 4) {{init = 1 : i32, sym_name = "{p}_Qp"}}
-    %{p}_Qc = aie.lock(%t{h}, 5) {{init = 0 : i32, sym_name = "{p}_Qc"}}
-    %{p}_Op = aie.lock(%t{h}, 6) {{init = 1 : i32, sym_name = "{p}_Op"}}
-    %{p}_Oc = aie.lock(%t{h}, 7) {{init = 0 : i32, sym_name = "{p}_Oc"}}
-    %{p}_Pp = aie.lock(%t{h}, 8) {{init = 1 : i32, sym_name = "{p}_Pp"}}
-    %{p}_Pc = aie.lock(%t{h}, 9) {{init = 0 : i32, sym_name = "{p}_Pc"}}
-    %{p}_A1p = aie.lock(%t{h}, 10) {{init = 1 : i32, sym_name = "{p}_A1p"}}
-    %{p}_A1c = aie.lock(%t{h}, 11) {{init = 0 : i32, sym_name = "{p}_A1c"}}
-    %{p}_B1p = aie.lock(%t{h}, 12) {{init = 1 : i32, sym_name = "{p}_B1p"}}
-    %{p}_B1c = aie.lock(%t{h}, 13) {{init = 0 : i32, sym_name = "{p}_B1c"}}
-    %{p}_B2p = aie.lock(%t{h}, 14) {{init = 1 : i32, sym_name = "{p}_B2p"}}
-    %{p}_B2c = aie.lock(%t{h}, 15) {{init = 0 : i32, sym_name = "{p}_B2c"}}
+    {_lock_decls}
     %{p}_gate = aie.buffer(%t{h}) {{sym_name = "{p}_gate"}} : memref<{HP}xbf16>
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<{HP}xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<{HP}xbf16>
@@ -211,7 +214,7 @@ class OFold8F3BestEmitter(_BaseEmitter):
       aie.end
     }}
     %mem_t{h} = aie.mem(%t{h}) {{
-      %s0 = aie.dma_start(S2MM, 0, ^a0{h}, ^bs{h})
+      %s0 = aie.dma_start(S2MM, {_s2mm_w}, ^a0{h}, ^bs{h})
     ^a0{h}:
       aie.use_lock(%{p}_A0p, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_A0 : memref<{PK}xi8>, 0, {PK})
@@ -223,7 +226,7 @@ class OFold8F3BestEmitter(_BaseEmitter):
       aie.use_lock(%{p}_A1c, Release, 1)
       aie.next_bd ^a0{h}
     ^bs{h}:
-      %s1 = aie.dma_start(S2MM, 1, ^b0{h}, ^m0{h})
+      %s1 = aie.dma_start(S2MM, {_s2mm_b}, ^b0{h}, ^m0{h})
     ^b0{h}:
       aie.use_lock(%{p}_B0p, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_B0 : memref<{XB}xbf16>, 0, {XB})
@@ -240,14 +243,14 @@ class OFold8F3BestEmitter(_BaseEmitter):
       aie.use_lock(%{p}_B2c, Release, 1)
       aie.next_bd ^b0{h}
     ^m0{h}:
-      %m0 = aie.dma_start(MM2S, 0, ^pf{h}, ^qo{h})
+      %m0 = aie.dma_start(MM2S, {_mm2s_p}, ^pf{h}, ^qo{h})
     ^pf{h}:
       aie.use_lock(%{p}_Pc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_P : memref<{PSZ}xbf16>, 0, {PH})
       aie.use_lock(%{p}_Pp, Release, 1)
       aie.next_bd ^pf{h}
     ^qo{h}:
-      %m1 = aie.dma_start(MM2S, 1, ^qi{h}, ^e{h})
+      %m1 = aie.dma_start(MM2S, {_mm2s_qo}, ^qi{h}, ^e{h})
     ^qi{h}:
       aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZ})
@@ -268,6 +271,22 @@ class OFold8F3BestEmitter(_BaseEmitter):
         PT = self.PER_TILE; UNI = self.UNI_SZ; KSZ = self.KV_SZ; KT = self.KV_T
         PH = self.PH_STRIDE; KV2 = self.KV_M // 2
 
+        # Auto-allocate locks and DMA channels (#154)
+        L = _LockAlloc('core')
+        D = _DmaAlloc('core')
+        _a0 = L.pair('A0'); _b = L.pair('B'); _q = L.pair('Q')
+        _o = L.pair('O');   _p = L.pair('P'); _a1 = L.pair('A1')
+        _s2mm_w  = D.s2mm('weight')
+        _s2mm_b  = D.s2mm('bcast')
+        _mm2s_p  = D.mm2s('drain')
+        _mm2s_qo = D.mm2s('qo')
+
+        _ld = lambda name, ids: _LockAlloc.mlir_decl(f't{h}', f'{p}', name, *ids)
+        _lock_decls = '\n'.join([
+            _ld('A0', _a0), _ld('B', _b), _ld('Q', _q),
+            _ld('O', _o), _ld('P', _p), _ld('A1', _a1),
+        ])
+
         return f"""
     %{p}_A0 = aie.buffer(%t{h}) {{sym_name = "{p}_A0"}} : memref<{PK}xi8>
     %{p}_A1 = aie.buffer(%t{h}) {{sym_name = "{p}_A1"}} : memref<{PK}xi8>
@@ -277,18 +296,7 @@ class OFold8F3BestEmitter(_BaseEmitter):
     %{p}_V = aie.buffer(%t{h}) {{sym_name = "{p}_V"}} : memref<{KSZ}xbf16>
     %{p}_O = aie.buffer(%t{h}) {{sym_name = "{p}_O"}} : memref<{OSZ}xbf16>
     %{p}_P = aie.buffer(%t{h}) {{sym_name = "{p}_P"}} : memref<{PSZ}xbf16>
-    %{p}_A0p = aie.lock(%t{h}, 0) {{init = 1 : i32, sym_name = "{p}_A0p"}}
-    %{p}_A0c = aie.lock(%t{h}, 1) {{init = 0 : i32, sym_name = "{p}_A0c"}}
-    %{p}_Bp = aie.lock(%t{h}, 2) {{init = 1 : i32, sym_name = "{p}_Bp"}}
-    %{p}_Bc = aie.lock(%t{h}, 3) {{init = 0 : i32, sym_name = "{p}_Bc"}}
-    %{p}_Qp = aie.lock(%t{h}, 4) {{init = 1 : i32, sym_name = "{p}_Qp"}}
-    %{p}_Qc = aie.lock(%t{h}, 5) {{init = 0 : i32, sym_name = "{p}_Qc"}}
-    %{p}_Op = aie.lock(%t{h}, 6) {{init = 1 : i32, sym_name = "{p}_Op"}}
-    %{p}_Oc = aie.lock(%t{h}, 7) {{init = 0 : i32, sym_name = "{p}_Oc"}}
-    %{p}_Pp = aie.lock(%t{h}, 8) {{init = 1 : i32, sym_name = "{p}_Pp"}}
-    %{p}_Pc = aie.lock(%t{h}, 9) {{init = 0 : i32, sym_name = "{p}_Pc"}}
-    %{p}_A1p = aie.lock(%t{h}, 10) {{init = 1 : i32, sym_name = "{p}_A1p"}}
-    %{p}_A1c = aie.lock(%t{h}, 11) {{init = 0 : i32, sym_name = "{p}_A1c"}}
+    {_lock_decls}
     %{p}_gate = aie.buffer(%t{h}) {{sym_name = "{p}_gate"}} : memref<{HP}xbf16>
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<{HP}xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<{HP}xbf16>
@@ -419,7 +427,7 @@ class OFold8F3BestEmitter(_BaseEmitter):
       aie.end
     }}
     %mem{h} = aie.mem(%t{h}) {{
-      %s0 = aie.dma_start(S2MM, 0, ^a0{h}, ^bs{h})
+      %s0 = aie.dma_start(S2MM, {_s2mm_w}, ^a0{h}, ^bs{h})
     ^a0{h}:
       aie.use_lock(%{p}_A0p, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_A0 : memref<{PK}xi8>, 0, {PK})
@@ -431,21 +439,21 @@ class OFold8F3BestEmitter(_BaseEmitter):
       aie.use_lock(%{p}_A1c, Release, 1)
       aie.next_bd ^a0{h}
     ^bs{h}:
-      %s1 = aie.dma_start(S2MM, 1, ^b{h}, ^m0{h})
+      %s1 = aie.dma_start(S2MM, {_s2mm_b}, ^b{h}, ^m0{h})
     ^b{h}:
       aie.use_lock(%{p}_Bp, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_B : memref<{XB}xbf16>, 0, {XB})
       aie.use_lock(%{p}_Bc, Release, 1)
       aie.next_bd ^b{h}
     ^m0{h}:
-      %m0 = aie.dma_start(MM2S, 0, ^pf{h}, ^m1{h})
+      %m0 = aie.dma_start(MM2S, {_mm2s_p}, ^pf{h}, ^m1{h})
     ^pf{h}:
       aie.use_lock(%{p}_Pc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_P : memref<{PSZ}xbf16>, 0, {PH})
       aie.use_lock(%{p}_Pp, Release, 1)
       aie.next_bd ^pf{h}
     ^m1{h}:
-      %m1 = aie.dma_start(MM2S, 1, ^qo{h}, ^e{h})
+      %m1 = aie.dma_start(MM2S, {_mm2s_qo}, ^qo{h}, ^e{h})
     ^qo{h}:
       aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZ})

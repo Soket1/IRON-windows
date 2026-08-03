@@ -17,6 +17,100 @@ SCORE_COLS  = [(0, 2), (1, 2), (6, 2), (7, 2), (0, 3), (1, 3), (6, 3), (7, 3)]
 VALUE_COLS  = [(0, 4), (1, 4), (6, 4), (7, 4), (0, 5), (1, 5), (6, 5), (7, 5)]
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Auto-allocators for locks and DMA channels (#154)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _LockAlloc:
+    """Sequential per-tile lock allocator with overflow validation.
+
+    Usage in a tile-method:
+        L = _LockAlloc('core')
+        a0_p, a0_c = L.pair()   # -> (0, 1)
+        b0_p, b0_c = L.pair()   # -> (2, 3)
+        ...
+        L.mlir_decl(tref, name, p_id, c_id)  # -> "aie.lock(%t0, 0) {...}..."
+    """
+    def __init__(self, tile_kind='core'):
+        self._next = 0
+        self._max = {'core': 16, 'memtile': 64, 'shim': 16}.get(tile_kind, 16)
+        self._kind = tile_kind
+        self._pairs = {}   # name -> (p_id, c_id)
+
+    def pair(self, name):
+        """Allocate lock pair (producer, consumer). Returns (p_id, c_id)."""
+        p, c = self._next, self._next + 1
+        self._next += 2
+        if self._next > self._max:
+            raise OverflowError(
+                f"Lock overflow on {self._kind} tile: {self._next} > {self._max}"
+            )
+        self._pairs[name] = (p, c)
+        return p, c
+
+    @staticmethod
+    def mlir_decl(tile_ref, prefix, name, p_id, c_id):
+        """Generate aie.lock MLIR declarations for a buffer's lock pair.
+
+        tile_ref: MLIR tile SSA value (e.g. 't0', 'jA')
+        prefix: SSA name prefix (e.g. 'c0', 'sc3', 'jA')
+        """
+        return (
+            f"%{prefix}_{name}p = aie.lock(%{tile_ref}, {p_id}) "
+            f'{{init = 1 : i32, sym_name = "{prefix}_{name}p"}}\n'
+            f"%{prefix}_{name}c = aie.lock(%{tile_ref}, {c_id}) "
+            f'{{init = 0 : i32, sym_name = "{prefix}_{name}c"}}'
+        )
+
+    @property
+    def used(self):
+        return self._next
+
+
+class _DmaAlloc:
+    """Sequential per-tile DMA channel allocator.
+
+    Usage:
+        D = _DmaAlloc('core')
+        w_ch = D.s2mm()     # -> 0
+        b_ch = D.s2mm()     # -> 1
+        p_ch = D.mm2s()     # -> 0
+    """
+    def __init__(self, tile_kind='core'):
+        max_ch = {'core': (2, 2), 'memtile': (6, 6), 'shim': (2, 2)}.get(tile_kind, (2, 2))
+        self._s2mm_max, self._mm2s_max = max_ch
+        self._next_s2mm = 0
+        self._next_mm2s = 0
+        self._kind = tile_kind
+        # track assigned channels
+        self.s2mm_chs = {}
+        self.mm2s_chs = {}
+
+    def s2mm(self, name=''):
+        """Allocate next S2MM channel. Returns channel index."""
+        ch = self._next_s2mm
+        self._next_s2mm += 1
+        if self._next_s2mm > self._s2mm_max:
+            raise OverflowError(
+                f"S2MM overflow on {self._kind} tile: {self._next_s2mm} > {self._s2mm_max}"
+            )
+        if name:
+            self.s2mm_chs[name] = ch
+        return ch
+
+    def mm2s(self, name=''):
+        """Allocate next MM2S channel. Returns channel index."""
+        ch = self._next_mm2s
+        self._next_mm2s += 1
+        if self._next_mm2s > self._mm2s_max:
+            raise OverflowError(
+                f"MM2S overflow on {self._kind} tile: {self._next_mm2s} > {self._mm2s_max}"
+            )
+        if name:
+            self.mm2s_chs[name] = ch
+        return ch
+
+
 class OFold8F3BestEmitter:
     """Parametric validating wrapper around the F3-best MLIR generation."""
 
@@ -160,6 +254,24 @@ class OFold8F3BestEmitter:
         OSZ = self.O_SZ; PSZ = self.P_SZ; HP = self.HPER; GT = self.GU_T
         PT = self.PER_TILE; UNI = self.UNI_SZ
 
+        # Auto-allocate locks and DMA channels (#154)
+        L = _LockAlloc('core')
+        D = _DmaAlloc('core')
+        _a0 = L.pair('A0'); _b0 = L.pair('B0'); _q = L.pair('Q')
+        _o = L.pair('O');   _p = L.pair('P');   _a1 = L.pair('A1')
+        _b1 = L.pair('B1'); _b2 = L.pair('B2')
+        _s2mm_w  = D.s2mm('weight')   # A0/A1 ping-pong
+        _s2mm_b  = D.s2mm('bcast')    # B0/B1/B2 triple
+        _mm2s_p  = D.mm2s('drain')    # P drain
+        _mm2s_qo = D.mm2s('qo')       # Q+O drain
+
+        # Lock declarations (auto-allocated)
+        _ld = lambda name, ids: _LockAlloc.mlir_decl(f't{h}', f'{p}', name, *ids)
+        _lock_decls = '\n'.join([
+            _ld('A0', _a0), _ld('B0', _b0), _ld('Q', _q), _ld('O', _o),
+            _ld('P', _p), _ld('A1', _a1), _ld('B1', _b1), _ld('B2', _b2),
+        ])
+
         return f"""
     %{p}_A0 = aie.buffer(%t{h}) {{sym_name = "{p}_A0"}} : memref<{PK}xi8>
     %{p}_A1 = aie.buffer(%t{h}) {{sym_name = "{p}_A1"}} : memref<{PK}xi8>
@@ -169,22 +281,7 @@ class OFold8F3BestEmitter:
     %{p}_Q = aie.buffer(%t{h}) {{sym_name = "{p}_Q"}} : memref<{QSZ}xbf16>
     %{p}_O = aie.buffer(%t{h}) {{sym_name = "{p}_O"}} : memref<{OSZ}xbf16>
     %{p}_P = aie.buffer(%t{h}) {{sym_name = "{p}_P"}} : memref<{PSZ}xbf16>
-    %{p}_A0p = aie.lock(%t{h}, 0) {{init = 1 : i32, sym_name = "{p}_A0p"}}
-    %{p}_A0c = aie.lock(%t{h}, 1) {{init = 0 : i32, sym_name = "{p}_A0c"}}
-    %{p}_B0p = aie.lock(%t{h}, 2) {{init = 1 : i32, sym_name = "{p}_B0p"}}
-    %{p}_B0c = aie.lock(%t{h}, 3) {{init = 0 : i32, sym_name = "{p}_B0c"}}
-    %{p}_Qp = aie.lock(%t{h}, 4) {{init = 1 : i32, sym_name = "{p}_Qp"}}
-    %{p}_Qc = aie.lock(%t{h}, 5) {{init = 0 : i32, sym_name = "{p}_Qc"}}
-    %{p}_Op = aie.lock(%t{h}, 6) {{init = 1 : i32, sym_name = "{p}_Op"}}
-    %{p}_Oc = aie.lock(%t{h}, 7) {{init = 0 : i32, sym_name = "{p}_Oc"}}
-    %{p}_Pp = aie.lock(%t{h}, 8) {{init = 1 : i32, sym_name = "{p}_Pp"}}
-    %{p}_Pc = aie.lock(%t{h}, 9) {{init = 0 : i32, sym_name = "{p}_Pc"}}
-    %{p}_A1p = aie.lock(%t{h}, 10) {{init = 1 : i32, sym_name = "{p}_A1p"}}
-    %{p}_A1c = aie.lock(%t{h}, 11) {{init = 0 : i32, sym_name = "{p}_A1c"}}
-    %{p}_B1p = aie.lock(%t{h}, 12) {{init = 1 : i32, sym_name = "{p}_B1p"}}
-    %{p}_B1c = aie.lock(%t{h}, 13) {{init = 0 : i32, sym_name = "{p}_B1c"}}
-    %{p}_B2p = aie.lock(%t{h}, 14) {{init = 1 : i32, sym_name = "{p}_B2p"}}
-    %{p}_B2c = aie.lock(%t{h}, 15) {{init = 0 : i32, sym_name = "{p}_B2c"}}
+    {_lock_decls}
     %{p}_gate = aie.buffer(%t{h}) {{sym_name = "{p}_gate"}} : memref<{HP}xbf16>
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<{HP}xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<{HP}xbf16>
@@ -282,7 +379,7 @@ class OFold8F3BestEmitter:
       aie.end
     }}
     %mem_t{h} = aie.mem(%t{h}) {{
-      %s0 = aie.dma_start(S2MM, 0, ^a0{h}, ^bs{h})
+      %s0 = aie.dma_start(S2MM, {_s2mm_w}, ^a0{h}, ^bs{h})
     ^a0{h}:
       aie.use_lock(%{p}_A0p, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_A0 : memref<{PK}xi8>, 0, {PK})
@@ -294,7 +391,7 @@ class OFold8F3BestEmitter:
       aie.use_lock(%{p}_A1c, Release, 1)
       aie.next_bd ^a0{h}
     ^bs{h}:
-      %s1 = aie.dma_start(S2MM, 1, ^b0{h}, ^m0{h})
+      %s1 = aie.dma_start(S2MM, {_s2mm_b}, ^b0{h}, ^m0{h})
     ^b0{h}:
       aie.use_lock(%{p}_B0p, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_B0 : memref<{XB}xbf16>, 0, {XB})
@@ -311,14 +408,14 @@ class OFold8F3BestEmitter:
       aie.use_lock(%{p}_B2c, Release, 1)
       aie.next_bd ^b0{h}
     ^m0{h}:
-      %m0 = aie.dma_start(MM2S, 0, ^pf{h}, ^qo{h})
+      %m0 = aie.dma_start(MM2S, {_mm2s_p}, ^pf{h}, ^qo{h})
     ^pf{h}:
       aie.use_lock(%{p}_Pc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_P : memref<{PSZ}xbf16>, 0, {E})
       aie.use_lock(%{p}_Pp, Release, 1)
       aie.next_bd ^pf{h}
     ^qo{h}:
-      %m1 = aie.dma_start(MM2S, 1, ^qi{h}, ^e{h})
+      %m1 = aie.dma_start(MM2S, {_mm2s_qo}, ^qi{h}, ^e{h})
     ^qi{h}:
       aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZ})
@@ -339,6 +436,22 @@ class OFold8F3BestEmitter:
         OSZ = self.O_SZ; PSZ = self.P_SZ; HP = self.HPER; GT = self.GU_T
         PT = self.PER_TILE; UNI = self.UNI_SZ
 
+        # Auto-allocate locks and DMA channels (#154)
+        L = _LockAlloc('core')
+        D = _DmaAlloc('core')
+        _a0 = L.pair('A0'); _b = L.pair('B'); _q = L.pair('Q')
+        _o = L.pair('O');   _p = L.pair('P'); _a1 = L.pair('A1')
+        _s2mm_w  = D.s2mm('weight')
+        _s2mm_b  = D.s2mm('bcast')
+        _mm2s_p  = D.mm2s('drain')
+        _mm2s_qo = D.mm2s('qo')
+
+        _ld = lambda name, ids: _LockAlloc.mlir_decl(f't{h}', f'{p}', name, *ids)
+        _lock_decls = '\n'.join([
+            _ld('A0', _a0), _ld('B', _b), _ld('Q', _q),
+            _ld('O', _o), _ld('P', _p), _ld('A1', _a1),
+        ])
+
         return f"""
     %{p}_A0 = aie.buffer(%t{h}) {{sym_name = "{p}_A0"}} : memref<{PK}xi8>
     %{p}_A1 = aie.buffer(%t{h}) {{sym_name = "{p}_A1"}} : memref<{PK}xi8>
@@ -346,18 +459,7 @@ class OFold8F3BestEmitter:
     %{p}_Q = aie.buffer(%t{h}) {{sym_name = "{p}_Q"}} : memref<{QSZ}xbf16>
     %{p}_O = aie.buffer(%t{h}) {{sym_name = "{p}_O"}} : memref<{OSZ}xbf16>
     %{p}_P = aie.buffer(%t{h}) {{sym_name = "{p}_P"}} : memref<{PSZ}xbf16>
-    %{p}_A0p = aie.lock(%t{h}, 0) {{init = 1 : i32, sym_name = "{p}_A0p"}}
-    %{p}_A0c = aie.lock(%t{h}, 1) {{init = 0 : i32, sym_name = "{p}_A0c"}}
-    %{p}_Bp = aie.lock(%t{h}, 2) {{init = 1 : i32, sym_name = "{p}_Bp"}}
-    %{p}_Bc = aie.lock(%t{h}, 3) {{init = 0 : i32, sym_name = "{p}_Bc"}}
-    %{p}_Qp = aie.lock(%t{h}, 4) {{init = 1 : i32, sym_name = "{p}_Qp"}}
-    %{p}_Qc = aie.lock(%t{h}, 5) {{init = 0 : i32, sym_name = "{p}_Qc"}}
-    %{p}_Op = aie.lock(%t{h}, 6) {{init = 1 : i32, sym_name = "{p}_Op"}}
-    %{p}_Oc = aie.lock(%t{h}, 7) {{init = 0 : i32, sym_name = "{p}_Oc"}}
-    %{p}_Pp = aie.lock(%t{h}, 8) {{init = 1 : i32, sym_name = "{p}_Pp"}}
-    %{p}_Pc = aie.lock(%t{h}, 9) {{init = 0 : i32, sym_name = "{p}_Pc"}}
-    %{p}_A1p = aie.lock(%t{h}, 10) {{init = 1 : i32, sym_name = "{p}_A1p"}}
-    %{p}_A1c = aie.lock(%t{h}, 11) {{init = 0 : i32, sym_name = "{p}_A1c"}}
+    {_lock_decls}
     %{p}_gate = aie.buffer(%t{h}) {{sym_name = "{p}_gate"}} : memref<{HP}xbf16>
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<{HP}xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<{HP}xbf16>
@@ -456,7 +558,7 @@ class OFold8F3BestEmitter:
       aie.end
     }}
     %mem{h} = aie.mem(%t{h}) {{
-      %s0 = aie.dma_start(S2MM, 0, ^a0{h}, ^bs{h})
+      %s0 = aie.dma_start(S2MM, {_s2mm_w}, ^a0{h}, ^bs{h})
     ^a0{h}:
       aie.use_lock(%{p}_A0p, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_A0 : memref<{PK}xi8>, 0, {PK})
@@ -468,21 +570,21 @@ class OFold8F3BestEmitter:
       aie.use_lock(%{p}_A1c, Release, 1)
       aie.next_bd ^a0{h}
     ^bs{h}:
-      %s1 = aie.dma_start(S2MM, 1, ^b{h}, ^m0{h})
+      %s1 = aie.dma_start(S2MM, {_s2mm_b}, ^b{h}, ^m0{h})
     ^b{h}:
       aie.use_lock(%{p}_Bp, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_B : memref<{XB}xbf16>, 0, {XB})
       aie.use_lock(%{p}_Bc, Release, 1)
       aie.next_bd ^b{h}
     ^m0{h}:
-      %m0 = aie.dma_start(MM2S, 0, ^pf{h}, ^m1{h})
+      %m0 = aie.dma_start(MM2S, {_mm2s_p}, ^pf{h}, ^m1{h})
     ^pf{h}:
       aie.use_lock(%{p}_Pc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_P : memref<{PSZ}xbf16>, 0, {E})
       aie.use_lock(%{p}_Pp, Release, 1)
       aie.next_bd ^pf{h}
     ^m1{h}:
-      %m1 = aie.dma_start(MM2S, 1, ^qo{h}, ^e{h})
+      %m1 = aie.dma_start(MM2S, {_mm2s_qo}, ^qo{h}, ^e{h})
     ^qo{h}:
       aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZ})
@@ -502,21 +604,27 @@ class OFold8F3BestEmitter:
         KCH = self.KCH; ITC = self.ITC; QSZ = self.Q_SZ
         NC = self.NCHUNK; CH = self.CHUNK; PT = self.PER_TILE
 
+        # Auto-allocate locks and DMA channels (#154)
+        L = _LockAlloc('core'); D = _DmaAlloc('core')
+        _q = L.pair('Q'); _k = L.pair('K'); _i = L.pair('I')
+        _oh = L.pair('Oh'); _ohd = L.pair('Ohd')
+        _s2mm_in  = D.s2mm('in')   # Q + Oh relay (2-BD chain)
+        _s2mm_kv  = D.s2mm('kv')   # K
+        _mm2s_out = D.mm2s('out')  # inter (I) to value
+        _mm2s_oh  = D.mm2s('oh')   # Oh relay to join
+
+        _ld = lambda name, ids: _LockAlloc.mlir_decl(f'sc{h}', f'{p}', name, *ids)
+        _lock_decls = '\n'.join([
+            _ld('Q', _q), _ld('K', _k), _ld('I', _i),
+            _ld('Oh', _oh), _ld('Ohd', _ohd),
+        ])
+
         return f"""
     %{p}_Qs = aie.buffer(%sc{h}) {{sym_name = "{p}_Qs"}} : memref<{QSZ}xbf16>
     %{p}_K  = aie.buffer(%sc{h}) {{sym_name = "{p}_K"}}  : memref<{KCH}xbf16>
     %{p}_It = aie.buffer(%sc{h}) {{sym_name = "{p}_It"}} : memref<{ITC}xbf16>
     %{p}_Oh = aie.buffer(%sc{h}) {{sym_name = "{p}_Oh"}} : memref<{PT}xbf16>
-    %{p}_Qp = aie.lock(%sc{h}, 0) {{init = 1 : i32, sym_name = "{p}_Qp"}}
-    %{p}_Qc = aie.lock(%sc{h}, 1) {{init = 0 : i32, sym_name = "{p}_Qc"}}
-    %{p}_Kp = aie.lock(%sc{h}, 2) {{init = 1 : i32, sym_name = "{p}_Kp"}}
-    %{p}_Kc = aie.lock(%sc{h}, 3) {{init = 0 : i32, sym_name = "{p}_Kc"}}
-    %{p}_Ip = aie.lock(%sc{h}, 4) {{init = 1 : i32, sym_name = "{p}_Ip"}}
-    %{p}_Ic = aie.lock(%sc{h}, 5) {{init = 0 : i32, sym_name = "{p}_Ic"}}
-    %{p}_Ohp = aie.lock(%sc{h}, 6) {{init = 1 : i32, sym_name = "{p}_Ohp"}}
-    %{p}_Ohc = aie.lock(%sc{h}, 7) {{init = 0 : i32, sym_name = "{p}_Ohc"}}
-    %{p}_Ohdp = aie.lock(%sc{h}, 8) {{init = 1 : i32, sym_name = "{p}_Ohdp"}}
-    %{p}_Ohdc = aie.lock(%sc{h}, 9) {{init = 0 : i32, sym_name = "{p}_Ohdc"}}
+    {_lock_decls}
     %core_sc{h} = aie.core(%sc{h}) {{
       %c0 = arith.constant 0 : index
       %cN = arith.constant 9223372036854775807 : index
@@ -546,7 +654,7 @@ class OFold8F3BestEmitter:
       aie.end
     }}
     %mem_sc{h} = aie.mem(%sc{h}) {{
-      %s0 = aie.dma_start(S2MM, 0, ^q{h}, ^ks{h})
+      %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
     ^q{h}:
       aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZ})
@@ -558,21 +666,21 @@ class OFold8F3BestEmitter:
       aie.use_lock(%{p}_Ohc, Release, 1)
       aie.next_bd ^q{h}
     ^ks{h}:
-      %s1 = aie.dma_start(S2MM, 1, ^k{h}, ^im{h})
+      %s1 = aie.dma_start(S2MM, {_s2mm_kv}, ^k{h}, ^im{h})
     ^k{h}:
       aie.use_lock(%{p}_Kp, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_K : memref<{KCH}xbf16>, 0, {KCH})
       aie.use_lock(%{p}_Kc, Release, 1)
       aie.next_bd ^k{h}
     ^im{h}:
-      %m0 = aie.dma_start(MM2S, 0, ^io{h}, ^ohm{h})
+      %m0 = aie.dma_start(MM2S, {_mm2s_out}, ^io{h}, ^ohm{h})
     ^io{h}:
       aie.use_lock(%{p}_Ic, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_It : memref<{ITC}xbf16>, 0, {ITC})
       aie.use_lock(%{p}_Ip, Release, 1)
       aie.next_bd ^io{h}
     ^ohm{h}:
-      %m1 = aie.dma_start(MM2S, 1, ^ohf{h}, ^e{h})
+      %m1 = aie.dma_start(MM2S, {_mm2s_oh}, ^ohf{h}, ^e{h})
     ^ohf{h}:
       aie.use_lock(%{p}_Ohdc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Oh : memref<{PT}xbf16>, 0, {PT})
@@ -587,16 +695,21 @@ class OFold8F3BestEmitter:
         KCH = self.KCH; ITC = self.ITC; PT = self.PER_TILE
         NC = self.NCHUNK; CH = self.CHUNK
 
+        # Auto-allocate locks and DMA channels (#154)
+        L = _LockAlloc('core'); D = _DmaAlloc('core')
+        _i = L.pair('I'); _v = L.pair('V'); _o = L.pair('O')
+        _s2mm_in = D.s2mm('in')   # inter
+        _s2mm_v  = D.s2mm('v')    # V
+        _mm2s_o  = D.mm2s('out')  # Of
+
+        _ld = lambda name, ids: _LockAlloc.mlir_decl(f'va{h}', f'{p}', name, *ids)
+        _lock_decls = '\n'.join([_ld('I', _i), _ld('V', _v), _ld('O', _o)])
+
         return f"""
     %{p}_Iv = aie.buffer(%va{h}) {{sym_name = "{p}_Iv"}} : memref<{ITC}xbf16>
     %{p}_V  = aie.buffer(%va{h}) {{sym_name = "{p}_V"}}  : memref<{KCH}xbf16>
     %{p}_Of = aie.buffer(%va{h}) {{sym_name = "{p}_Of"}} : memref<{PT}xbf16>
-    %{p}_Ip = aie.lock(%va{h}, 0) {{init = 1 : i32, sym_name = "{p}_Ip"}}
-    %{p}_Ic = aie.lock(%va{h}, 1) {{init = 0 : i32, sym_name = "{p}_Ic"}}
-    %{p}_Vp = aie.lock(%va{h}, 2) {{init = 1 : i32, sym_name = "{p}_Vp"}}
-    %{p}_Vc = aie.lock(%va{h}, 3) {{init = 0 : i32, sym_name = "{p}_Vc"}}
-    %{p}_Op = aie.lock(%va{h}, 4) {{init = 1 : i32, sym_name = "{p}_Op"}}
-    %{p}_Oc = aie.lock(%va{h}, 5) {{init = 0 : i32, sym_name = "{p}_Oc"}}
+    {_lock_decls}
     %core_va{h} = aie.core(%va{h}) {{
       %c0 = arith.constant 0 : index
       %cN = arith.constant 9223372036854775807 : index
@@ -621,21 +734,21 @@ class OFold8F3BestEmitter:
       aie.end
     }}
     %mem_va{h} = aie.mem(%va{h}) {{
-      %s0 = aie.dma_start(S2MM, 0, ^iv{h}, ^vs{h})
+      %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^iv{h}, ^vs{h})
     ^iv{h}:
       aie.use_lock(%{p}_Ip, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Iv : memref<{ITC}xbf16>, 0, {ITC})
       aie.use_lock(%{p}_Ic, Release, 1)
       aie.next_bd ^iv{h}
     ^vs{h}:
-      %s1 = aie.dma_start(S2MM, 1, ^v{h}, ^om{h})
+      %s1 = aie.dma_start(S2MM, {_s2mm_v}, ^v{h}, ^om{h})
     ^v{h}:
       aie.use_lock(%{p}_Vp, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_V : memref<{KCH}xbf16>, 0, {KCH})
       aie.use_lock(%{p}_Vc, Release, 1)
       aie.next_bd ^v{h}
     ^om{h}:
-      %m0 = aie.dma_start(MM2S, 0, ^oo{h}, ^e{h})
+      %m0 = aie.dma_start(MM2S, {_mm2s_o}, ^oo{h}, ^e{h})
     ^oo{h}:
       aie.use_lock(%{p}_Oc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Of : memref<{PT}xbf16>, 0, {PT})
@@ -648,21 +761,30 @@ class OFold8F3BestEmitter:
     def _join_memtile(self, name, tile, with_weight_relay=False, packet_id=None):
         """Join MemTile: 4 S2MM gather -> 1 MM2S output."""
         SL = self.PACKED; QI = self.PER_TILE; E = self.E; D = self.RELAY_DEPTH
+        # Auto-allocate locks (#154)
+        L = _LockAlloc('memtile')
+        base_locks = [L.pair(f'p{k}') for k in range(4)]
+        # weight relay locks (auto-continue from base pairs)
+        wt_locks = []
+        if with_weight_relay:
+            for p in range(2):
+                for k in range(D):
+                    wt_locks.append(L.pair(f'w{p}s{k}'))
+
         s = f"""
     %{name}_buf = aie.buffer(%{tile}) {{sym_name = "{name}_buf"}} : memref<{E}xbf16>"""
-        for k in range(4):
+        for k, (lp, lc) in enumerate(base_locks):
             s += f"""
-    %{name}_p{k} = aie.lock(%{tile}, {2*k}) {{init = 1 : i32, sym_name = "{name}_p{k}"}}
-    %{name}_c{k} = aie.lock(%{tile}, {2*k+1}) {{init = 0 : i32, sym_name = "{name}_c{k}"}}"""
+    %{name}_p{k} = aie.lock(%{tile}, {lp}) {{init = 1 : i32, sym_name = "{name}_p{k}"}}
+    %{name}_c{k} = aie.lock(%{tile}, {lc}) {{init = 0 : i32, sym_name = "{name}_c{k}"}}"""
         if with_weight_relay:
             s += f"""
     %{name}_wt = aie.buffer(%{tile}) {{sym_name = "{name}_wt"}} : memref<{2*D*SL}xi8>"""
-            for p in range(2):
-                for k in range(D):
-                    base = 8 + 2 * (p * D + k)
-                    s += f"""
-    %{name}_w{p}s{k}p = aie.lock(%{tile}, {base}) {{init = 1 : i32, sym_name = "{name}_w{p}s{k}p"}}
-    %{name}_w{p}s{k}c = aie.lock(%{tile}, {base+1}) {{init = 0 : i32, sym_name = "{name}_w{p}s{k}c"}}"""
+            for idx, (lp, lc) in enumerate(wt_locks):
+                p = idx // D; k = idx % D
+                s += f"""
+    %{name}_w{p}s{k}p = aie.lock(%{tile}, {lp}) {{init = 1 : i32, sym_name = "{name}_w{p}s{k}p"}}
+    %{name}_w{p}s{k}c = aie.lock(%{tile}, {lc}) {{init = 0 : i32, sym_name = "{name}_w{p}s{k}c"}}"""
         s += f"""
     %{name}_dma = aie.memtile_dma(%{tile}) {{"""
         for ch in range(4):
@@ -743,19 +865,27 @@ class OFold8F3BestEmitter:
     def _split_memtile(self, name, tile, with_weight_relay=False):
         """1 shim stream (4*KVN) -> 4 MM2S slices (KVN each)."""
         SL_KV = self.KVN; KVN = self.KVN; D = self.RELAY_DEPTH; WS = self.PACKED
+        # Auto-allocate locks (#154)
+        L = _LockAlloc('memtile')
+        base_locks = [L.pair(f'p{k}') for k in range(4)]
+        wt_locks = []
+        if with_weight_relay:
+            for k in range(D):
+                wt_locks.append(L.pair(f'ws{k}'))
+
         s = f"""
     %{name}_buf = aie.buffer(%{tile}) {{sym_name = "{name}_buf"}} : memref<{4*KVN}xbf16>"""
-        for k in range(4):
+        for k, (lp, lc) in enumerate(base_locks):
             s += f"""
-    %{name}_p{k} = aie.lock(%{tile}, {2*k}) {{init = 1 : i32, sym_name = "{name}_p{k}"}}
-    %{name}_c{k} = aie.lock(%{tile}, {2*k+1}) {{init = 0 : i32, sym_name = "{name}_c{k}"}}"""
+    %{name}_p{k} = aie.lock(%{tile}, {lp}) {{init = 1 : i32, sym_name = "{name}_p{k}"}}
+    %{name}_c{k} = aie.lock(%{tile}, {lc}) {{init = 0 : i32, sym_name = "{name}_c{k}"}}"""
         if with_weight_relay:
             s += f"""
     %{name}_wt = aie.buffer(%{tile}) {{sym_name = "{name}_wt"}} : memref<{D*WS}xi8>"""
-            for k in range(D):
+            for k, (lp, lc) in enumerate(wt_locks):
                 s += f"""
-    %{name}_wsp{k} = aie.lock(%{tile}, {8+2*k}) {{init = 1 : i32, sym_name = "{name}_wsp{k}"}}
-    %{name}_wsc{k} = aie.lock(%{tile}, {8+2*k+1}) {{init = 0 : i32, sym_name = "{name}_wsc{k}"}}"""
+    %{name}_wsp{k} = aie.lock(%{tile}, {lp}) {{init = 1 : i32, sym_name = "{name}_wsp{k}"}}
+    %{name}_wsc{k} = aie.lock(%{tile}, {lc}) {{init = 0 : i32, sym_name = "{name}_wsc{k}"}}"""
         fill_nxt = f"^{name}w0" if with_weight_relay else f"^{name}m0"
         s += f"""
     %{name}_dma = aie.memtile_dma(%{tile}) {{
@@ -809,14 +939,14 @@ class OFold8F3BestEmitter:
     def _relay_block(self):
         """rl tile: relay attn_out half0+half1 -> mx (packet)."""
         E = self.E; E2 = E // 2
+        L = _LockAlloc('core'); D = _DmaAlloc('core')
+        _h0 = L.pair('p0'); _h1 = L.pair('p1'); _oo = L.pair('op')
+        _s2mm_0 = D.s2mm(); _s2mm_1 = D.s2mm(); _mm2s = D.mm2s()
+        _ld = lambda name, ids: _LockAlloc.mlir_decl('rl', 'rl', name, *ids)
+        _lock_decls = '\n'.join([_ld('p0', _h0), _ld('p1', _h1), _ld('op', _oo)])
         return f"""
     %rl_A = aie.buffer(%rl) {{sym_name = "rl_A"}} : memref<{E}xbf16>
-    %rl_p0 = aie.lock(%rl, 0) {{init = 1 : i32, sym_name = "rl_p0"}}
-    %rl_c0 = aie.lock(%rl, 1) {{init = 0 : i32, sym_name = "rl_c0"}}
-    %rl_p1 = aie.lock(%rl, 2) {{init = 1 : i32, sym_name = "rl_p1"}}
-    %rl_c1 = aie.lock(%rl, 3) {{init = 0 : i32, sym_name = "rl_c1"}}
-    %rl_op = aie.lock(%rl, 4) {{init = 1 : i32, sym_name = "rl_op"}}
-    %rl_oc = aie.lock(%rl, 5) {{init = 0 : i32, sym_name = "rl_oc"}}
+    {_lock_decls}
     %core_rl = aie.core(%rl) {{
       %z = arith.constant 0 : index
       %N = arith.constant 9223372036854775807 : index
@@ -832,21 +962,21 @@ class OFold8F3BestEmitter:
       aie.end
     }}
     %mem_rl = aie.mem(%rl) {{
-      %s0 = aie.dma_start(S2MM, 0, ^rh0, ^rs1)
+      %s0 = aie.dma_start(S2MM, {_s2mm_0}, ^rh0, ^rs1)
     ^rh0:
       aie.use_lock(%rl_p0, AcquireGreaterEqual, 1)
       aie.dma_bd(%rl_A : memref<{E}xbf16>, 0, {E2})
       aie.use_lock(%rl_c0, Release, 1)
       aie.next_bd ^rh0
     ^rs1:
-      %s1 = aie.dma_start(S2MM, 1, ^rh1, ^rm0)
+      %s1 = aie.dma_start(S2MM, {_s2mm_1}, ^rh1, ^rm0)
     ^rh1:
       aie.use_lock(%rl_p1, AcquireGreaterEqual, 1)
       aie.dma_bd(%rl_A : memref<{E}xbf16>, {E2}, {E2})
       aie.use_lock(%rl_c1, Release, 1)
       aie.next_bd ^rh1
     ^rm0:
-      %m0 = aie.dma_start(MM2S, 0, ^ro, ^re)
+      %m0 = aie.dma_start(MM2S, {_mm2s}, ^ro, ^re)
     ^ro:
       aie.use_lock(%rl_oc, AcquireGreaterEqual, 1)
       aie.dma_bd_packet(0, 0)
@@ -860,48 +990,48 @@ class OFold8F3BestEmitter:
     def _op_block(self):
         """op tile: O-relay — concat O_h0..3 + O_h4..7 -> nm."""
         E = self.E; E2 = E // 2
+        L = _LockAlloc('core'); D = _DmaAlloc('core')
+        _h0 = L.pair('p0'); _h1 = L.pair('p1'); _oo = L.pair('op')
+        _s2mm_0 = D.s2mm(); _s2mm_1 = D.s2mm(); _mm2s = D.mm2s()
+        _ld = lambda name, ids: _LockAlloc.mlir_decl('op', 'op', name, *ids)
+        _lock_decls = '\n'.join([_ld('p0', _h0), _ld('p1', _h1), _ld('op', _oo)])
         return f"""
     %op_O  = aie.buffer(%op) {{sym_name = "op_O"}}  : memref<{E}xbf16>
-    %op_p0 = aie.lock(%op, 0) {{init = 1 : i32, sym_name = "op_p0"}}
-    %op_c0 = aie.lock(%op, 1) {{init = 0 : i32, sym_name = "op_c0"}}
-    %op_p1 = aie.lock(%op, 2) {{init = 1 : i32, sym_name = "op_p1"}}
-    %op_c1 = aie.lock(%op, 3) {{init = 0 : i32, sym_name = "op_c1"}}
-    %op_op = aie.lock(%op, 4) {{init = 1 : i32, sym_name = "op_op"}}
-    %op_oc = aie.lock(%op, 5) {{init = 0 : i32, sym_name = "op_oc"}}
+    {_lock_decls}
     %core_op = aie.core(%op) {{
       %z = arith.constant 0 : index
       %N = arith.constant 9223372036854775807 : index
       %one = arith.constant 1 : index
       scf.for %it = %z to %N step %one {{
-        aie.use_lock(%op_c0, AcquireGreaterEqual, 1)
-        aie.use_lock(%op_c1, AcquireGreaterEqual, 1)
-        aie.use_lock(%op_op, AcquireGreaterEqual, 1)
-        aie.use_lock(%op_p0, Release, 1)
-        aie.use_lock(%op_p1, Release, 1)
-        aie.use_lock(%op_oc, Release, 1)
+        aie.use_lock(%op_p0c, AcquireGreaterEqual, 1)
+        aie.use_lock(%op_p1c, AcquireGreaterEqual, 1)
+        aie.use_lock(%op_opp, AcquireGreaterEqual, 1)
+        aie.use_lock(%op_p0p, Release, 1)
+        aie.use_lock(%op_p1p, Release, 1)
+        aie.use_lock(%op_opc, Release, 1)
       }}
       aie.end
     }}
     %mem_op = aie.mem(%op) {{
-      %s0 = aie.dma_start(S2MM, 0, ^oh0, ^os1)
+      %s0 = aie.dma_start(S2MM, {_s2mm_0}, ^oh0, ^os1)
     ^oh0:
-      aie.use_lock(%op_p0, AcquireGreaterEqual, 1)
+      aie.use_lock(%op_p0p, AcquireGreaterEqual, 1)
       aie.dma_bd(%op_O : memref<{E}xbf16>, 0, {E2})
-      aie.use_lock(%op_c0, Release, 1)
+      aie.use_lock(%op_p0c, Release, 1)
       aie.next_bd ^oh0
     ^os1:
-      %s1 = aie.dma_start(S2MM, 1, ^oh1, ^om0)
+      %s1 = aie.dma_start(S2MM, {_s2mm_1}, ^oh1, ^om0)
     ^oh1:
-      aie.use_lock(%op_p1, AcquireGreaterEqual, 1)
+      aie.use_lock(%op_p1p, AcquireGreaterEqual, 1)
       aie.dma_bd(%op_O : memref<{E}xbf16>, {E2}, {E2})
-      aie.use_lock(%op_c1, Release, 1)
+      aie.use_lock(%op_p1c, Release, 1)
       aie.next_bd ^oh1
     ^om0:
-      %m0 = aie.dma_start(MM2S, 0, ^oo, ^oe)
+      %m0 = aie.dma_start(MM2S, {_mm2s}, ^oo, ^oe)
     ^oo:
-      aie.use_lock(%op_oc, AcquireGreaterEqual, 1)
+      aie.use_lock(%op_opc, AcquireGreaterEqual, 1)
       aie.dma_bd(%op_O : memref<{E}xbf16>, 0, {E})
-      aie.use_lock(%op_op, Release, 1)
+      aie.use_lock(%op_opp, Release, 1)
       aie.next_bd ^oo
     ^oe:
       aie.end
@@ -910,22 +1040,26 @@ class OFold8F3BestEmitter:
     def _nm_block(self):
         """nm tile: add O+resid, RMSNorm(ffn_in, gain)."""
         E = self.E; XB = self.XB
+
+        # Auto-allocate locks and DMA channels (#154)
+        L = _LockAlloc('core'); D = _DmaAlloc('core')
+        _o = L.pair('O'); _r = L.pair('R'); _f = L.pair('F')
+        _g = L.pair('G'); _fn = L.pair('FN')
+        _s2mm_0 = D.s2mm(); _s2mm_1 = D.s2mm(); _mm2s_0 = D.mm2s(); _mm2s_1 = D.mm2s()
+
+        _ld = lambda name, ids: _LockAlloc.mlir_decl('nm', 'nm', name, *ids)
+        _lock_decls = '\n'.join([
+            _ld('O', _o), _ld('R', _r), _ld('F', _f),
+            _ld('G', _g), _ld('FN', _fn),
+        ])
+
         return f"""
     %nm_O = aie.buffer(%nm) {{sym_name = "nm_O"}} : memref<{E}xbf16>
     %nm_R = aie.buffer(%nm) {{sym_name = "nm_R"}} : memref<{E}xbf16>
     %nm_F = aie.buffer(%nm) {{sym_name = "nm_F"}} : memref<{XB}xbf16>
     %nm_FN = aie.buffer(%nm) {{sym_name = "nm_FN"}} : memref<{XB}xbf16>
     %nm_gain = aie.buffer(%nm) {{sym_name = "nm_gain"}} : memref<{E}xbf16>
-    %nm_Op = aie.lock(%nm, 0) {{init = 1 : i32, sym_name = "nm_Op"}}
-    %nm_Oc = aie.lock(%nm, 1) {{init = 0 : i32, sym_name = "nm_Oc"}}
-    %nm_Rp = aie.lock(%nm, 2) {{init = 1 : i32, sym_name = "nm_Rp"}}
-    %nm_Rc = aie.lock(%nm, 3) {{init = 0 : i32, sym_name = "nm_Rc"}}
-    %nm_Fp = aie.lock(%nm, 4) {{init = 1 : i32, sym_name = "nm_Fp"}}
-    %nm_Fc = aie.lock(%nm, 5) {{init = 0 : i32, sym_name = "nm_Fc"}}
-    %nm_Gp = aie.lock(%nm, 6) {{init = 1 : i32, sym_name = "nm_Gp"}}
-    %nm_Gc = aie.lock(%nm, 7) {{init = 0 : i32, sym_name = "nm_Gc"}}
-    %nm_FNp = aie.lock(%nm, 8) {{init = 1 : i32, sym_name = "nm_FNp"}}
-    %nm_FNc = aie.lock(%nm, 9) {{init = 0 : i32, sym_name = "nm_FNc"}}
+    {_lock_decls}
     %core_nm = aie.core(%nm) {{
       %z = arith.constant 0 : index
       %N = arith.constant 9223372036854775807 : index
@@ -948,14 +1082,14 @@ class OFold8F3BestEmitter:
       aie.end
     }}
     %mem_nm = aie.mem(%nm) {{
-      %s0 = aie.dma_start(S2MM, 0, ^no, ^nrs)
+      %s0 = aie.dma_start(S2MM, {_s2mm_0}, ^no, ^nrs)
     ^no:
       aie.use_lock(%nm_Op, AcquireGreaterEqual, 1)
       aie.dma_bd(%nm_O : memref<{E}xbf16>, 0, {E})
       aie.use_lock(%nm_Oc, Release, 1)
       aie.next_bd ^no
     ^nrs:
-      %s1 = aie.dma_start(S2MM, 1, ^nr, ^nm0)
+      %s1 = aie.dma_start(S2MM, {_s2mm_1}, ^nr, ^nm0)
     ^nr:
       aie.use_lock(%nm_Rp, AcquireGreaterEqual, 1)
       aie.dma_bd(%nm_R : memref<{E}xbf16>, 0, {E})
@@ -967,7 +1101,7 @@ class OFold8F3BestEmitter:
       aie.use_lock(%nm_Gc, Release, 1)
       aie.next_bd ^nr
     ^nm0:
-      %m0 = aie.dma_start(MM2S, 0, ^nf, ^nm1)
+      %m0 = aie.dma_start(MM2S, {_mm2s_0}, ^nf, ^nm1)
     ^nf:
       aie.use_lock(%nm_FNc, AcquireGreaterEqual, 1)
       aie.dma_bd_packet(0, 1)
@@ -975,7 +1109,7 @@ class OFold8F3BestEmitter:
       aie.use_lock(%nm_FNp, Release, 1)
       aie.next_bd ^nf
     ^nm1:
-      %m1 = aie.dma_start(MM2S, 1, ^ns, ^nme)
+      %m1 = aie.dma_start(MM2S, {_mm2s_1}, ^ns, ^nme)
     ^ns:
       aie.use_lock(%nm_Fc, AcquireGreaterEqual, 1)
       aie.dma_bd(%nm_F : memref<{XB}xbf16>, 0, {E})
@@ -988,22 +1122,20 @@ class OFold8F3BestEmitter:
     def _mux_block(self):
         """mx tile: 3-phase broadcast mux (x / attn_out / ffn_in -> center tiles)."""
         E = self.E; XB = self.XB
+        L = _LockAlloc('core'); D = _DmaAlloc('core')
+        _s2mm_0 = D.s2mm(); _s2mm_1 = D.s2mm(); _mm2s = D.mm2s()
+        _ld = lambda name, ids: _LockAlloc.mlir_decl('mx', 'mx', name, *ids)
         if self.RL_FIX:
+            _x = L.pair('x'); _a0 = L.pair('a0'); _f = L.pair('f')
+            _a1 = L.pair('a1'); _o = L.pair('o')
+            _lock_decls = '\n'.join([_ld('x', _x), _ld('a0', _a0), _ld('f', _f),
+                                     _ld('a1', _a1), _ld('o', _o)])
             return f"""
     %mx_x = aie.buffer(%mx) {{sym_name = "mx_x"}} : memref<{XB}xbf16>
     %mx_a = aie.buffer(%mx) {{sym_name = "mx_a"}} : memref<{XB}xbf16>
     %mx_f = aie.buffer(%mx) {{sym_name = "mx_f"}} : memref<{XB}xbf16>
     %mx_o = aie.buffer(%mx) {{sym_name = "mx_o"}} : memref<{XB}xbf16>
-    %mx_xp = aie.lock(%mx, 0) {{init = 1 : i32, sym_name = "mx_xp"}}
-    %mx_xc = aie.lock(%mx, 1) {{init = 0 : i32, sym_name = "mx_xc"}}
-    %mx_a0p = aie.lock(%mx, 2) {{init = 1 : i32, sym_name = "mx_a0p"}}
-    %mx_a0c = aie.lock(%mx, 3) {{init = 0 : i32, sym_name = "mx_a0c"}}
-    %mx_fp = aie.lock(%mx, 4) {{init = 1 : i32, sym_name = "mx_fp"}}
-    %mx_fc = aie.lock(%mx, 5) {{init = 0 : i32, sym_name = "mx_fc"}}
-    %mx_a1p = aie.lock(%mx, 6) {{init = 1 : i32, sym_name = "mx_a1p"}}
-    %mx_a1c = aie.lock(%mx, 7) {{init = 0 : i32, sym_name = "mx_a1c"}}
-    %mx_op = aie.lock(%mx, 8) {{init = 1 : i32, sym_name = "mx_op"}}
-    %mx_oc = aie.lock(%mx, 9) {{init = 0 : i32, sym_name = "mx_oc"}}
+    {_lock_decls}
     %core_mx = aie.core(%mx) {{
       %z = arith.constant 0 : index
       %N = arith.constant 9223372036854775807 : index
@@ -1012,7 +1144,7 @@ class OFold8F3BestEmitter:
       %ne = arith.constant {E} : i32
       scf.for %it = %z to %N step %one {{
         aie.use_lock(%mx_xc, AcquireGreaterEqual, 1)
-        aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
+        aie.use_lock(%mx_oc, AcquireGreaterEqual, 1)
         func.call @attn_copy_bf16(%mx_x, %mx_o, %nx) : (memref<{XB}xbf16>, memref<{XB}xbf16>, i32) -> ()
         aie.use_lock(%mx_xp, Release, 1)
         aie.use_lock(%mx_oc, Release, 1)
@@ -1032,14 +1164,14 @@ class OFold8F3BestEmitter:
       aie.end
     }}
     %mem_mx = aie.mem(%mx) {{
-      %s0 = aie.dma_start(S2MM, 0, ^mxi, ^mxs1)
+      %s0 = aie.dma_start(S2MM, {_s2mm_0}, ^mxi, ^mxs1)
     ^mxi:
       aie.use_lock(%mx_xp, AcquireGreaterEqual, 1)
       aie.dma_bd(%mx_x : memref<{XB}xbf16>, 0, {XB})
       aie.use_lock(%mx_xc, Release, 1)
       aie.next_bd ^mxi
     ^mxs1:
-      %s1 = aie.dma_start(S2MM, 1, ^mxa0, ^mxm0)
+      %s1 = aie.dma_start(S2MM, {_s2mm_1}, ^mxa0, ^mxm0)
     ^mxa0:
       aie.use_lock(%mx_a0p, AcquireGreaterEqual, 1)
       aie.dma_bd_packet(0, 0)
@@ -1059,7 +1191,7 @@ class OFold8F3BestEmitter:
       aie.use_lock(%mx_a1c, Release, 1)
       aie.next_bd ^mxa0
     ^mxm0:
-      %m0 = aie.dma_start(MM2S, 0, ^mxo, ^mxe)
+      %m0 = aie.dma_start(MM2S, {_mm2s}, ^mxo, ^mxe)
     ^mxo:
       aie.use_lock(%mx_oc, AcquireGreaterEqual, 1)
       aie.dma_bd(%mx_o : memref<{XB}xbf16>, 0, {XB})
@@ -1069,19 +1201,14 @@ class OFold8F3BestEmitter:
       aie.end
     }}"""
         else:
+            _x = L.pair('x'); _a = L.pair('a'); _f = L.pair('f'); _o = L.pair('o')
+            _lock_decls = '\n'.join([_ld('x', _x), _ld('a', _a), _ld('f', _f), _ld('o', _o)])
             return f"""
     %mx_x = aie.buffer(%mx) {{sym_name = "mx_x"}} : memref<{XB}xbf16>
     %mx_a = aie.buffer(%mx) {{sym_name = "mx_a"}} : memref<{XB}xbf16>
     %mx_f = aie.buffer(%mx) {{sym_name = "mx_f"}} : memref<{XB}xbf16>
     %mx_o = aie.buffer(%mx) {{sym_name = "mx_o"}} : memref<{XB}xbf16>
-    %mx_xp = aie.lock(%mx, 0) {{init = 1 : i32, sym_name = "mx_xp"}}
-    %mx_xc = aie.lock(%mx, 1) {{init = 0 : i32, sym_name = "mx_xc"}}
-    %mx_ap = aie.lock(%mx, 2) {{init = 1 : i32, sym_name = "mx_ap"}}
-    %mx_ac = aie.lock(%mx, 3) {{init = 0 : i32, sym_name = "mx_ac"}}
-    %mx_fp = aie.lock(%mx, 4) {{init = 1 : i32, sym_name = "mx_fp"}}
-    %mx_fc = aie.lock(%mx, 5) {{init = 0 : i32, sym_name = "mx_fc"}}
-    %mx_op = aie.lock(%mx, 6) {{init = 1 : i32, sym_name = "mx_op"}}
-    %mx_oc = aie.lock(%mx, 7) {{init = 0 : i32, sym_name = "mx_oc"}}
+    {_lock_decls}
     %core_mx = aie.core(%mx) {{
       %z = arith.constant 0 : index
       %N = arith.constant 9223372036854775807 : index
@@ -1108,14 +1235,14 @@ class OFold8F3BestEmitter:
       aie.end
     }}
     %mem_mx = aie.mem(%mx) {{
-      %s0 = aie.dma_start(S2MM, 0, ^mxi, ^mxs1)
+      %s0 = aie.dma_start(S2MM, {_s2mm_0}, ^mxi, ^mxs1)
     ^mxi:
       aie.use_lock(%mx_xp, AcquireGreaterEqual, 1)
       aie.dma_bd(%mx_x : memref<{XB}xbf16>, 0, {XB})
       aie.use_lock(%mx_xc, Release, 1)
       aie.next_bd ^mxi
     ^mxs1:
-      %s1 = aie.dma_start(S2MM, 1, ^mxa, ^mxm0)
+      %s1 = aie.dma_start(S2MM, {_s2mm_1}, ^mxa, ^mxm0)
     ^mxa:
       aie.use_lock(%mx_ap, AcquireGreaterEqual, 1)
       aie.dma_bd_packet(0, 0)
@@ -1129,7 +1256,7 @@ class OFold8F3BestEmitter:
       aie.use_lock(%mx_fc, Release, 1)
       aie.next_bd ^mxa
     ^mxm0:
-      %m0 = aie.dma_start(MM2S, 0, ^mxo, ^mxe)
+      %m0 = aie.dma_start(MM2S, {_mm2s}, ^mxo, ^mxe)
     ^mxo:
       aie.use_lock(%mx_oc, AcquireGreaterEqual, 1)
       aie.dma_bd(%mx_o : memref<{XB}xbf16>, 0, {XB})
