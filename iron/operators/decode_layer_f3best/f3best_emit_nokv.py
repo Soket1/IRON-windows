@@ -160,6 +160,7 @@ class OFold8F3BestEmitter:
         self.KCH = self.CHUNK * HD                         # per-chunk K/V buffer elems (1B: 8192)
         self.ITC = self.CHUNK * AG + 2 * AG                # per-chunk score packet (1B: 520)
         self.KVN = SEQ * HD                                # per-head KV buffer (1B: 16384)
+        self.FLOWKV_LIB = f"flowkv_{HD}d_h{AG}_c{SEQ}.o"   # per-dimension flowkv kernel (#155)
 
         # ── XR bundle ──
         self.XR_ELEMS = self.XB + E + E                    # x_bundle + resid + gain (1B: 6416)
@@ -629,18 +630,18 @@ class OFold8F3BestEmitter:
       %c0 = arith.constant 0 : index
       %cN = arith.constant 9223372036854775807 : index
       %c1 = arith.constant 1 : index
-      %a4 = arith.constant 4 : i32
-      %h64 = arith.constant 64 : i32
+      %ag = arith.constant {self.AG} : i32
+      %hd = arith.constant {self.HD} : i32
       %cnc = arith.constant {NC} : index
       %sC = arith.constant {CH} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
-        func.call @flowkv_score_init_bf16(%a4) : (i32) -> ()
+        func.call @flowkv_score_init_bf16(%ag) : (i32) -> ()
         aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
-        func.call @flowkv_score_rope_q_bf16(%{p}_Qs, %a4, %h64) : (memref<{QSZ}xbf16>, i32, i32) -> ()
+        func.call @flowkv_score_rope_q_bf16(%{p}_Qs, %ag, %hd) : (memref<{QSZ}xbf16>, i32, i32) -> ()
         scf.for %ci = %c0 to %cnc step %c1 {{
           aie.use_lock(%{p}_Kc, AcquireGreaterEqual, 1)
           aie.use_lock(%{p}_Ip, AcquireGreaterEqual, 1)
-          func.call @flowkv_score_chunk_bf16(%{p}_Qs, %{p}_K, %{p}_It, %a4, %h64, %sC) : (memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) -> ()
+          func.call @flowkv_score_chunk_bf16(%{p}_Qs, %{p}_K, %{p}_It, %ag, %hd, %sC) : (memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) -> ()
           aie.use_lock(%{p}_Kp, Release, 1)
           aie.use_lock(%{p}_Ic, Release, 1)
         }}
@@ -714,21 +715,21 @@ class OFold8F3BestEmitter:
       %c0 = arith.constant 0 : index
       %cN = arith.constant 9223372036854775807 : index
       %c1 = arith.constant 1 : index
-      %a4 = arith.constant 4 : i32
-      %h64 = arith.constant 64 : i32
+      %ag = arith.constant {self.AG} : i32
+      %hd = arith.constant {self.HD} : i32
       %cnc = arith.constant {NC} : index
       %sC = arith.constant {CH} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
-        func.call @flowkv_value_init_bf16(%a4, %h64) : (i32, i32) -> ()
+        func.call @flowkv_value_init_bf16(%ag, %hd) : (i32, i32) -> ()
         scf.for %ci = %c0 to %cnc step %c1 {{
           aie.use_lock(%{p}_Ic, AcquireGreaterEqual, 1)
           aie.use_lock(%{p}_Vc, AcquireGreaterEqual, 1)
-          func.call @flowkv_value_accum_bf16(%{p}_Iv, %{p}_V, %a4, %h64, %sC) : (memref<{ITC}xbf16>, memref<{KCH}xbf16>, i32, i32, i32) -> ()
+          func.call @flowkv_value_accum_bf16(%{p}_Iv, %{p}_V, %ag, %hd, %sC) : (memref<{ITC}xbf16>, memref<{KCH}xbf16>, i32, i32, i32) -> ()
           aie.use_lock(%{p}_Ip, Release, 1)
           aie.use_lock(%{p}_Vp, Release, 1)
         }}
         aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
-        func.call @flowkv_value_normalize_bf16(%{p}_Of, %a4, %h64) : (memref<{PT}xbf16>, i32, i32) -> ()
+        func.call @flowkv_value_normalize_bf16(%{p}_Of, %ag, %hd) : (memref<{PT}xbf16>, i32, i32) -> ()
         aie.use_lock(%{p}_Oc, Release, 1)
       }}
       aie.end
@@ -1307,12 +1308,12 @@ class OFold8F3BestEmitter:
             f'    func.func private @oproj_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_oproj_signed_2048k_g32.o"}}\n'
             f'    func.func private @layer_fused_add_bf16(memref<{E}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
             f'    func.func private @layer_fused_rms_norm2_bf16(memref<{XB}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            '    func.func private @flowkv_score_init_bf16(i32) attributes {link_with = "flowkv_64d_h4_c256.o"}\n'
-            f'    func.func private @flowkv_score_rope_q_bf16(memref<{QSZ}xbf16>, i32, i32) attributes {{link_with = "flowkv_64d_h4_c256.o"}}\n'
-            f'    func.func private @flowkv_score_chunk_bf16(memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) attributes {{link_with = "flowkv_64d_h4_c256.o"}}\n'
-            '    func.func private @flowkv_value_init_bf16(i32, i32) attributes {link_with = "flowkv_64d_h4_c256.o"}\n'
-            f'    func.func private @flowkv_value_accum_bf16(memref<{ITC}xbf16>, memref<{KCH}xbf16>, i32, i32, i32) attributes {{link_with = "flowkv_64d_h4_c256.o"}}\n'
-            f'    func.func private @flowkv_value_normalize_bf16(memref<{PT}xbf16>, i32, i32) attributes {{link_with = "flowkv_64d_h4_c256.o"}}\n')
+            '    func.func private @flowkv_score_init_bf16(i32) attributes {link_with = "{self.FLOWKV_LIB}"}\n'
+            f'    func.func private @flowkv_score_rope_q_bf16(memref<{QSZ}xbf16>, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
+            f'    func.func private @flowkv_score_chunk_bf16(memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
+            '    func.func private @flowkv_value_init_bf16(i32, i32) attributes {link_with = "{self.FLOWKV_LIB}"}\n'
+            f'    func.func private @flowkv_value_accum_bf16(memref<{ITC}xbf16>, memref<{KCH}xbf16>, i32, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
+            f'    func.func private @flowkv_value_normalize_bf16(memref<{PT}xbf16>, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n')
 
         # flows
         flows = []
