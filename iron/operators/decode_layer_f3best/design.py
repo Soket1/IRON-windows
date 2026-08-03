@@ -14,7 +14,7 @@ any other shape rather than silently generalizing.
 
 
 def my_decode_layer_f3best(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
-                           head_dim=64, num_kv_heads=8, attn_group=4, seq_len=32,
+                           head_dim=64, num_kv_heads=8, attn_group=4, seq_len=256,
                            with_npu_kv=False):
     import os
     import sys
