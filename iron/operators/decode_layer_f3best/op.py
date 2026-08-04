@@ -58,10 +58,10 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         _div_suffix = f'_d{_ffn_div}' if _ffn_div != '1' else ''
         _decouple = '_decouple' if _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != '' else ''
         _triple_b = '_tb' if _os.environ.get('F3BEST_TRIPLE_B', '1').strip() != '' else ''
-        _handasm_rr = '_rr' if _os.environ.get('F3BEST_HANDASM_RR', '').strip() != '' else ''
+        _cpp_bcast = '_cpp'  # #188: pure C++ bcast path (no hand-asm .s)
         _kv_abi = '_kv' if self.with_npu_kv else '_nokv'
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}")   # _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_cpp_bcast}")   # _cpp = pure C++ bcast (#188, no hand-asm .s), _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -121,41 +121,14 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
                 f"-DHEAD_DIM={self.head_dim}", f"-DNUM_HEADS={self.num_q_heads}",
                 f"-DNUM_KV_HEADS={self.num_kv_heads}", f"-DMAX_SEQ_LEN=2048",
                 "-DNUM_AIE_COLUMNS=8", "-DM_OUTPUT_MAX=1024",
-                "-DUSE_HAND_ASM_BCAST",
             ],
         )
 
         # #131: C++ wrapper that calls hand-asm kernel for unified broadcast GEMV.
-        # Level 1: single generic_bcast_gemv_bf16 replaces 4 per-phase wrappers.
-        unified_bcast_obj = KernelObjectArtifact.new(
-            "layer_fused_unified_bcast.o",
-            depends=[SourceArtifact.new(k2p / "layer_fused_unified_bcast.cc")],
-            extra_flags=[
-                f"-DEMBED_DIM={E}", f"-DHIDDEN_DIM={H}", f"-DGROUP_SIZE={g}",
-                f"-DHEAD_DIM={self.head_dim}", f"-DNUM_HEADS={self.num_q_heads}",
-                f"-DNUM_KV_HEADS={self.num_kv_heads}", f"-DMAX_SEQ_LEN=2048",
-                "-DNUM_AIE_COLUMNS=8", "-DM_OUTPUT_MAX=1024",
-            ],
-        )
-        # #131: KC=256 hand-asm kernel (bcast_gemv adapted for chunk mode)
-        bcast_kc256_obj = KernelObjectArtifact.new(
-            "layer_fused_bcast_kc256.o",
-            depends=[SourceArtifact.new(k2p / "layer_fused_bcast_kc256.s")],
-            extra_flags=[],
-        )
-        # #135: ppbase-density RR kernel (1.5 bundles/vmac)
-        bcast_kc256_rr_obj = KernelObjectArtifact.new(
-            "layer_fused_bcast_kc256_rr.o",
-            depends=[SourceArtifact.new(k2p / "layer_fused_bcast_kc256_rr.s")],
-            extra_flags=[],
-        )
-        _use_rr = _os.environ.get('F3BEST_HANDASM_RR', '').strip() != ''
-        _bcast_obj = bcast_kc256_rr_obj if _use_rr else bcast_kc256_obj
-
         xclbin_artifact = XclbinArtifact.new(
             f"{base}.xclbin",
             depends=[mlir_artifact, gemv_obj, oproj_obj, rope_obj, flowkv_obj,
-                     concat_obj, relay_obj, unified_bcast_obj, _bcast_obj],
+                     concat_obj, relay_obj],
         )
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
         return xclbin_artifact, insts_artifact
