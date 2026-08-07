@@ -193,11 +193,18 @@ class OFold8F3BestEmitter:
 
         self.DECOUPLE = _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != ''
         self.RL_FIX = _os.environ.get('F3BEST_RL_FIX', '').strip() != ''
-        self.HANDASM_RR = False  # #188: hand-asm .s removed, pure C++ bcast path
+        # hand-asm bcast path (#188 fix: kc256.s cml-init corrected; RR = kc256_rr.s)
+        self.HANDASM_RR = _os.environ.get('F3BEST_HANDASM_RR', '').strip() != ''
 
         # triple-B: env overrides auto-detection. '0' = force off; '1' or unset = auto.
         _tb_env = _os.environ.get('F3BEST_TRIPLE_B', '1').strip()
         self._tb_env_forced_off = (_tb_env == '0')
+
+        # #188 Ш21 Direct-NPU Q dump: when set, each score tile copies its received
+        # roped-Q (PT elems) into a dedicated Qd buffer and the O_h relay MM2S1 is
+        # re-pointed at Qd, so the per-head Q lands in the host-visible s-region of
+        # the output BO (the O output is displaced for this diagnostic build).
+        self.QDUMP = _os.environ.get('F3BEST_QDUMP', '').strip() != ''
 
     def _compute_l1_budget(self):
         """Compute L1 usage and auto-select single-B vs triple-B (64KB limit)."""
@@ -286,6 +293,7 @@ class OFold8F3BestEmitter:
     %{p}_gate = aie.buffer(%t{h}) {{sym_name = "{p}_gate"}} : memref<{HP}xbf16>
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<{HP}xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<{HP}xbf16>
+    %{p}_uni_partial = aie.buffer(%t{h}) {{sym_name = "{p}_uni_partial"}} : memref<{UNI}xi8>
     %core{h} = aie.core(%t{h}) {{
       %c0 = arith.constant 0 : index
       %cN = arith.constant 9223372036854775807 : index
@@ -295,23 +303,22 @@ class OFold8F3BestEmitter:
       %cF = arith.constant {GT} : index
       %c4 = arith.constant 4 : i32
       %c8 = arith.constant 8 : i32
-      %c0_i32 = arith.constant 0 : i32
-      %c1_i32 = arith.constant 1 : i32
       %qr = arith.constant {PT} : i32
       %hc = arith.constant {HP} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
+        func.call @_ha_noop() : () -> ()
         // ---- phase 1: Q-GEMV + rope (B0 = x_bundle, nchunk=8) ----
         aie.use_lock(%{p}_B0c, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_qkv_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_B0, %{p}_Q) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_q(%ji0, %{p}_A0, %{p}_B0, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{QSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_qkv_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B0, %{p}_Q) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_q(%ji1, %{p}_A1, %{p}_B0, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{QSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) -> ()
@@ -323,12 +330,12 @@ class OFold8F3BestEmitter:
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_oproj_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_B1, %{p}_O) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_o(%ji0, %{p}_A0, %{p}_B1, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{OSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_oproj_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B1, %{p}_O) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_o(%ji1, %{p}_A1, %{p}_B1, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{OSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_B1p, Release, 1)
@@ -339,24 +346,24 @@ class OFold8F3BestEmitter:
         scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_gate_up_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_B2, %c0_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
+          func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B2, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_gate_up_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B2, %c0_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
+          func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B2, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         // 3b: up GEMV (nchunk=8, output -> up_buf)
         scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_gate_up_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_B2, %c1_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
+          func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B2, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_gate_up_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B2, %c1_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
+          func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B2, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_B2p, Release, 1)
@@ -367,12 +374,12 @@ class OFold8F3BestEmitter:
         scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_down_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_P) : (i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_d(%ji0, %{p}_A0, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<{PK}xi8>, memref<{HP}xbf16>, memref<{UNI}xi8>, i32, memref<{PSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_down_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_P) : (i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<{PK}xi8>, memref<{HP}xbf16>, memref<{UNI}xi8>, i32, memref<{PSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_Pc, Release, 1)
@@ -464,6 +471,7 @@ class OFold8F3BestEmitter:
     %{p}_gate = aie.buffer(%t{h}) {{sym_name = "{p}_gate"}} : memref<{HP}xbf16>
     %{p}_up   = aie.buffer(%t{h}) {{sym_name = "{p}_up"}}   : memref<{HP}xbf16>
     %{p}_silu = aie.buffer(%t{h}) {{sym_name = "{p}_silu"}} : memref<{HP}xbf16>
+    %{p}_uni_partial = aie.buffer(%t{h}) {{sym_name = "{p}_uni_partial"}} : memref<{UNI}xi8>
     %core{h} = aie.core(%t{h}) {{
       %c0 = arith.constant 0 : index
       %cN = arith.constant 9223372036854775807 : index
@@ -473,23 +481,23 @@ class OFold8F3BestEmitter:
       %cF = arith.constant {GT} : index
       %c4 = arith.constant 4 : i32
       %c8 = arith.constant 8 : i32
-      %c0_i32 = arith.constant 0 : i32
-      %c1_i32 = arith.constant 1 : i32
       %qr = arith.constant {PT} : i32
       %hc = arith.constant {HP} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
+        // #131: no-op call to force aiecc to link kc256.o (called by C++ wrapper on this core)
+        func.call @_ha_noop() : () -> ()
         // ---- phase 1: Q-GEMV + rope (B = x_bundle, nchunk=8) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_qkv_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_B, %{p}_Q) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_q(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{QSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_qkv_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B, %{p}_Q) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_q(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_Q) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{QSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) -> ()
@@ -501,12 +509,12 @@ class OFold8F3BestEmitter:
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_oproj_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_B, %{p}_O) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_o(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{OSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_oproj_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B, %{p}_O) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_o(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_O) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{OSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_Bp, Release, 1)
@@ -517,24 +525,24 @@ class OFold8F3BestEmitter:
         scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_gate_up_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_B, %c0_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
+          func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_gate_up_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B, %c0_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
+          func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_gate) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         // 3b: up GEMV (nchunk=8, output -> up_buf)
         scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_gate_up_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_B, %c1_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
+          func.call @generic_bcast_gemv_bf16_g(%ji0, %{p}_A0, %{p}_B, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_gate_up_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B, %c1_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
+          func.call @generic_bcast_gemv_bf16_g(%ji1, %{p}_A1, %{p}_B, %{p}_uni_partial, %c8, %{p}_up) : (i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_Bp, Release, 1)
@@ -545,12 +553,12 @@ class OFold8F3BestEmitter:
         scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
-          func.call @layer_fused_down_bcast_bf16(%ji0, %c0_i32, %{p}_A0, %{p}_P) : (i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_d(%ji0, %{p}_A0, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<{PK}xi8>, memref<{HP}xbf16>, memref<{UNI}xi8>, i32, memref<{PSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A0p, Release, 1)
           aie.use_lock(%{p}_A1c, AcquireGreaterEqual, 1)
           %j1 = arith.addi %j, %c1 : index
           %ji1 = arith.index_cast %j1 : index to i32
-          func.call @layer_fused_down_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_P) : (i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) -> ()
+          func.call @generic_bcast_gemv_bf16_d(%ji1, %{p}_A1, %{p}_silu, %{p}_uni_partial, %c4, %{p}_P) : (i32, memref<{PK}xi8>, memref<{HP}xbf16>, memref<{UNI}xi8>, i32, memref<{PSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_Pc, Release, 1)
@@ -614,10 +622,102 @@ class OFold8F3BestEmitter:
         _mm2s_oh  = D.mm2s('oh')   # Oh relay to join
 
         _ld = lambda name, ids: _LockAlloc.mlir_decl(f'sc{h}', f'{p}', name, *ids)
-        _lock_decls = '\n'.join([
-            _ld('Q', _q), _ld('K', _k), _ld('I', _i),
-            _ld('Oh', _oh), _ld('Ohd', _ohd),
-        ])
+        if self.QDUMP:
+            # #188 Q dump: one extra lock pair gates the Qd relay buffer (the score
+            # tile has 16/16 locks with 5 pairs used -> 3 pairs headroom; no extra
+            # DMA channel is allocated — the O_h relay MM2S1 is re-pointed at Qd).
+            _qd = L.pair('Qd')
+            _lock_decls = '\n'.join([
+                _ld('Q', _q), _ld('K', _k), _ld('I', _i),
+                _ld('Oh', _oh), _ld('Ohd', _ohd), _ld('Qd', _qd),
+            ])
+        else:
+            _lock_decls = '\n'.join([
+                _ld('Q', _q), _ld('K', _k), _ld('I', _i),
+                _ld('Oh', _oh), _ld('Ohd', _ohd),
+            ])
+
+        if self.QDUMP:
+            # #188 Q-dump variant: after rope, copy the received roped-Q (PT) into
+            # Qd and gate the relay on Qd (instead of O_h). The O_h relay buffer is
+            # still filled by S2MM0-BD1 (core sends O via mm2s_qo BD1) — we cycle
+            # Ohc/Ohp so that S2MM0 BD1 never spins — but its data is discarded.
+            # The O_hd pair (Ohd) is left idle (no code references it -> no deadlock).
+            return f"""
+    %{p}_Qs = aie.buffer(%sc{h}) {{sym_name = "{p}_Qs"}} : memref<{QSZ}xbf16>
+    %{p}_K  = aie.buffer(%sc{h}) {{sym_name = "{p}_K"}}  : memref<{KCH}xbf16>
+    %{p}_It = aie.buffer(%sc{h}) {{sym_name = "{p}_It"}} : memref<{ITC}xbf16>
+    %{p}_Oh = aie.buffer(%sc{h}) {{sym_name = "{p}_Oh"}} : memref<{PT}xbf16>
+    %{p}_Qd = aie.buffer(%sc{h}) {{sym_name = "{p}_Qd"}} : memref<{PT}xbf16>
+    {_lock_decls}
+    %core_sc{h} = aie.core(%sc{h}) {{
+      %c0 = arith.constant 0 : index
+      %cN = arith.constant 9223372036854775807 : index
+      %c1 = arith.constant 1 : index
+      %ag = arith.constant {self.AG} : i32
+      %hd = arith.constant {self.HD} : i32
+      %cnc = arith.constant {NC} : index
+      %sC = arith.constant {CH} : i32
+      %cd = arith.constant {PT} : i32
+      scf.for %tok = %c0 to %cN step %c1 {{
+        func.call @flowkv_score_init_bf16(%ag) : (i32) -> ()
+        aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
+        func.call @flowkv_score_rope_q_bf16(%{p}_Qs, %ag, %hd) : (memref<{QSZ}xbf16>, i32, i32) -> ()
+        // #188 Q dump: relay the roped-Q slice off to the host s-region via the O_h
+        // relay (MM2S1, re-pointed at Qd). Compute is the producer of Qd.
+        aie.use_lock(%{p}_Qdp, AcquireGreaterEqual, 1)
+        func.call @layer_fused_dump_q_bf16(%{p}_Qs, %{p}_Qd, %cd) : (memref<{QSZ}xbf16>, memref<{PT}xbf16>, i32) -> ()
+        aie.use_lock(%{p}_Qdc, Release, 1)
+        scf.for %ci = %c0 to %cnc step %c1 {{
+          aie.use_lock(%{p}_Kc, AcquireGreaterEqual, 1)
+          aie.use_lock(%{p}_Ip, AcquireGreaterEqual, 1)
+          func.call @flowkv_score_chunk_bf16(%{p}_Qs, %{p}_K, %{p}_It, %ag, %hd, %sC) : (memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) -> ()
+          aie.use_lock(%{p}_Kp, Release, 1)
+          aie.use_lock(%{p}_Ic, Release, 1)
+        }}
+        aie.use_lock(%{p}_Qp, Release, 1)
+        // cycle the dead O_h buffer so the incoming core O (S2MM0-BD1) never stalls
+        aie.use_lock(%{p}_Ohc, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Ohp, Release, 1)
+      }}
+      aie.end
+    }}
+    %mem_sc{h} = aie.mem(%sc{h}) {{
+      %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
+    ^q{h}:
+      aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZ})
+      aie.use_lock(%{p}_Qc, Release, 1)
+      aie.next_bd ^oh{h}
+    ^oh{h}:
+      aie.use_lock(%{p}_Ohp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Oh : memref<{PT}xbf16>, 0, {PT})
+      aie.use_lock(%{p}_Ohc, Release, 1)
+      aie.next_bd ^q{h}
+    ^ks{h}:
+      %s1 = aie.dma_start(S2MM, {_s2mm_kv}, ^k{h}, ^im{h})
+    ^k{h}:
+      aie.use_lock(%{p}_Kp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_K : memref<{KCH}xbf16>, 0, {KCH})
+      aie.use_lock(%{p}_Kc, Release, 1)
+      aie.next_bd ^k{h}
+    ^im{h}:
+      %m0 = aie.dma_start(MM2S, {_mm2s_out}, ^io{h}, ^ohm{h})
+    ^io{h}:
+      aie.use_lock(%{p}_Ic, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_It : memref<{ITC}xbf16>, 0, {ITC})
+      aie.use_lock(%{p}_Ip, Release, 1)
+      aie.next_bd ^io{h}
+    ^ohm{h}:
+      %m1 = aie.dma_start(MM2S, {_mm2s_oh}, ^ohf{h}, ^e{h})
+    ^ohf{h}:
+      aie.use_lock(%{p}_Qdc, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Qd : memref<{PT}xbf16>, 0, {PT})
+      aie.use_lock(%{p}_Qdp, Release, 1)
+      aie.next_bd ^ohf{h}
+    ^e{h}:
+      aie.end
+    }}"""
 
         return f"""
     %{p}_Qs = aie.buffer(%sc{h}) {{sym_name = "{p}_Qs"}} : memref<{QSZ}xbf16>
@@ -1291,14 +1391,16 @@ class OFold8F3BestEmitter:
         PK = self.PACKED; XB = self.XB; QSZ = self.Q_SZ; OSZ = self.O_SZ
         PSZ = self.P_SZ; HP = self.HPER; UNI = self.UNI_SZ; E = self.E
         KCH = self.KCH; ITC = self.ITC; PT = self.PER_TILE
+        _ha_link = 'layer_fused_bcast_kc256_rr.o' if self.HANDASM_RR else 'layer_fused_bcast_kc256.o'
         funcs = (
+            f'    func.func private @_ha_noop() -> () attributes {{link_with = "{_ha_link}"}}\n'
             f'    func.func private @fused_dequant_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_signed_2048k_g32.o"}}\n'
             f'    func.func private @rope_bundled(memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) attributes {{link_with = "rope_il.o"}}\n'
             f'    func.func private @layer_fused_gate_up_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_qkv_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_oproj_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_gate_up_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_down_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
+            f'    func.func private @generic_bcast_gemv_bf16_q(i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{QSZ}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
+            f'    func.func private @generic_bcast_gemv_bf16_o(i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{OSZ}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
+            f'    func.func private @generic_bcast_gemv_bf16_g(i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
+            f'    func.func private @generic_bcast_gemv_bf16_d(i32, memref<{PK}xi8>, memref<{HP}xbf16>, memref<{UNI}xi8>, i32, memref<{PSZ}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
             f'    func.func private @layer_fused_silu_mul_explicit_bf16(memref<{HP}xbf16>, memref<{HP}xbf16>, memref<{HP}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
             f'    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
             f'    func.func private @attn_copy_bf16(memref<{XB}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "attn_concat.o"}}\n'
@@ -1310,7 +1412,9 @@ class OFold8F3BestEmitter:
             f'    func.func private @flowkv_score_chunk_bf16(memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_value_init_bf16(i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_value_accum_bf16(memref<{ITC}xbf16>, memref<{KCH}xbf16>, i32, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
-            f'    func.func private @flowkv_value_normalize_bf16(memref<{PT}xbf16>, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n')
+            f'    func.func private @flowkv_value_normalize_bf16(memref<{PT}xbf16>, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
+            + (f'    func.func private @layer_fused_dump_q_bf16(memref<{QSZ}xbf16>, memref<{PT}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
+               if self.QDUMP else ''))
 
         # flows
         flows = []

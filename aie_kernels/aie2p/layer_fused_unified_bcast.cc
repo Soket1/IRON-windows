@@ -83,6 +83,18 @@ void generic_bcast_gemv_bf16(
     // activation + chunk*KC: this chunk's 256-element activation slice.
     layer_fused_gemv_bcast_kc256_bf16(weights, activation + chunk * KC, scratch);
 
+#ifdef QBCAST_NO_CROSSCHUNK_DI
+    // #188 Ш22.5 diagnostic: flush THIS chunk's fresh scratch directly to output
+    // with NO cross-chunk partial add/store at all. If the hand-asm Q corruption
+    // (dense noise / NaN) disappears -> the cross-chunk static partial is the
+    // shared root (same as the C++ _qkv_bcast_chunk). Q magnitude ~1/nchunk of
+    // correct (only this chunk's KC cols contribute), but FINITE if clean.
+    aie::accum<accfloat, N> facc0;
+    facc0.from_vector(aie::load_v<N>(scratch));
+    aie::store_v(output + block * N, facc0.template to_vector<bfloat16>());
+    return;
+#endif
+
     // ── Step 2: bf16 → accfloat → float32 ─────────────────────────────────
     // Match the existing conversion chain exactly:
     //   load_v<32>(bf16*) → from_vector() → accum<accfloat,32>

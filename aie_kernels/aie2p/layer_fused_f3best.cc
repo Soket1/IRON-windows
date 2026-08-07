@@ -811,6 +811,23 @@ void layer_fused_dump_oproj_bf16(
     for (int i = chunks * VEC; i < n; i++) c[i] = src[i];
 }
 
+// DEBUG (#188 Ш21 Direct-NPU Q dump): copy `n` elems from an on-chip buffer
+// (the score tile's received roped-Q) into a small relay buffer that rides the
+// EXISTING O_h relay (score MM2S1 -> oJ/oK join -> orelay -> ANM+resid -> shim
+// S2MM1 -> the s-region of the output BO). No new DMA channel is needed — the
+// center/score tiles are already at their DMA (2+2) and lock budget, so the Q
+// dump reuses the O relay and only re-points its BD source. Landing the output
+// in the host-visible s-region lets the host read Q magnitude / NaN after
+// subtracting the known resid (NaN/finite survives the +resid).
+void layer_fused_dump_q_bf16(
+        const bfloat16 *src, bfloat16 *dst, int32_t n) {
+    constexpr int VEC = 16;
+    int chunks = n / VEC;
+    for (int i = 0; i < chunks; i++)
+        ::aie::store_v(dst + i * VEC, ::aie::load_v<VEC>(src + i * VEC));
+    for (int i = chunks * VEC; i < n; i++) dst[i] = src[i];
+}
+
 // Weighted RMSNorm: output[i] = (input[i] / rms(input)) * gain[i], eps=1e-5.
 void layer_fused_rms_norm2_bf16(
         const bfloat16 *input, const bfloat16 *gain,
@@ -928,8 +945,14 @@ static void _lf_dual_gemv(uint32_t m, uint32_t row_offset,
 // block=j/NCHUNK, chunk=j%NCHUNK. Accumulates a per-block float partial across the
 // NCHUNK chunks (dense _gemv_bcast_w2 over KC cols + 2 accs), flushes to
 // lf_left/right_buf[block*32] on the last chunk. silu/down downstream unchanged.
-// #131: exposed (non-static) for hand-asm wrapper
-    float lf_qkv_bc_partial[32] __attribute__((aligned(64)));
+// #188 fix: the 32-float (1024-bit) partial store/load is double the AIE2 native
+// 512-bit vector width; aiecc's two-op lowering misplaces the middle 64 bytes
+// (lanes 8-23) -> the block-local [8,24) garbage. Split each 32-float partial
+// into two native 16-float (64-byte) halves, with a 128-byte PAD between lo/hi
+// so aiecc cannot re-merge them into one contiguous 128-byte region.
+    float lf_qkv_bc_partial_lo[16] __attribute__((aligned(64)));
+    char  lf_qkv_bc_partial_pad[128] __attribute__((aligned(64)));
+    float lf_qkv_bc_partial_hi[16] __attribute__((aligned(64)));
 
 template <uint32_t N, uint32_t G, uint32_t NCHUNK>
 static void _qkv_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
@@ -957,21 +980,31 @@ static void _qkv_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
         aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
         acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
     }
-    aie::vector<float, N> cur = acc.template to_vector<float>();
+    // #188 fix: fully-16-wide partial path — split acc into two 16-float halves;
+    // NEVER recombine to a 32-float vector for the partial add/store/load
+    // (1024-bit L1/ALU ops are the suspect). The 32-float `v` here is a REGISTER
+    // value (the chunk0-diag proved 32-wide register compute is clean).
+    auto v = acc.template to_vector<float>();
+    aie::vector<float, 16> clo = v.template extract<16>(0);
+    aie::vector<float, 16> chi = v.template extract<16>(1);
     if (chunk != 0) {
-        cur = aie::add(cur, aie::load_v<N>(lf_qkv_bc_partial));
+        clo = aie::add(clo, aie::load_v<16>(lf_qkv_bc_partial_lo));
+        chi = aie::add(chi, aie::load_v<16>(lf_qkv_bc_partial_hi));
     }
     if (chunk == NCHUNK - 1) {
-        aie::accum<accfloat, N> facc;
-        facc.from_vector(cur);
-        aie::store_v(c_out + block * N, facc.template to_vector<bfloat16>());
+        aie::accum<accfloat, 16> fo, fh;
+        fo.from_vector(clo);  aie::store_v(c_out + block * N,      fo.template to_vector<bfloat16>());
+        fh.from_vector(chi);  aie::store_v(c_out + block * N + 16, fh.template to_vector<bfloat16>());
     } else {
-        aie::store_v(lf_qkv_bc_partial, cur);
+        aie::store_v(lf_qkv_bc_partial_lo, clo);
+        aie::store_v(lf_qkv_bc_partial_hi, chi);
     }
 }
 
-// #131: exposed (non-static) for hand-asm wrapper
-    float lf_bc_partial[32] __attribute__((aligned(64)));
+// #188 fix: 16-float halves with pad (see lf_qkv_bc_partial comment).
+    float lf_bc_partial_lo[16] __attribute__((aligned(64)));
+    char  lf_bc_partial_pad[128] __attribute__((aligned(64)));
+    float lf_bc_partial_hi[16] __attribute__((aligned(64)));
 
 template <uint32_t N, uint32_t G, uint32_t NCHUNK>
 static void _gate_up_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
@@ -1000,20 +1033,29 @@ static void _gate_up_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
         acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
     }
     // accumulate this chunk's scaled partial into the running float partial
-    aie::vector<float, N> cur = acc.template to_vector<float>();
-    if (chunk != 0)
-        cur = aie::add(cur, aie::load_v<N>(lf_bc_partial));
+    auto v = acc.template to_vector<float>();
+    aie::vector<float, 16> clo = v.template extract<16>(0);
+    aie::vector<float, 16> chi = v.template extract<16>(1);
+    if (chunk != 0) {
+        clo = aie::add(clo, aie::load_v<16>(lf_bc_partial_lo));
+        chi = aie::add(chi, aie::load_v<16>(lf_bc_partial_hi));
+    }
     if (chunk == NCHUNK - 1) {
         bfloat16 *dest = (phase == 0) ? lf_left_buf : lf_right_buf;
-        aie::accum<accfloat, N> facc; facc.from_vector(cur);     // float vec → bf16
-        aie::store_v(dest + block * N, facc.template to_vector<bfloat16>());
+        aie::accum<accfloat, 16> fo, fh;
+        fo.from_vector(clo);  aie::store_v(dest + block * N,      fo.template to_vector<bfloat16>());
+        fh.from_vector(chi);  aie::store_v(dest + block * N + 16, fh.template to_vector<bfloat16>());
     } else {
-        aie::store_v(lf_bc_partial, cur);
+        aie::store_v(lf_bc_partial_lo, clo);
+        aie::store_v(lf_bc_partial_hi, chi);
     }
 }
 
 
-float lf_down_bc_partial[32] __attribute__((aligned(64)));
+// #188 fix: 16-float halves with pad (see lf_qkv_bc_partial comment).
+float lf_down_bc_partial_lo[16] __attribute__((aligned(64)));
+char  lf_down_bc_partial_pad[128] __attribute__((aligned(64)));
+float lf_down_bc_partial_hi[16] __attribute__((aligned(64)));
 
 template <uint32_t N, uint32_t G, uint32_t NCHUNK>
 static void _down_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
@@ -1041,14 +1083,20 @@ static void _down_bcast_chunk(uint32_t j, const uint8_t *__restrict a,
         aie::vector<bfloat16, N> sg = aie::load_v<N>(scales + kg * N);
         acc = aie::mac(acc, gacc.template to_vector<bfloat16>(), sg);
     }
-    aie::vector<float, N> cur = acc.template to_vector<float>();
-    if (chunk != 0)
-        cur = aie::add(cur, aie::load_v<N>(lf_down_bc_partial));
+    auto v = acc.template to_vector<float>();
+    aie::vector<float, 16> clo = v.template extract<16>(0);
+    aie::vector<float, 16> chi = v.template extract<16>(1);
+    if (chunk != 0) {
+        clo = aie::add(clo, aie::load_v<16>(lf_down_bc_partial_lo));
+        chi = aie::add(chi, aie::load_v<16>(lf_down_bc_partial_hi));
+    }
     if (chunk == NCHUNK - 1) {
-        aie::accum<accfloat, N> facc; facc.from_vector(cur);
-        aie::store_v(c_out + block * N, facc.template to_vector<bfloat16>());
+        aie::accum<accfloat, 16> fo, fh;
+        fo.from_vector(clo);  aie::store_v(c_out + block * N,      fo.template to_vector<bfloat16>());
+        fh.from_vector(chi);  aie::store_v(c_out + block * N + 16, fh.template to_vector<bfloat16>());
     } else {
-        aie::store_v(lf_down_bc_partial, cur);
+        aie::store_v(lf_down_bc_partial_lo, clo);
+        aie::store_v(lf_down_bc_partial_hi, chi);
     }
 }
 
