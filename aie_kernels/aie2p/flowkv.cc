@@ -99,7 +99,12 @@ static inline int32_t bf16_to_int(const bfloat16 * buf, int idx) {
     int exp = ((bits >> 7) & 0xFF) - 127;
     if (exp < 0) return 0;
     uint32_t mant = (bits & 0x7F) | 0x80;
-    return (int)(mant << (exp - 7));
+    // The mantissa carries an implicit binary point after bit 7, so the value
+    // is mant * 2^(exp-7). For exp < 7 that is a RIGHT shift; the old code
+    // always shifted left, which is UB for every value below 128 (e.g. a
+    // 47-token cache: exp=5 -> shift by -2).
+    return (exp >= 7) ? (int)(mant << (exp - 7))
+                      : (int)(mant >> (7 - exp));
 }
 
 // ---------------------------------------------------------------------------

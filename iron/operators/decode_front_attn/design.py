@@ -88,7 +88,7 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
         [np.int32, np.int32, L1_A_ty, L1_B_ty, L1_Q_ty],
     )
     rope = Kernel("rope_bundled", "rope_il.o", [L1_Q_ty, L1_B_ty, L1_Q_ty, np.int32])
-    fkv = f"flowkv_{head_dim}d_h{attn_group}.o"
+    fkv = f"flowkv_{head_dim}d_h{attn_group}_c{chunk_size}_r4.o"
     s_init  = Kernel("flowkv_score_init_bf16",      fkv, [np.int32])
     s_rope  = Kernel("flowkv_score_rope_q_bf16",    fkv, [L1_Q_ty, np.int32, np.int32])
     s_chunk = Kernel("flowkv_score_chunk_bf16",     fkv,
@@ -103,7 +103,13 @@ def my_decode_front_attn(dev, embed_dim=2048, K_gemv=2048, head_dim=64, group_si
     K_f = [ObjectFifo(L1_K_ty, name=f"K_{c}", depth=2) for c in range(num_cols)]
     V_f = [ObjectFifo(L1_V_ty, name=f"V_{c}", depth=2) for c in range(num_cols)]
     Qi  = [ObjectFifo(L1_Q_ty, name=f"Qi_{c}", depth=2) for c in range(num_cols)]
-    Ii  = [ObjectFifo(L1_I_ty, name=f"Ii_{c}", depth=2) for c in range(num_cols)]
+    # depth=1 is REQUIRED, not a tuning choice: with depth=2 the score worker
+    # runs a chunk ahead and the value tile reads a packet whose score body is
+    # not yet visible, while its tail (correction/denom) already is. Measured
+    # (#188): depth=2 leaves 3 of every 4 q-heads of the second temporal batch
+    # exactly zero; depth=1 makes all 32 heads report canonical state. Padding
+    # inter_size to 64B does NOT help, so this is ordering, not alignment.
+    Ii  = [ObjectFifo(L1_I_ty, name=f"Ii_{c}", depth=1) for c in range(num_cols)]
     O_f = [ObjectFifo(L1_O_ty, name=f"O_{c}", depth=2) for c in range(num_cols)]
 
     workers = []

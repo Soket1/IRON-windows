@@ -39,7 +39,7 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
         operator_dir = Path(__file__).parent
         base = (f"{prefix}{self.embed_dim}x{self.K}_d{self.head_dim}"
                 f"_g{self.group_size}_s{self.seq_len}_a{self.attn_group}"
-                f"_kv{self.num_kv_heads}_c{self.num_cols}")
+                f"_kv{self.num_kv_heads}_c{self.num_cols}_r4")
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -79,12 +79,18 @@ class AIEDecodeFrontAttn(AIEOperatorBase):
             extra_flags=["-DINTERLEAVED", f"-DLUT_OFF={self.K}",
                          f"-DSEQ_META={self.head_dim}"],
         )
+        # MAX_CHUNK sizes the per-head `scores_bf16[MAX_CHUNK]` stack scratch in
+        # flowkv_score_chunk_bf16, so it must be >= the chunk_size design.py
+        # dispatches. Mirror design.py's chunk_size=None resolution exactly
+        # rather than relying on flowkv.cc's silent 32 default (#192).
+        chunk_size = 32 if self.seq_len % 32 == 0 else self.seq_len
         flowkv_obj = KernelObjectArtifact.new(
-            f"flowkv_{self.head_dim}d_h{self.attn_group}.o",
+            f"flowkv_{self.head_dim}d_h{self.attn_group}_c{chunk_size}_r4.o",
             depends=[SourceArtifact.new(
                 self.context.base_dir / "aie_kernels" / "aie2p" / "flowkv.cc")],
             extra_flags=[f"-DHEAD_DIM={self.head_dim}",
-                         f"-DMAX_Q_HEADS={self.attn_group}"],
+                         f"-DMAX_Q_HEADS={self.attn_group}",
+                         f"-DMAX_CHUNK={chunk_size}"],
         )
 
         xclbin_artifact = XclbinArtifact.new(
