@@ -107,18 +107,36 @@ void generic_bcast_gemv_bf16(
     // ── Step 3: Cross-chunk accumulation in float32 ────────────────────────
     // Existing wrappers accumulate in float32, NOT accfloat. This avoids
     // double-rounding: accfloat→float32 (step 2), then float32+float32.
-    if (chunk != 0)
-        cur = aie::add(cur, aie::load_v<N>(partial));
+    //
+    // #206 fix: a 32-float partial is 128 bytes = 1024 bits, DOUBLE the AIE2
+    // native 512-bit vector width. aiecc lowers the oversized load/store into
+    // two ops and misplaces the middle 64 bytes — the same defect already fixed
+    // in layer_fused_f3best.cc for the three per-phase wrappers (see the
+    // "#188 fix: the 32-float (1024-bit) partial store/load" comment there).
+    // This unified wrapper is the one live path that never received that fix,
+    // and uni_partial is allocated immediately after the gate buffer, so the
+    // misplaced half lands on gate[1008..1024) — exactly the observed window.
+    // Split every partial access into two native 16-float (64-byte) halves.
+    aie::vector<float, 16> clo = cur.template extract<16>(0);
+    aie::vector<float, 16> chi = cur.template extract<16>(1);
+    if (chunk != 0) {
+        clo = aie::add(clo, aie::load_v<16>(partial));
+        chi = aie::add(chi, aie::load_v<16>(partial + 16));
+    }
 
     // ── Step 4/5: Last chunk → flush to output; else → store float32 partial
     if (chunk == nchunk - 1) {
         // Last chunk: float32 → accfloat → bf16 (single rounding), write to output.
-        aie::accum<accfloat, N> facc;
-        facc.from_vector(cur);
-        aie::store_v(output + block * N, facc.template to_vector<bfloat16>());
+        // The bf16 output halves are 32 bytes each — natively sized either way.
+        aie::accum<accfloat, 16> flo, fhi;
+        flo.from_vector(clo);
+        fhi.from_vector(chi);
+        aie::store_v(output + block * N,      flo.template to_vector<bfloat16>());
+        aie::store_v(output + block * N + 16, fhi.template to_vector<bfloat16>());
     } else {
         // Store float32 partial for next chunk's accumulation.
-        aie::store_v(partial, cur);
+        aie::store_v(partial,      clo);
+        aie::store_v(partial + 16, chi);
     }
 }
 

@@ -23,6 +23,12 @@
 		mov	s0, r1
 		vmov	bmll1, x2
 		mova	r2, #16;		vconv.fp32.bf16	cml0, x0
+	// #206: same defect as the baseline kernel -- cml1/cmh1 seed cml2/3/4 and are
+	// read by the epilog, but only cml0 is explicitly zeroed. Inside the fused
+	// f3best tile this kernel runs after flowkv/rope/silu and inherits their
+	// accumulator state, so the implicit "zero" is stale. Zero both halves.
+		vconv.fp32.bf16	cml1, x0
+		vconv.fp32.bf16	cmh1, x0
 		mova	r4, #512;		movx	r3, #828;		vmov	bmlh1, x2
 		mova	r7, #0;		movx	r6, #1;		vmov	cmh0, cml0
 		mova	r0, #60;		movx	r16, #0;		vmov	cml2, cml1

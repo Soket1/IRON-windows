@@ -25,7 +25,10 @@ static inline int32_t echo_v7_bf16_to_int(const bfloat16 *buf, int idx) {
     int exp = ((bits >> 7) & 0xFF) - 127;
     if (exp < 0) return 0;
     uint32_t mant = (bits & 0x7F) | 0x80;
-    return (int)(mant << (exp - 7));
+    // exp < 7 means the value is below 128 and needs a RIGHT shift; the
+    // left-shift-only form was UB there (see flowkv.cc bf16_to_int).
+    return (exp >= 7) ? (int)(mant << (exp - 7))
+                      : (int)(mant >> (7 - exp));
 }
 
 extern "C" {

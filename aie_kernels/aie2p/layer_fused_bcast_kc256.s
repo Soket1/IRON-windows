@@ -16,6 +16,14 @@ layer_fused_gemv_bcast_kc256_bf16:     // @layer_fused_gemv_bcast_kc256_bf16
 	vbcst.32	 x2, r0
 	mov	s0, r0
 	vconv.fp32.bf16	cml0, x0
+// #206: cml1/cmh1 are the zero source for cml2/3/4 and are read directly by the
+// epilog, but nothing in the prolog writes them -- only cml0 gets an explicit
+// zero (the vconv above). Standing alone the kernel happens to inherit a zero
+// accumulator file; inside the f3best fused tile it runs after flowkv/rope/silu
+// and inherits their leftovers, so the "zero" is whatever ran last. Zero both
+// halves explicitly. This costs 2 slots once per call, outside the loop.
+	vconv.fp32.bf16	cml1, x0
+	vconv.fp32.bf16	cmh1, x0
 	mova	r2, #16;		vmov	bmll1, x2
 	mova	r4, #828;		movx	r3, #60;		vmov	bmlh1, x2
 	mova	r6, #1;		vst	 bmll1, [sp, #-128];		movx	r5, #512;		vmov	cmh0, cml0 // 64-byte Folded Spill

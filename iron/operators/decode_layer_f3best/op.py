@@ -57,12 +57,20 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         _ffn_div = _os.environ.get('F3BEST_FFN_DIV', '1')
         _div_suffix = f'_d{_ffn_div}' if _ffn_div != '1' else ''
         _decouple = '_decouple' if _os.environ.get('F3BEST_MT_DECOUPLE', '').strip() != '' else ''
-        _triple_b = '_tb' if _os.environ.get('F3BEST_TRIPLE_B', '1').strip() != '' else ''
-        _handasm_rr = '_rr' if _os.environ.get('F3BEST_HANDASM_RR', '').strip() != '' else ''  # hand-asm bcast path (kc256_rr.o when RR, else kc256.o)
+        # triple-B: the emitter treats ONLY '0' as force-off ('1'/unset = auto), so the
+        # key must use the same test. Testing for "non-empty" made F3BEST_TRIPLE_B=0
+        # emit a single-B design under the `_tb` name, silently colliding with the real
+        # triple-B artifact in the shared cache directory.
+        _triple_b = '' if _os.environ.get('F3BEST_TRIPLE_B', '1').strip() == '0' else '_tb'
+        _cpp_bcast = '_cpp'  # #188: pure C++ bcast path (layer_fused_*_bcast_bf16 in layer_fused_relay.o); hand-asm .s dropped
         _qdump = '_qdump7' if _os.environ.get('F3BEST_QDUMP', '').strip() != '' else ''  # #188 Ш21 Direct-NPU Q dump (v6 = fixed hand-asm kc256.s + output-width store)
         _kv_abi = '_kv' if self.with_npu_kv else '_nokv'
+        # uni_partial size (#206/#207): participates in the L1 layout, so it
+        # must participate in the cache key.
+        _uni = _os.environ.get('F3BEST_UNI_SZ', '128')
+        _uni_sfx = '' if _uni == '128' else f'_u{_uni}'
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_handasm_rr}{_qdump}")   # _rr = hand-asm RR variant (#135, F3BEST_HANDASM_RR), _qdump = #188 Ш21 direct-NPU Q dump (routes Q into the O_h relay), _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_cpp_bcast}{_qdump}{_uni_sfx}_fkfix2_silu2")  # _silu = #210: FFN gate/up/down all live in the C++ statics (lf_left/right/silu_buf); the MLIR was calling the explicit-pointer SiLU on IRON buffers nobody wrote, so down consumed the raw gate. _fkfix2 = #208 root: F3BEST_MT_DECOUPLE edge MemTile weight relay corrupts KV+center — drop decouple from all presets (root #208). _cpp = pure C++ bcast path (#188 fix — hand-asm .s dropped: baseline NaN, RR ~500x blow-up), _qdump = #188 Ш21 direct-NPU Q dump (routes Q into the O_h relay), _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -113,7 +121,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         )
         # Fused relay: the phase-blind center body (Q-GEMV+RoPE / O-proj / FFN) +
         # rms hub + mux, built for the 8-center-column f3best layout.
-        # Guard C++ bcast functions so the hand-asm .o provides them instead (#131).
+        # #188: pure C++ bcast path (layer_fused_*_bcast_bf16); hand-asm .s dropped.
         relay_obj = KernelObjectArtifact.new(
             "layer_fused_relay.o",
             depends=[SourceArtifact.new(k2p / "layer_fused_f3best.cc")],
@@ -122,43 +130,13 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
                 f"-DHEAD_DIM={self.head_dim}", f"-DNUM_HEADS={self.num_q_heads}",
                 f"-DNUM_KV_HEADS={self.num_kv_heads}", f"-DMAX_SEQ_LEN=2048",
                 "-DNUM_AIE_COLUMNS=8", "-DM_OUTPUT_MAX=1024",
-                "-DUSE_HAND_ASM_BCAST",
             ],
         )
-
-        # #131: C++ wrapper that calls hand-asm kernel for unified broadcast GEMV.
-        # Level 1: single generic_bcast_gemv_bf16 replaces 4 per-phase wrappers.
-        unified_bcast_obj = KernelObjectArtifact.new(
-            "layer_fused_unified_bcast.o",
-            depends=[SourceArtifact.new(k2p / "layer_fused_unified_bcast.cc")],
-            extra_flags=[
-                f"-DEMBED_DIM={E}", f"-DHIDDEN_DIM={H}", f"-DGROUP_SIZE={g}",
-                f"-DHEAD_DIM={self.head_dim}", f"-DNUM_HEADS={self.num_q_heads}",
-                f"-DNUM_KV_HEADS={self.num_kv_heads}", f"-DMAX_SEQ_LEN=2048",
-                "-DNUM_AIE_COLUMNS=8", "-DM_OUTPUT_MAX=1024",
-                # #188 Ш22.7: cross-chunk accumulation restored (the DI diagnostic
-                # bypass is gone — the wrapper accumulates float32 across chunks).
-            ],
-        )
-        # #131: KC=256 hand-asm kernel (bcast_gemv adapted for chunk mode)
-        bcast_kc256_obj = KernelObjectArtifact.new(
-            "layer_fused_bcast_kc256.o",
-            depends=[SourceArtifact.new(k2p / "layer_fused_bcast_kc256.s")],
-            extra_flags=[],
-        )
-        # #135: RR kernel (same cml-init fix applied; scales/blow-up still suspect)
-        bcast_kc256_rr_obj = KernelObjectArtifact.new(
-            "layer_fused_bcast_kc256_rr.o",
-            depends=[SourceArtifact.new(k2p / "layer_fused_bcast_kc256_rr.s")],
-            extra_flags=[],
-        )
-        _use_rr = _os.environ.get('F3BEST_HANDASM_RR', '').strip() != ''
-        _bcast_obj = bcast_kc256_rr_obj if _use_rr else bcast_kc256_obj
 
         xclbin_artifact = XclbinArtifact.new(
             f"{base}.xclbin",
             depends=[mlir_artifact, gemv_obj, oproj_obj, rope_obj, flowkv_obj,
-                     concat_obj, relay_obj, unified_bcast_obj, _bcast_obj],
+                     concat_obj, relay_obj],
         )
         insts_artifact = InstsBinArtifact.new(f"{base}.bin", depends=[mlir_artifact])
         return xclbin_artifact, insts_artifact
