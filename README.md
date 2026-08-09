@@ -40,6 +40,8 @@ The IRON Python API for Ryzen™ AI NPUs is described in the following paper:
 
 #### 🎯 Operator Dashboard
 
+**Base Operators**
+
 | Section | Description | Datatype | AIE2 | AIE2P | Status | Design Example |
 |:--------|:------------|:---------|:-----|:------|:-------|:-------------|
 | [Element-wise Add](./aie_kernels/generic/add.cc) | Element-wise addition kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/elementwise_add/](./iron/operators/elementwise_add/) |
@@ -49,25 +51,49 @@ The IRON Python API for Ryzen™ AI NPUs is described in the following paper:
 | [GEMV](./aie_kernels/generic/mv.cc) | General Matrix-Vector Multiplication kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/gemv/](./iron/operators/gemv/) |
 | [GQA](./aie_kernels/aie2p/mha.cc) | Grouped Query Attention kernel (Single pipeline) | bfloat16 | | ✓ | 🟢 | [iron/operators/mha/](./iron/operators/mha/) |
 | [MHA](./aie_kernels/aie2p/mha.cc) | Multi-Head Attention kernel & Grouped Query Attention | bfloat16 | | ✓ | 🟢 | [iron/operators/mha/](./iron/operators/mha/) |
-| [RMSNorm](./aie_kernels/aie2/rms_norm.cc) | RMSNorm kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/rms_norm/](./iron/operators/rms_norm/) |
+| [RMSNorm](./aie_kernels/aie2/rms_norm.cc) | RMSNorm kernel (includes Weighted RMSNorm) | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/rms_norm/](./iron/operators/rms_norm/) |
 | [RoPE](./aie_kernels/generic/rope.cc) | Rotary Positional Embedding kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/rope/](./iron/operators/rope/) |
 | [SiLU](./aie_kernels/aie2/silu.cc) | Sigmoid Linear Unit activation kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/silu/](./iron/operators/silu/) |
 | [Softmax](./aie_kernels/aie2/softmax.cc) | Softmax kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/softmax/](./iron/operators/softmax/) |
-| [Weighted RMSNorm](./aie_kernels/aie2/rms_norm.cc) | Weighted RMSNorm kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/rms_norm/](./iron/operators/rms_norm/) |
 | [Copy](./aie_kernels/generic/passThrough.cc) | Copy | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/mem_copy/](./iron/operators/mem_copy/) |
 | [Transpose](./aie_kernels/generic/transpose.cc) | Transpose | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/transpose/](./iron/operators/transpose/) |
 | [AXPY](./aie_kernels/generic/axpy.cc) | AXPY | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/axpy/](./iron/operators/axpy/) |
-| [Reduction]() | Reduction | bfloat16 | | | 🟡 |  |
 | [Dequant](./aie_kernels/generic/expand.cc) | Dequant Q4NX from [AWQ](https://github.com/mit-han-lab/llm-awq) to bfloat16 | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/dequant/](./iron/operators/dequant/) |
 | [RELU](./aie_kernels/aie2/relu.cc) | RELU | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/relu/](./iron/operators/relu/) |
 | [Leaky RELU](./aie_kernels/aie2p/leaky_relu.cc) (WIP) | Leaky RELU kernel | bfloat16 | | ✓ | ⚪ | [iron/operators/leaky_relu/](./iron/operators/leaky_relu/) |
 | [GELU](./aie_kernels/aie2/gelu.cc) | GELU | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/gelu/](./iron/operators/gelu/) |
 | [LayerNorm](./aie_kernels/aie2/layer_norm.cc) | LayerNorm | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/layer_norm/](./iron/operators/layer_norm/) |
-| [Convolution]() | Convolution | bfloat16 | | | 🟡 |  |
-| [MaxPool]() | MaxPool | bfloat16 | | | ⚪ |  |
-| [AveragePool]() | AveragePool | bfloat16 | | | ⚪ |  |
 | [Tanh](./aie_kernels/aie2/tanh.cc) | Tanh kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/tanh/](./iron/operators/tanh/) |
 | [Sigmoid](./aie_kernels/aie2/sigmoid.cc) | Sigmoid kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/sigmoid/](./iron/operators/sigmoid/) |
+
+**Fused Operators (LLM)**
+
+| Section | Description | Datatype | AIE2 | AIE2P | Status | Design Example |
+|:--------|:------------|:---------|:-----|:------|:-------|:-------------|
+| [SiLU Mul](./aie_kernels/aie2p/silu_mul.cc) | Fused SiLU activation + element-wise multiply: `SiLU(x) * y` | bfloat16 | | ✓ | 🟢 | [iron/operators/silu_mul/](./iron/operators/silu_mul/) |
+| [Dual GEMV + SiLU + Mul](./aie_kernels/aie2p/dual_gemv_silu_mul.cc) | Fused dual GEMV + SiLU + multiply: `silu(W1 @ x) * (W2 @ x)` | bfloat16 | | ✓ | 🟢 | [iron/operators/dual_gemv_silu_mul/](./iron/operators/dual_gemv_silu_mul/) |
+| [Fused Dequant + GEMV](./aie_kernels/aie2p/fused_dequant_gemv.cc) | INT4 dequantization fused with matrix-vector multiply (4x DDR bandwidth reduction) | bfloat16 | | ✓ | 🟢 | [iron/operators/fused_dequant_gemv/](./iron/operators/fused_dequant_gemv/) |
+| [Fused QKV Projection](./aie_kernels/generic/mv.cc) | Fused Q/K/V projection via concatenated weight matrix (reuses GEMV kernel) | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/fused_qkv_proj/](./iron/operators/fused_qkv_proj/) |
+| [FlowKV Decode](./aie_kernels/aie2p/flowkv.cc) | Streaming decode attention with fused RoPE (online softmax, FlashAttention semantics) | bfloat16 | | ✓ | 🟢 | [iron/operators/flowkv_decode/](./iron/operators/flowkv_decode/) |
+| [SwiGLU Decode](./aie_kernels/aie2p/dual_gemv_silu_mul.cc) | SwiGLU FFN for decode: dual GEMV + SiLU + mul + down-projection | bfloat16 | | ✓ | 🟢 | [iron/operators/swiglu_decode/](./iron/operators/swiglu_decode/) |
+| [SwiGLU Fused Decode](./aie_kernels/aie2p/swiglu_fused.cc) | Fully fused SwiGLU decode (intermediate stays on-chip, no DDR round-trip) | bfloat16 | | ✓ | 🟢 | [iron/operators/swiglu_fused_decode/](./iron/operators/swiglu_fused_decode/) |
+| [SwiGLU Prefill](./aie_kernels/aie2p/mm.cc) | SwiGLU FFN for prefill: GEMM + SiLU Mul + GEMM pipeline | bfloat16 | | ✓ | 🟢 | [iron/operators/swiglu_prefill/](./iron/operators/swiglu_prefill/) |
+
+**Utilities**
+
+| Section | Description | Datatype | AIE2 | AIE2P | Status | Design Example |
+|:--------|:------------|:---------|:-----|:------|:-------|:-------------|
+| Repeat | Repeat-interleave: repeats rows of a matrix N times | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/repeat/](./iron/operators/repeat/) |
+| Strided Copy | Strided DMA copy with arbitrary stride and offset | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/strided_copy/](./iron/operators/strided_copy/) |
+
+**In Development**
+
+| Section | Description | Datatype | AIE2 | AIE2P | Status |
+|:--------|:------------|:---------|:-----|:------|:-------|
+| [Reduction]() | Reduction (sum/max over axis) | bfloat16 | | | 🟡 |
+| [Convolution]() | Convolution | bfloat16 | | | 🟡 |
+| [MaxPool]() | Max Pooling | bfloat16 | | | ⚪ |
+| [AveragePool]() | Average Pooling | bfloat16 | | | ⚪ |
 
 > Use this dashboard to quickly check the status of each kernel and locate relevant setup, build, and usage information.
 
