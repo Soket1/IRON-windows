@@ -210,6 +210,12 @@ class OFold8F3BestEmitter:
         # re-pointed at Qd, so the per-head Q lands in the host-visible s-region of
         # the output BO (the O output is displaced for this diagnostic build).
         self.QDUMP = _os.environ.get('F3BEST_QDUMP', '').strip() != ''
+        # #211 B0 dump: after phase1 (B0=x_bundle consumed), memcpy B0 -> P and
+        # drain P via the existing Pf0 MM2S to the shim s-region. Lets the host
+        # read the CONTENTS of B0 as delivered by the mux->center flow, to confirm
+        # whether B0 holds x_bundle or stale/wrong-phase data. Only valid for
+        # triple-B (single-B has no B0 buffer).
+        self.B0DUMP = _os.environ.get('F3BEST_B0DUMP', '').strip() != ''
 
     def _compute_l1_budget(self):
         """Compute L1 usage and auto-select single-B vs triple-B (64KB limit)."""
@@ -308,6 +314,7 @@ class OFold8F3BestEmitter:
       %c1_i32 = arith.constant 1 : i32
       %qr = arith.constant {PT} : i32
       %hc = arith.constant {HP} : i32
+      %xb_i32 = arith.constant {XB} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         // ---- phase 1: Q-GEMV + rope (B0 = x_bundle, nchunk=8) ----
         aie.use_lock(%{p}_B0c, AcquireGreaterEqual, 1)
@@ -326,6 +333,17 @@ class OFold8F3BestEmitter:
         func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
         aie.use_lock(%{p}_B0p, Release, 1)
+        // #211 B0 dump: snapshot B0 (x_bundle as delivered by mux->center) into P,
+        // then drain P via the existing Pf0 MM2S to the shim s-region. The host
+        // reads P and compares TB=0 vs TB=1 B0 contents. Reuses attn_copy_bf16
+        // (already linked via attn_concat.o) and the P buffer/Pf0 drain — no new
+        // kernel, DMA channel, or lock pair. Pp/Pc are recycled: the dump fills P
+        // (Pc=1), Pf0 drains it (releases Pp), and phase3d later re-acquires Pp.
+        """ + (f"""
+        aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
+        func.call @attn_copy_bf16(%{p}_B0, %{p}_P, %xb_i32) : (memref<{XB}xbf16>, memref<{XB}xbf16>, i32) -> ()
+        aie.use_lock(%{p}_Pc, Release, 1)
+        """ if self.B0DUMP else "") + f"""
         // ---- phase 2: O-proj (B1 = attn_out, nchunk=8) ----
         aie.use_lock(%{p}_B1c, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
@@ -488,6 +506,7 @@ class OFold8F3BestEmitter:
       %c1_i32 = arith.constant 1 : i32
       %qr = arith.constant {PT} : i32
       %hc = arith.constant {HP} : i32
+      %xb_i32 = arith.constant {XB} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         // ---- phase 1: Q-GEMV + rope (B = x_bundle, nchunk=8) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
@@ -506,6 +525,14 @@ class OFold8F3BestEmitter:
         func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) -> ()
         aie.use_lock(%{p}_Qc, Release, 1)
         aie.use_lock(%{p}_Bp, Release, 1)
+        // #211 B0 dump (single-B): snapshot B (x_bundle as delivered by mux->center)
+        // into P, then drain P via Pf0 MM2S. Mirrors the triple-B dump so the host
+        // can compare TB=0 vs TB=1 B0 contents from the same code path.
+        """ + (f"""
+        aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
+        func.call @attn_copy_bf16(%{p}_B, %{p}_P, %xb_i32) : (memref<{XB}xbf16>, memref<{XB}xbf16>, i32) -> ()
+        aie.use_lock(%{p}_Pc, Release, 1)
+        """ if self.B0DUMP else "") + f"""
         // ---- phase 2: O-proj broadcast (B = attn_out, nchunk=8) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
