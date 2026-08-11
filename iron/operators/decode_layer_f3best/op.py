@@ -61,10 +61,18 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         # key must use the same test. Testing for "non-empty" made F3BEST_TRIPLE_B=0
         # emit a single-B design under the `_tb` name, silently colliding with the real
         # triple-B artifact in the shared cache directory.
-        # #211: triple-B (F3BEST_TRIPLE_B=1) NaNs in attention from layer 0 --
-        # mux MM2S0 broadcast is not phase-locked to center S2MM1 round-robin,
-        # so 8 center tiles desync and x_bundle lands in B1/B2. Single-B is
-        # rock-solid. Default to single-B; triple-B needs explicit opt-in.
+        # #211/#212: triple-B (F3BEST_TRIPLE_B=1) collapses in attention from layer 0.
+        # Root = ARCHITECTURAL: circuit-flow mux->center multicast has NO per-consumer
+        # back-pressure; the center S2MM1 round-robin (b0->b1->b2) and the center core
+        # phase index are two independent state machines that drift because the 8 centers
+        # finish phases at different times (weight-stream contention). A slow center
+        # writes attn_out into B0 while its core expects x -> permanent 1-phase lag, no
+        # resync. The mux lock protocol (non-RL_FIX, the production branch) was ALREADY
+        # balanced (all 3 phases acquire mx_op / release mx_oc) — an earlier lock fix
+        # landed in the DEAD RL_FIX branch and had zero effect. Fix paths (a)-(g)
+        # exhausted (per-buffer S2MM needs 3 S2MM, cap is 2; cross-tile locks N/A;
+        # packet-tagged doesn't route to different buffers). Default = single-B
+        # (rock-solid, 47.30 t/s, 1 passed/0 failed in harness); triple-B opt-in.
         _triple_b = _os.environ.get('F3BEST_TRIPLE_B', '0').strip()
         _triple_b = '_tb' if _triple_b == '1' else ''
         _cpp_bcast = '_cpp'  # #188: pure C++ bcast path (layer_fused_*_bcast_bf16 in layer_fused_relay.o); hand-asm .s dropped
@@ -76,7 +84,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         _uni = _os.environ.get('F3BEST_UNI_SZ', '128')
         _uni_sfx = '' if _uni == '128' else f'_u{_uni}'
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_cpp_bcast}{_qdump}{_b0dump}{_uni_sfx}_fkfix2_silu2")  # _silu = #210: FFN gate/up/down all live in the C++ statics (lf_left/right/silu_buf); the MLIR was calling the explicit-pointer SiLU on IRON buffers nobody wrote, so down consumed the raw gate. _fkfix2 = #208 root: F3BEST_MT_DECOUPLE edge MemTile weight relay corrupts KV+center — drop decouple from all presets (root #208). _cpp = pure C++ bcast path (#188 fix — hand-asm .s dropped: baseline NaN, RR ~500x blow-up), _qdump = #188 Ш21 direct-NPU Q dump (routes Q into the O_h relay), _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_cpp_bcast}{_qdump}{_b0dump}{_uni_sfx}_fkfix2_silu2_mxpp")  # _silu = #210: FFN gate/up/down all live in the C++ statics (lf_left/right/silu_buf); the MLIR was calling the explicit-pointer SiLU on IRON buffers nobody wrote, so down consumed the raw gate. _fkfix2 = #208 root: F3BEST_MT_DECOUPLE edge MemTile weight relay corrupts KV+center — drop decouple from all presets (root #208). _cpp = pure C++ bcast path (#188 fix — hand-asm .s dropped: baseline NaN, RR ~500x blow-up), _qdump = #188 Ш21 direct-NPU Q dump (routes Q into the O_h relay), _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",

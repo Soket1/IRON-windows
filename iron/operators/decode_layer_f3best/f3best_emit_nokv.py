@@ -1273,8 +1273,11 @@ class OFold8F3BestEmitter:
       %nx = arith.constant {XB} : i32
       %ne = arith.constant {E} : i32
       scf.for %it = %z to %N step %one {{
+        // NOTE: F3BEST_RL_FIX is OFF in production — this RL_FIX branch is dead.
+        // The non-RL_FIX mux below (L1340+) is what ships; its lock protocol is
+        // already a clean acquire mx_op / release mx_oc ping-pong on all 3 phases.
         aie.use_lock(%mx_xc, AcquireGreaterEqual, 1)
-        aie.use_lock(%mx_oc, AcquireGreaterEqual, 1)
+        aie.use_lock(%mx_op, AcquireGreaterEqual, 1)
         func.call @attn_copy_bf16(%mx_x, %mx_o, %nx) : (memref<{XB}xbf16>, memref<{XB}xbf16>, i32) -> ()
         aie.use_lock(%mx_xp, Release, 1)
         aie.use_lock(%mx_oc, Release, 1)
