@@ -63,7 +63,7 @@ static_assert(HEAD_DIM % 32 == 0, "FlowKV: HEAD_DIM must be multiple of 32");
 // statics (e.g. score_init(8) into a [4] array) silently corrupts adjacent
 // memory and produces large garbage output — must match the design's attn_group.
 #ifndef MAX_Q_HEADS
-#define MAX_Q_HEADS 4
+#error "FlowKV: MAX_Q_HEADS must be passed via -DMAX_Q_HEADS=N (sizes score/value statics; silent default corrupts memory when attn_group != 4)"
 #endif
 static_assert(MAX_Q_HEADS >= 1, "FlowKV: MAX_Q_HEADS must be >= 1");
 
@@ -73,7 +73,7 @@ static_assert(MAX_Q_HEADS >= 1, "FlowKV: MAX_Q_HEADS must be >= 1");
 // the whole sequence in one "chunk" (single-chunk online softmax = standard
 // softmax over all positions).
 #ifndef MAX_CHUNK
-#define MAX_CHUNK 32
+#error "FlowKV: MAX_CHUNK must be passed via -DMAX_CHUNK=N (bounds score scratch; silent default overflows when chunk_size > 32)"
 #endif
 static_assert(MAX_CHUNK >= 1, "FlowKV: MAX_CHUNK must be >= 1");
 
