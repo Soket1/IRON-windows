@@ -15,7 +15,8 @@ any other shape rather than silently generalizing.
 
 def my_decode_layer_f3best(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
                            head_dim=64, num_kv_heads=8, attn_group=4, seq_len=256,
-                           with_npu_kv=False):
+                           with_npu_kv=False, flowkv_obj_name=None, rope_obj_name=None,
+                           relay_obj_name=None):
     import os
     import sys
 
@@ -30,5 +31,6 @@ def my_decode_layer_f3best(dev, embed_dim=2048, hidden_dim=8192, group_size=32,
 
     return OFold8F3BestEmitter(
         NH=8, E=embed_dim, H=hidden_dim, G=group_size, M=4, HD=head_dim,
-        AG=attn_group, SEQ=seq_len,
+        AG=attn_group, SEQ=seq_len, flowkv_obj_name=flowkv_obj_name,
+        rope_obj_name=rope_obj_name, relay_obj_name=relay_obj_name,
     ).emit_mlir()

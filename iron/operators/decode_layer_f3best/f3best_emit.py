@@ -13,8 +13,13 @@ from f3best_emit_nokv import _LockAlloc, _DmaAlloc
 class OFold8F3BestEmitter(_BaseEmitter):
     """KV ABI: adds K/V GEMV on center tiles, K/V drain in output P tail."""
 
-    def __init__(self, NH=8, E=2048, H=8192, G=32, M=4, HD=64, AG=4, SEQ=256, POS=5):
-        super().__init__(NH=NH, E=E, H=H, G=G, M=M, HD=HD, AG=AG, SEQ=SEQ, POS=POS)
+    def __init__(self, NH=8, E=2048, H=8192, G=32, M=4, HD=64, AG=4, SEQ=256,
+                 POS=5, flowkv_obj_name=None, rope_obj_name=None, relay_obj_name=None):
+        super().__init__(
+            NH=NH, E=E, H=H, G=G, M=M, HD=HD, AG=AG, SEQ=SEQ, POS=POS,
+            flowkv_obj_name=flowkv_obj_name, rope_obj_name=rope_obj_name,
+            relay_obj_name=relay_obj_name,
+        )
 
         # KV-specific dimensions (2 KV heads per center tile, each head_dim outputs)
         self.KV_M = 128                           # K/V outputs per head (2 KV heads × 64)
@@ -495,20 +500,20 @@ class OFold8F3BestEmitter(_BaseEmitter):
         funcs = (
             f'    func.func private @_ha_noop() -> () attributes {{link_with = "{_ha_link}"}}\n'
             f'    func.func private @fused_dequant_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_signed_2048k_g32.o"}}\n'
-            f'    func.func private @rope_bundled(memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) attributes {{link_with = "rope_il.o"}}\n'
-            f'    func.func private @rope_kv_bundled(memref<{KSZ}xbf16>, memref<{XB}xbf16>, memref<{KSZ}xbf16>, i32) attributes {{link_with = "rope_il.o"}}\n'
-            f'    func.func private @layer_fused_gate_up_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
+            f'    func.func private @rope_bundled(memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) attributes {{link_with = "{self.ROPE_LIB}"}}\n'
+            f'    func.func private @rope_kv_bundled(memref<{KSZ}xbf16>, memref<{XB}xbf16>, memref<{KSZ}xbf16>, i32) attributes {{link_with = "{self.ROPE_LIB}"}}\n'
+            f'    func.func private @layer_fused_gate_up_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
             f'    func.func private @generic_bcast_gemv_bf16_q(i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{QSZ}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
             f'    func.func private @generic_bcast_gemv_bf16_o(i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{OSZ}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
             f'    func.func private @generic_bcast_gemv_bf16_g(i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{HP}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
             f'    func.func private @generic_bcast_gemv_bf16_kv(i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{UNI}xi8>, i32, memref<{KSZ}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
             f'    func.func private @generic_bcast_gemv_bf16_d(i32, memref<{PK}xi8>, memref<{HP}xbf16>, memref<{UNI}xi8>, i32, memref<{PSZ}xbf16>) attributes {{link_with = "layer_fused_unified_bcast.o"}}\n'
-            f'    func.func private @layer_fused_silu_mul_explicit_bf16(memref<{HP}xbf16>, memref<{HP}xbf16>, memref<{HP}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
+            f'    func.func private @layer_fused_silu_mul_explicit_bf16(memref<{HP}xbf16>, memref<{HP}xbf16>, memref<{HP}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
             f'    func.func private @attn_copy_bf16(memref<{XB}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "attn_concat.o"}}\n'
             f'    func.func private @oproj_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_oproj_signed_2048k_g32.o"}}\n'
-            f'    func.func private @layer_fused_add_bf16(memref<{E}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_rms_norm2_bf16(memref<{XB}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
+            f'    func.func private @layer_fused_add_bf16(memref<{E}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_rms_norm2_bf16(memref<{XB}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
             f'    func.func private @flowkv_score_init_bf16(i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_score_rope_q_bf16(memref<{QSZ}xbf16>, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_score_chunk_bf16(memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'

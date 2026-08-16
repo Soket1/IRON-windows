@@ -114,7 +114,8 @@ class _DmaAlloc:
 class OFold8F3BestEmitter:
     """Parametric validating wrapper around the F3-best MLIR generation."""
 
-    def __init__(self, NH=8, E=2048, H=8192, G=32, M=4, HD=64, AG=4, SEQ=256, POS=5):
+    def __init__(self, NH=8, E=2048, H=8192, G=32, M=4, HD=64, AG=4, SEQ=256,
+                 POS=5, flowkv_obj_name=None, rope_obj_name=None, relay_obj_name=None):
         # ── primary dimensions ──
         self.NH, self.E, self.H, self.G, self.M = NH, E, H, G, M
         self.HD, self.AG, self.SEQ, self.POS = HD, AG, SEQ, POS
@@ -128,24 +129,31 @@ class OFold8F3BestEmitter:
         self.PACKED = M * E // 2 + M * self.GROUPS * 2    # bytes per weight tile (1B: 4608)
 
         # ── per-tile weight tile counts ──
-        self.GEMV_T = self.PER_TILE // M                  # Q/O weight tiles per tile (1B: 64)
-        self.OPROJ_T = self.PER_TILE // M
-        self.GU_T = self.H8 // M                           # gate/up weight tiles (1B: 256)
+        # Derives from pack_bcast in f3best_pack.h:
+        #   tiles = (n_rows/N) * (K_pack/KC), N=32, KC=256.
+        # Q/O: n_rows=PER_TILE=E/NH, K_pack=E  -> Q_T = (PER_TILE/32)*(E/256)
+        # GU:  n_rows=H8=H/NH,        K_pack=E  -> GU_T = (H8/32)*(E/256)
+        # DN:  n_rows=E,              K_pack=H8 -> DN_T = (E/32)*(H8/256)
+        _N = 32; _KC = 256
+        self.Q_T = (self.PER_TILE // _N) * (self.E // _KC)  # Q/O weight tiles per tile (1B: 64, 3B: 144)
+        self.GEMV_T = self.Q_T
+        self.OPROJ_T = self.Q_T
+        self.GU_T = (self.H8 // _N) * (self.E // _KC)        # gate/up weight tiles (1B: 256, 3B: 384)
+        self.DN_T = (self.E // _N) * (self.H8 // _KC)        # down weight tiles (1B: 256, 3B: 384)
 
         # F3BEST_FFN_DIV probe (divides FFN weight stream)
         _FFN_DIV = int(_os.environ.get('F3BEST_FFN_DIV', '1'))
         assert self.GU_T % _FFN_DIV == 0, 'F3BEST_FFN_DIV must divide GU_T'
         self.GU_T //= _FFN_DIV
-        self.DN_T = self.GU_T                              # same loop bound for down
         self._ffn_div = _FFN_DIV
 
-        self.WT_TILES = self.GEMV_T + self.OPROJ_T + 2 * self.GU_T + self.DN_T  # (1B no-KV: 896)
+        self.WT_TILES = self.GEMV_T + self.OPROJ_T + 2 * self.GU_T + self.DN_T  # (1B no-KV: 896, 3B no-KV: 1440)
         self.WT_BYTES = self.WT_TILES * self.PACKED
         self.O_TILES = E // M
         self.WO_BYTES = self.O_TILES * self.PACKED         # unused arg3 placeholder
 
         # ── buffer sizes (bf16 elements unless noted) ──
-        self.XB = E + 256 + 16                             # x_bundle: input + rope LUT + seq meta (1B: 2320)
+        self.XB = E + AG * HD + 16                         # x_bundle: input + rope LUT (q_rows=AG*HD) + seq meta (1B: 2320, 3B: 2448)
         self.QI = self.PER_TILE                            # quadrant size (1B: 256)
         self.Q_SZ = self.PER_TILE + HD + 2                 # Q buffer (1B: 322)
         self.O_SZ = E                                      # O buffer (1B: 2048)
@@ -165,7 +173,15 @@ class OFold8F3BestEmitter:
         self.KCH = self.CHUNK * HD                         # per-chunk K/V buffer elems (1B: 8192)
         self.ITC = self.CHUNK * AG + 2 * AG                # per-chunk score packet (1B: 520)
         self.KVN = SEQ * HD                                # per-head KV buffer (1B: 16384)
-        self.FLOWKV_LIB = f"flowkv_{HD}d_h{AG}_c{SEQ}.o"   # per-dimension flowkv kernel (#155)
+        self.FLOWKV_LIB = (
+            flowkv_obj_name
+            if flowkv_obj_name is not None
+            else f"flowkv_{HD}d_h{AG}_c{SEQ}.o"
+        )
+        self.ROPE_LIB = rope_obj_name if rope_obj_name is not None else "rope_il.o"
+        self.RELAY_LIB = (
+            relay_obj_name if relay_obj_name is not None else "layer_fused_relay.o"
+        )
 
         # ── XR bundle ──
         self.XR_ELEMS = self.XB + E + E                    # x_bundle + resid + gain (1B: 6416)
@@ -1425,26 +1441,26 @@ class OFold8F3BestEmitter:
         PSZ = self.P_SZ; HP = self.HPER; UNI = self.UNI_SZ; E = self.E
         KCH = self.KCH; ITC = self.ITC; PT = self.PER_TILE
         funcs = (
-            f'    func.func private @fused_dequant_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_signed_2048k_g32.o"}}\n'
-            f'    func.func private @rope_bundled(memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) attributes {{link_with = "rope_il.o"}}\n'
-            f'    func.func private @layer_fused_gate_up_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_qkv_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_oproj_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_gate_up_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_down_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_silu_mul_static_bf16(i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) attributes {{link_with = "layer_fused_relay.o"}}\n'
+            f'    func.func private @fused_dequant_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_signed_{self.E}k_g32.o"}}\n'
+            f'    func.func private @rope_bundled(memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) attributes {{link_with = "{self.ROPE_LIB}"}}\n'
+            f'    func.func private @layer_fused_gate_up_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_qkv_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_oproj_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_gate_up_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_down_bcast_bf16(i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_silu_mul_static_bf16(i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<{PK}xi8>, memref<{PSZ}xbf16>) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
             f'    func.func private @attn_copy_bf16(memref<{XB}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "attn_concat.o"}}\n'
-            f'    func.func private @oproj_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_oproj_signed_2048k_g32.o"}}\n'
-            f'    func.func private @layer_fused_add_bf16(memref<{E}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
-            f'    func.func private @layer_fused_rms_norm2_bf16(memref<{XB}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
+            f'    func.func private @oproj_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_oproj_signed_{self.E}k_g32.o"}}\n'
+            f'    func.func private @layer_fused_add_bf16(memref<{E}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+            f'    func.func private @layer_fused_rms_norm2_bf16(memref<{XB}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
             f'    func.func private @flowkv_score_init_bf16(i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_score_rope_q_bf16(memref<{QSZ}xbf16>, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_score_chunk_bf16(memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_value_init_bf16(i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_value_accum_bf16(memref<{ITC}xbf16>, memref<{KCH}xbf16>, i32, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_value_normalize_bf16(memref<{PT}xbf16>, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
-            + (f'    func.func private @layer_fused_dump_q_bf16(memref<{QSZ}xbf16>, memref<{PT}xbf16>, i32) attributes {{link_with = "layer_fused_relay.o"}}\n'
+            + (f'    func.func private @layer_fused_dump_q_bf16(memref<{QSZ}xbf16>, memref<{PT}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
                if self.QDUMP else ''))
 
         # flows

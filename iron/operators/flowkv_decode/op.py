@@ -13,6 +13,13 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
+from iron.operators.flowkv_decode.contract import (
+    flowkv_artifact_identity,
+    flowkv_geometry_flags,
+    flowkv_kernel_object_name,
+    flowkv_tuning_tokens_from_environment,
+    normalize_flowkv_tuning_tokens,
+)
 from iron.operators.flowkv_decode.reference import contiguous_kv_cache
 
 
@@ -77,6 +84,7 @@ class AIEFlowKVDecode(AIEOperatorBase):
         seq_len,
         chunk_size=32,
         num_cols=4,
+        tuning_tokens=None,
         context=None,
     ):
         assert (
@@ -99,6 +107,16 @@ class AIEFlowKVDecode(AIEOperatorBase):
         self.chunk_size = chunk_size
         self.num_cols = num_cols
         self.group_size = num_heads // num_kv_heads
+        if tuning_tokens is None:
+            self.tuning_tokens = flowkv_tuning_tokens_from_environment()
+        else:
+            self.tuning_tokens = normalize_flowkv_tuning_tokens(tuning_tokens)
+        self.kernel_obj_name = flowkv_kernel_object_name(
+            self.head_dim,
+            self.group_size,
+            self.chunk_size,
+            self.tuning_tokens,
+        )
 
         self.xclbin_artifact = None
         self.insts_artifact = None
@@ -107,10 +125,17 @@ class AIEFlowKVDecode(AIEOperatorBase):
 
     def set_up_artifacts(self):
         operator_dir = Path(__file__).parent
+        device_name = self.context.device_manager.device_type.resolve().name
+        tuning_fingerprint = flowkv_artifact_identity(
+            self.head_dim,
+            self.group_size,
+            self.chunk_size,
+            self.tuning_tokens,
+        )
         file_name_base = (
-            f"flowkv_decode_{self.num_heads}h_{self.num_kv_heads}kv_"
+            f"flowkv_decode_{device_name}_{self.num_heads}h_{self.num_kv_heads}kv_"
             f"{self.head_dim}d_{self.seq_len}s_{self.chunk_size}cs_"
-            f"{self.num_cols}col"
+            f"{self.num_cols}col_t{tuning_fingerprint}"
         )
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
@@ -125,23 +150,19 @@ class AIEFlowKVDecode(AIEOperatorBase):
                 self.seq_len,
                 self.chunk_size,
                 self.num_cols,
+                2,
+                2,
+                3,
+                self.kernel_obj_name,
             ],
         )
-
-        # Per-head_dim kernel object name so different HEAD_DIM compile
-        # specializations don't collide in the build cache. The
-        # -DHEAD_DIM=N flag selects the static-buffer size and unrolled
-        # dot-product chunk count inside flowkv.cc.
-        _cf = __import__("os").environ.get("FLOWKV_CFLAGS", "")
-        _cf_tag = ("_" + "".join(c for c in _cf if c.isalnum())[:16]) if _cf else ""
-        kernel_obj_name = f"flowkv_{self.head_dim}d{_cf_tag}.o"
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelObjectArtifact.new(
-                    kernel_obj_name,
+                    self.kernel_obj_name,
                     depends=[
                         SourceArtifact.new(
                             self.context.base_dir
@@ -150,8 +171,14 @@ class AIEFlowKVDecode(AIEOperatorBase):
                             / "flowkv.cc"
                         )
                     ],
-                    extra_flags=[f"-DHEAD_DIM={self.head_dim}"]
-                    + (__import__("os").environ.get("FLOWKV_CFLAGS", "").split()),
+                    extra_flags=[
+                        *flowkv_geometry_flags(
+                            self.head_dim,
+                            self.group_size,
+                            self.chunk_size,
+                        ),
+                        *self.tuning_tokens,
+                    ],
                 ),
             ],
         )

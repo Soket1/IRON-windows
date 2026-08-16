@@ -24,6 +24,10 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
+from iron.operators.flowkv_decode.contract import (
+    flowkv_geometry_flags,
+    flowkv_kernel_object_name,
+)
 
 
 class AIEDecodeLayerF3Best(AIEOperatorBase):
@@ -45,7 +49,18 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         self.seq_len = seq_len
         self.num_q_heads = num_q_heads
         self.with_npu_kv = with_npu_kv
-        self.WT_TILES = 960 if with_npu_kv else 896
+        # Compute WT_TILES from the same pack_bcast tile-count formulas the emitter
+        # uses (tiles = (n_rows/32)*(K_pack/256)). For 1B this gives 896 (no-KV) /
+        # 960 (KV); for 3B it gives 1440 (no-KV) / 1504 (KV). Hardcoding was wrong
+        # for any E != 2048.
+        _N = 32; _KC = 256
+        _per_tile = embed_dim // self.NH
+        _h8 = hidden_dim // self.NH
+        _q_t = (_per_tile // _N) * (embed_dim // _KC)
+        _gu_t = (_h8 // _N) * (embed_dim // _KC)
+        _dn_t = (embed_dim // _N) * (_h8 // _KC)
+        _kv_t = 128 // m_input if with_npu_kv else 0   # KV_M=128, same as emitter
+        self.WT_TILES = 2 * _q_t + 2 * _gu_t + _dn_t + 2 * _kv_t
         self.xclbin_artifact = None
         self.insts_artifact = None
         AIEOperatorBase.__init__(self, context=context)
@@ -83,8 +98,30 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         # must participate in the cache key.
         _uni = _os.environ.get('F3BEST_UNI_SZ', '128')
         _uni_sfx = '' if _uni == '128' else f'_u{_uni}'
+        flowkv_tuning = (
+            "-DFLOWKV_PRESCALE_Q=1",
+            "-DFLOWKV_VEC_EXP=1",
+            "-DFLOWKV_VALUE_AMAC=1",
+        )
+        flowkv_obj_name = flowkv_kernel_object_name(
+            self.head_dim, self.attn_group, self.seq_len, flowkv_tuning
+        )
+        # The object filename is the complete fixed FlowKV specialization: cache
+        # the outer xclbin under a tag derived from it rather than raw environment.
+        flowkv_obj_tag = f"_fkobj_{flowkv_obj_name.removesuffix('.o')}"
+        flowkv_flags = flowkv_geometry_flags(
+            self.head_dim, self.attn_group, self.seq_len
+        )
+        # KernelObjectArtifact freshness does not include extra_flags. Keep every
+        # flag-specialized object in its own filename namespace so a shared build
+        # directory can never reuse a 1B object for a 3B xclbin.
+        rope_obj_name = f"rope_il_k{self.K}_d{self.head_dim}.o"
+        relay_obj_name = (
+            f"layer_fused_relay_e{E}_h{H}_g{g}_d{self.head_dim}"
+            f"_qh{self.num_q_heads}_kvh{self.num_kv_heads}_s2048_c8_m1024.o"
+        )
         base = (f"{prefix}{E}x{H}_d{self.head_dim}_g{g}_s{self.seq_len}"
-                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_cpp_bcast}{_qdump}{_b0dump}{_uni_sfx}_fkfix2_silu2_mxpp")  # _silu = #210: FFN gate/up/down all live in the C++ statics (lf_left/right/silu_buf); the MLIR was calling the explicit-pointer SiLU on IRON buffers nobody wrote, so down consumed the raw gate. _fkfix2 = #208 root: F3BEST_MT_DECOUPLE edge MemTile weight relay corrupts KV+center — drop decouple from all presets (root #208). _cpp = pure C++ bcast path (#188 fix — hand-asm .s dropped: baseline NaN, RR ~500x blow-up), _qdump = #188 Ш21 direct-NPU Q dump (routes Q into the O_h relay), _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
+                f"_a{self.attn_group}_kv{self.num_kv_heads}_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2{_kv_abi}{_div_suffix}{_decouple}{_triple_b}{_cpp_bcast}{_qdump}{_b0dump}{_uni_sfx}{flowkv_obj_tag}_fkfix2_silu2_mxpp_objid2_abi2")  # _silu = #210: FFN gate/up/down all live in the C++ statics (lf_left/right/silu_buf); the MLIR was calling the explicit-pointer SiLU on IRON buffers nobody wrote, so down consumed the raw gate. _fkfix2 = #208 root: F3BEST_MT_DECOUPLE edge MemTile weight relay corrupts KV+center — drop decouple from all presets (root #208). _cpp = pure C++ bcast path (#188 fix — hand-asm .s dropped: baseline NaN, RR ~500x blow-up), _qdump = #188 Ш21 direct-NPU Q dump (routes Q into the O_h relay), _mc = multi-chunk attn fix (#70/#74), _preq/_vexp = flowkv score density cuts, _vreg = register-resident value accumulator, _dq8 = single int4->int8 unpack, _qp = 4 groups/iteration in two chains, _mxp = mx packet demux fix (#142), _ub = unified bcast GEMV (#157 L1), _amac = native bf16 MAC in value tile (#176)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{base}.mlir",
@@ -93,7 +130,8 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
             callback_args=[
                 self.context.device_manager.device_type,
                 E, H, g, self.head_dim, self.num_kv_heads,
-                self.attn_group, self.seq_len, self.with_npu_kv,
+                self.attn_group, self.seq_len, self.with_npu_kv, flowkv_obj_name,
+                rope_obj_name, relay_obj_name,
             ],
         )
 
@@ -114,20 +152,15 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
                          "-Dfused_dequant_matvec_v2_bf16=oproj_matvec_v2_bf16"],
         )
         rope_obj = KernelObjectArtifact.new(
-            "rope_il.o",
+            rope_obj_name,
             depends=[SourceArtifact.new(gen / "rope.cc")],
             extra_flags=["-DINTERLEAVED", f"-DLUT_OFF={self.K}",
                          f"-DSEQ_META={self.head_dim}"],
         )
         flowkv_obj = KernelObjectArtifact.new(
-            f"flowkv_{self.head_dim}d_h{self.attn_group}_c{self.seq_len}.o",
+            flowkv_obj_name,
             depends=[SourceArtifact.new(k2p / "flowkv.cc")],
-            extra_flags=[f"-DHEAD_DIM={self.head_dim}",
-                         f"-DMAX_Q_HEADS={self.attn_group}",
-                         f"-DMAX_CHUNK={self.seq_len}",
-                         "-DFLOWKV_PRESCALE_Q=1",
-                         "-DFLOWKV_VEC_EXP=1",
-                         "-DFLOWKV_VALUE_AMAC=1"],
+            extra_flags=[*flowkv_flags, *flowkv_tuning],
         )
         concat_obj = KernelObjectArtifact.new(
             "attn_concat.o",
@@ -137,7 +170,7 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         # rms hub + mux, built for the 8-center-column f3best layout.
         # #188: pure C++ bcast path (layer_fused_*_bcast_bf16); hand-asm .s dropped.
         relay_obj = KernelObjectArtifact.new(
-            "layer_fused_relay.o",
+            relay_obj_name,
             depends=[SourceArtifact.new(k2p / "layer_fused_f3best.cc")],
             extra_flags=[
                 f"-DEMBED_DIM={E}", f"-DHIDDEN_DIM={H}", f"-DGROUP_SIZE={g}",
@@ -171,7 +204,11 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         # bo3 unused Wo placeholder; bo4 KV cache (K then V, NH heads).
         KV_M = 128 if self.with_npu_kv else 0
         self.add_buffer("output", NH * (E + 2*KV_M) + E, dtype=bfloat16)
-        self.add_buffer("XR", (E + 256 + 16) + E + E, dtype=bfloat16)
+        # #187: q_rows = attn_group*head_dim varies (1B:256, 3B:384). Was hardcoded
+        # 256 (1B-only), which under-allocated XR by (q_rows-256) bf16 for 3B,
+        # mis-matching host XB=E+q_rows+16 and the emitter's parametric x_bundle.
+        q_rows = self.attn_group * self.head_dim
+        self.add_buffer("XR", (E + q_rows + 16) + E + E, dtype=bfloat16)
         self.add_buffer("A", NH * WT_BYTES, dtype=np.uint8)
         self.add_buffer("Wo", self.WO_BYTES, dtype=np.uint8)
         self.add_buffer("KV", 2 * NH * KVN, dtype=bfloat16)
