@@ -260,6 +260,37 @@ class OFold8F3BestEmitter:
         # (rl_A is unchanged; this only ADDS a second MM2S BD copying it host-side).
         # Default off → MLIR identical to production (zero risk to 1B).
         self.ATTN_DUMP = _os.environ.get('F3BEST_ATTN_DUMP', '').strip() != ''
+        # #260 AIE2P hardware trace: emit aie.trace ops on score tiles to capture
+        # DMA/lock/stream-stall events, routed to a trace shim→DDR BO. Use with
+        # F3BEST_SDUMP to debug why the ^ohf→%nm→@S_alloc path stalls (s_blk=0).
+        # Parse: python -m aie.utils.trace.parse --input <trace.bin> --mlir <mlir>.
+        self.AIE_TRACE = _os.environ.get('F3BEST_AIE_TRACE', '').strip() != ''
+
+    def _score_trace_ops(self, h):
+        """Emit aie.trace ops for one score tile %sc{h} (8 DMA/lock/stall events).
+        AIE2P Core Tile events (see AIE2P event tables):
+          core_dma_mm2s_1_go(47)/stalled(51) — ^ohf MM2S ch1 (_mm2s_oh)
+          core_dma_s2mm_0_stalled(48) — ^q S2MM input
+          stream_stall_ms0(34)/ms1(35) — output stream backpressure
+          core_stall_lock(16) — lock wait. Broadcast start=15/stop=14."""
+        if not self.AIE_TRACE:
+            return ''
+        p = f'sc{h}'
+        return f"""
+    aie.trace @trace_{p}(%{p}) {{
+      aie.trace.mode "Event-Time"
+      aie.trace.packet id={3+h} type=core
+      aie.trace.event<"STREAM_STALL">
+      aie.trace.event<"LOCK_STALL">
+      aie.trace.event<"MEMORY_STALL">
+      aie.trace.event<"PORT_STALLED_0">
+      aie.trace.event<"PORT_STALLED_1">
+      aie.trace.event<"PORT_STALLED_2">
+      aie.trace.event<"INSTR_LOCK_ACQUIRE_REQ">
+      aie.trace.event<"NONE">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }}"""
 
     def _compute_l1_budget(self):
         """Compute L1 usage and auto-select single-B vs triple-B (64KB limit)."""
@@ -1644,6 +1675,11 @@ class OFold8F3BestEmitter:
         # flows
         flows = []
         flows.append("    aie.flow(%sh0, DMA : 1, %mx, DMA : 0)   // x_bundle -> mux S2MM0")
+        if self.AIE_TRACE:
+            # #260: trace only 1 score tile (sc0) — let the auto-router find a
+            # free path. Explicit packet_flow caused port conflicts (South:2
+            # busy); with 1 tile the auto-router has more freedom.
+            flows.append(f"    aie.flow(%sc0, Trace : 0, %sh7, DMA : 0)   // trace sc0 -> sh7")
         if self.RL_FIX:
             flows.append("    aie.packet_flow(0) { aie.packet_source<%jA, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // attnA -> mux S2MM1")
             flows.append("    aie.packet_flow(1) { aie.packet_source<%nm, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // ffn_in -> mux S2MM1")
@@ -1706,6 +1742,10 @@ class OFold8F3BestEmitter:
         shim_allocs += "    aie.shim_dma_allocation @Vlo_alloc(%sh5, MM2S, 1)\n"
         shim_allocs += "    aie.shim_dma_allocation @Vhi_alloc(%sh6, MM2S, 1)\n"
         shim_allocs += "    aie.shim_dma_allocation @S_alloc(%sh4, S2MM, 1)\n"
+        if self.AIE_TRACE:
+            # #260: dedicated trace-destination shim. sh7 is free unless
+            # ATTN_DUMP (which uses sh7 S2MM1); use sh7 S2MM0 for trace.
+            shim_allocs += "    aie.shim_dma_allocation @T_alloc(%sh7, S2MM, 0)\n"
         if self.ATTN_DUMP:
             shim_allocs += "    aie.shim_dma_allocation @ATN_alloc(%sh7, S2MM, 1)\n"
         shim_allocs += "".join(
@@ -1719,6 +1759,9 @@ class OFold8F3BestEmitter:
 
         # runtime sequence
         rt = []
+        if self.AIE_TRACE:
+            rt.append(f"""      aie.trace.host_config buffer_size=65536 arg_idx={4+0}
+""")
         rt.append(f"""      %tx = aiex.dma_configure_task_for @X_alloc {{
         aie.dma_bd(%arg1 : memref<{self.XR_ELEMS}xbf16>, 0, {XB}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {XB}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
@@ -1784,7 +1827,7 @@ class OFold8F3BestEmitter:
 
         # Build MLIR sections
         centers = "".join(self._center(h) for h in range(NH))
-        scores = "".join(self._score(h) for h in range(NH))
+        scores = "".join(self._score(h) + (self._score_trace_ops(h) if h == 0 else '') for h in range(NH))
         values = "".join(self._value(h) for h in range(NH))
         if self.RL_FIX:
             joins = (self._join_memtile('jA', 'jA', with_weight_relay=(0 in self.RELAY_COLS), packet_id=0)
