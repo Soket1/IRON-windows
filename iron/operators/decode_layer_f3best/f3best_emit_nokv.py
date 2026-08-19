@@ -774,9 +774,9 @@ class OFold8F3BestEmitter:
     %mem_sc{h} = aie.mem(%sc{h}) {{
       %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
     ^q{h}:
-      aie.use_lock(%{p}_Sdp, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_Sd : memref<{ITC}xbf16>, 0, {ITCL})
-      aie.use_lock(%{p}_Sdc, Release, 1)
+      aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZL})
+      aie.use_lock(%{p}_Qc, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
       aie.use_lock(%{p}_Ohp, AcquireGreaterEqual, 1)
@@ -800,9 +800,9 @@ class OFold8F3BestEmitter:
     ^ohm{h}:
       %m1 = aie.dma_start(MM2S, {_mm2s_oh}, ^ohf{h}, ^e{h})
     ^ohf{h}:
-      aie.use_lock(%{p}_Ohdc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_Oh : memref<{PT}xbf16>, 0, {PT})
-      aie.use_lock(%{p}_Ohdp, Release, 1)
+      aie.use_lock(%{p}_Sdc, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Sd : memref<{ITC}xbf16>, 0, {ITCL})
+      aie.use_lock(%{p}_Sdp, Release, 1)
       aie.next_bd ^ohf{h}
     ^e{h}:
       aie.end
