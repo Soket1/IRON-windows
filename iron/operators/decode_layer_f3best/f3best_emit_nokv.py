@@ -1763,7 +1763,7 @@ class OFold8F3BestEmitter:
         # runtime sequence
         rt = []
         if self.AIE_TRACE:
-            rt.append(f"""      aie.trace.host_config buffer_size=65536 arg_idx={4+0}
+            rt.append(f"""      aie.trace.host_config buffer_size=65536 arg_idx=6
 """)
         rt.append(f"""      %tx = aiex.dma_configure_task_for @X_alloc {{
         aie.dma_bd(%arg1 : memref<{self.XR_ELEMS}xbf16>, 0, {XB}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {XB}, stride = 1>]) {{burst_length = 0 : i32}}
