@@ -1586,6 +1586,12 @@ class OFold8F3BestEmitter:
         flows.append("    aie.flow(%op, DMA : 0, %nm, DMA : 0)   // O -> ANM")
         flows.append("    aie.flow(%sh2, DMA : 1, %nm, DMA : 1)   // resid+gain -> ANM (2-BD on S2MM1)")
         flows.append("    aie.flow(%nm, DMA : 1, %sh4, DMA : 1)   // s = O+resid (attn-residual) -> arg0 tail")
+        if self.ATTN_DUMP:
+            # #245: rl tile MM2S ch1 (dump) drains rl_A (pre-O-proj attn_out) into a
+            # host-visible shim S2MM. sh7 ch1 is free (P7 uses ch0). 1 dispatch =
+            # 1 layer iteration, so a single-shot shim captures exactly one frame,
+            # identical to @S_alloc. (Round 4 review §6.1.)
+            flows.append("    aie.flow(%rl, DMA : 1, %sh7, DMA : 1)   // attn_out tap (ATTN_DUMP) -> sh7 S2MM1")
         flows_txt = "\n".join(flows) + "\n"
 
         # shim allocations
@@ -1596,11 +1602,15 @@ class OFold8F3BestEmitter:
         shim_allocs += "    aie.shim_dma_allocation @Vlo_alloc(%sh5, MM2S, 1)\n"
         shim_allocs += "    aie.shim_dma_allocation @Vhi_alloc(%sh6, MM2S, 1)\n"
         shim_allocs += "    aie.shim_dma_allocation @S_alloc(%sh4, S2MM, 1)\n"
+        if self.ATTN_DUMP:
+            shim_allocs += "    aie.shim_dma_allocation @ATN_alloc(%sh7, S2MM, 1)\n"
         shim_allocs += "".join(
             f'    aie.shim_dma_allocation @A{h}(%sh{h}, MM2S, 0)\n'
             f'    aie.shim_dma_allocation @P{h}(%sh{h}, S2MM, 0)\n' for h in range(NH))
 
-        WT_TY = f"{NH*WT_BYTES}xi8"; P_TY = f"{(NH+1)*E}xbf16"; KV_TY = f"{2*NH*KVN}xbf16"
+        # #245: grow P_TY by E in ATTN_DUMP to hold the tap region at [(NH+1)*E, (NH+2)*E).
+        P_TY = f"{(NH+2)*E}xbf16" if self.ATTN_DUMP else f"{(NH+1)*E}xbf16"
+        WT_TY = f"{NH*WT_BYTES}xi8"; KV_TY = f"{2*NH*KVN}xbf16"
         HALF_KV = self.HALF_KV
 
         # runtime sequence
@@ -1651,11 +1661,20 @@ class OFold8F3BestEmitter:
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%ts)""")
+        if self.ATTN_DUMP:
+            # #245: single-shot shim S2MM task capturing rl_A (pre-O-proj attn_out)
+            # from sh7 into arg0 (output BO) at offset (NH+1)*E. One dispatch = one
+            # layer iteration, so this captures exactly the current layer's frame
+            # (same model as @S_alloc). P_TY grew by E to hold this region.
+            rt.append(f"""      %tatn = aiex.dma_configure_task_for @ATN_alloc {{
+        aie.dma_bd(%arg0 : memref<{P_TY}>, {(NH+1)*E}, {E}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {E}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.end
+      }} {{issue_token = true}}
+      aiex.dma_start_task(%tatn)""")
+        _await_extra = "\n      aiex.dma_await_task(%tatn)" if self.ATTN_DUMP else ""
         rt.append("".join(f"      aiex.dma_await_task(%tp{h})\n" for h in range(NH)).rstrip()
-                  + "\n      aiex.dma_await_task(%ts)")
+                  + "\n      aiex.dma_await_task(%ts)" + _await_extra)
         rt_body = "\n".join(rt) + "\n"
-        # #245: in ATTN_DUMP mode arg3 (Wo-placeholder) is the tap destination, so
-        # declare it xbf16 (WO_BYTES/2 elems) to match the S2MM BD element count.
         rt_args = (f"%arg0: memref<{P_TY}>, %arg1: memref<{self.XR_ELEMS}xbf16>, %arg2: memref<{WT_TY}>, "
                    f"%arg3: memref<{self.WO_BYTES}xi8>, %arg4: memref<{KV_TY}>")
 
