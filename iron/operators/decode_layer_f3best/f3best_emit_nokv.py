@@ -1587,10 +1587,6 @@ class OFold8F3BestEmitter:
         flows.append("    aie.flow(%sh2, DMA : 1, %nm, DMA : 1)   // resid+gain -> ANM (2-BD on S2MM1)")
         flows.append("    aie.flow(%nm, DMA : 1, %sh4, DMA : 1)   // s = O+resid (attn-residual) -> arg0 tail")
         if self.ATTN_DUMP:
-            # #245: rl tile MM2S ch1 (dump) drains rl_A (pre-O-proj attn_out) into a
-            # host-visible shim S2MM. sh7 ch1 is free (P7 uses ch0). 1 dispatch =
-            # 1 layer iteration, so a single-shot shim captures exactly one frame,
-            # identical to @S_alloc. (Round 4 review §6.1.)
             flows.append("    aie.flow(%rl, DMA : 1, %sh7, DMA : 1)   // attn_out tap (ATTN_DUMP) -> sh7 S2MM1")
         flows_txt = "\n".join(flows) + "\n"
 
