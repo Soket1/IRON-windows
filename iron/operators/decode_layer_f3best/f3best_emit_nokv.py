@@ -156,22 +156,34 @@ class OFold8F3BestEmitter:
         self.XB = E + AG * HD + 16                         # x_bundle: input + rope LUT (q_rows=AG*HD) + seq meta (1B: 2320, 3B: 2448)
         self.QI = self.PER_TILE                            # quadrant size (1B: 256)
         self.Q_SZ = self.PER_TILE + HD + 2                 # Q buffer (1B: 322)
+        # #235: allocation size padded to 32 bf16 (64 B). Q_SZ/ITC are odd
+        # (3B: 514/390 elems = 1028/780 B), and when aiecc cannot satisfy
+        # bank-aware L1 placement it packs the tile's buffers contiguously --
+        # then those odd sizes cascade and push the FOLLOWING buffers off the
+        # 32-byte grid. On 3B that landed va*_Of at addr%32==12 while
+        # flowkv_value_normalize_bf16 writes it with aie::store_v of a
+        # 16xbf16 (32 B) vector, i.e. an unaligned vector store.
+        # 1B never showed it only because its K/V buffers are 16 KB, so
+        # bank-aware alloc succeeded and every buffer sat on a bank boundary.
+        # Padding the ALLOCATION keeps every buffer 64 B-aligned in either
+        # placement mode; DMA lengths below stay at the logical Q_SZ/ITC.
+        self.Q_SZ_ALLOC = (self.Q_SZ + 31) // 32 * 32      # 1B: 352, 3B: 544
         self.O_SZ = E                                      # O buffer (1B: 2048)
         self.P_SZ = self.XB                                # P buffer = XB (1B: 2320)
         self.HPER = self.H8                                # gate/up/silu buffer (1B: 1024)
         # uni_partial: the wrapper's 128-byte float32 accumulator, written as a
         # PAIR of 64-byte vector ops (vst bmll0/bmlh0). #206/#207: a 192-byte
         # guard band was tried to break adjacency with gate and 64-align the
-        # base — it changed the whole L1 map yet left the corruption bit-for-bit
+        # base - it changed the whole L1 map yet left the corruption bit-for-bit
         # identical, so buffer adjacency/alignment is NOT the cause.
         self.UNI_SZ = int(_os.environ.get('F3BEST_UNI_SZ', '128'))
 
         # ── attention chunking ──
         self.CHUNK = 128
-        assert SEQ % self.CHUNK == 0
         self.NCHUNK = SEQ // self.CHUNK
         self.KCH = self.CHUNK * HD                         # per-chunk K/V buffer elems (1B: 8192)
         self.ITC = self.CHUNK * AG + 2 * AG                # per-chunk score packet (1B: 520)
+        self.ITC_ALLOC = (self.ITC + 31) // 32 * 32        # 1B: 544, 3B: 416 (see Q_SZ_ALLOC)
         self.KVN = SEQ * HD                                # per-head KV buffer (1B: 16384)
         self.FLOWKV_LIB = (
             flowkv_obj_name
@@ -232,12 +244,19 @@ class OFold8F3BestEmitter:
         # whether B0 holds x_bundle or stale/wrong-phase data. Only valid for
         # triple-B (single-B has no B0 buffer).
         self.B0DUMP = _os.environ.get('F3BEST_B0DUMP', '').strip() != ''
+        # #245 tapped debug-build: when set, the relay (rl) tile copies its
+        # attn_out buffer (rl_A, the full E-element pre-O-proj attention output)
+        # into a host-visible debug BO via the rl tile's FREE MM2S channel 1 and a
+        # free shim S2MM (sh2 ch0). Numerically identical to the production path
+        # (rl_A is unchanged; this only ADDS a second MM2S BD copying it host-side).
+        # Default off → MLIR identical to production (zero risk to 1B).
+        self.ATTN_DUMP = _os.environ.get('F3BEST_ATTN_DUMP', '').strip() != ''
 
     def _compute_l1_budget(self):
         """Compute L1 usage and auto-select single-B vs triple-B (64KB limit)."""
         a_bytes = 2 * self.PACKED
         b_bytes = self.XB * 2                              # bf16 → bytes
-        q_bytes = self.Q_SZ * 2
+        q_bytes = self.Q_SZ_ALLOC * 2
         o_bytes = self.O_SZ * 2
         p_bytes = self.P_SZ * 2
         g_bytes = self.HPER * 2
@@ -285,7 +304,10 @@ class OFold8F3BestEmitter:
 
     def _center_triple_b(self, h, p):
         """Triple B-buffer: B0(x_bundle), B1(attn_out), B2(ffn_in)."""
-        E = self.E; PK = self.PACKED; XB = self.XB; QSZ = self.Q_SZ
+        # QSZ/ITC name the memref TYPE (= L1 allocation, 64 B-aligned); the
+        # QSZL/ITCL suffix is the logical DMA length. See Q_SZ_ALLOC.
+        E = self.E; PK = self.PACKED; XB = self.XB; QSZ = self.Q_SZ_ALLOC
+        QSZL = self.Q_SZ
         OSZ = self.O_SZ; PSZ = self.P_SZ; HP = self.HPER; GT = self.GU_T
         PT = self.PER_TILE; UNI = self.UNI_SZ
 
@@ -352,7 +374,7 @@ class OFold8F3BestEmitter:
         // #211 B0 dump: snapshot B0 (x_bundle as delivered by mux->center) into P,
         // then drain P via the existing Pf0 MM2S to the shim s-region. The host
         // reads P and compares TB=0 vs TB=1 B0 contents. Reuses attn_copy_bf16
-        // (already linked via attn_concat.o) and the P buffer/Pf0 drain — no new
+        // (already linked via attn_concat.o) and the P buffer/Pf0 drain - no new
         // kernel, DMA channel, or lock pair. Pp/Pc are recycled: the dump fills P
         // (Pc=1), Pf0 drains it (releases Pp), and phase3d later re-acquires Pp.
         """ + (f"""
@@ -408,7 +430,7 @@ class OFold8F3BestEmitter:
         // lf_left_buf / lf_right_buf / lf_silu_buf: gate_up writes the statics
         // and down reads lf_silu_buf. Calling the explicit-pointer SiLU on the
         // IRON buffers would read gate/up nobody ever wrote and leave down on
-        // the raw (un-SiLU'd) gate — so use the static variant that matches.
+        // the raw (un-SiLU'd) gate - so use the static variant that matches.
         func.call @layer_fused_silu_mul_static_bf16(%hc) : (i32) -> ()
         // 3d: down GEMV (nchunk=4, activation = silu_buf)
         aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
@@ -467,7 +489,7 @@ class OFold8F3BestEmitter:
       %m1 = aie.dma_start(MM2S, {_mm2s_qo}, ^qi{h}, ^e{h})
     ^qi{h}:
       aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZ})
+      aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZL})
       aie.use_lock(%{p}_Qp, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
@@ -481,7 +503,8 @@ class OFold8F3BestEmitter:
 
     def _center_single_b(self, h, p):
         """Single B-buffer: B = shared activation (x_bundle / attn_out / ffn_in)."""
-        E = self.E; PK = self.PACKED; XB = self.XB; QSZ = self.Q_SZ
+        E = self.E; PK = self.PACKED; XB = self.XB; QSZ = self.Q_SZ_ALLOC
+        QSZL = self.Q_SZ
         OSZ = self.O_SZ; PSZ = self.P_SZ; HP = self.HPER; GT = self.GU_T
         PT = self.PER_TILE; UNI = self.UNI_SZ
 
@@ -592,7 +615,7 @@ class OFold8F3BestEmitter:
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         aie.use_lock(%{p}_Bp, Release, 1)
-        // 3c: SiLU(gate) * up -> silu_buf (statics — see the triple-B center).
+        // 3c: SiLU(gate) * up -> silu_buf (statics - see the triple-B center).
         func.call @layer_fused_silu_mul_static_bf16(%hc) : (i32) -> ()
         // 3d: down GEMV (nchunk=4, activation = silu_buf)
         aie.use_lock(%{p}_Pp, AcquireGreaterEqual, 1)
@@ -641,7 +664,7 @@ class OFold8F3BestEmitter:
       %m1 = aie.dma_start(MM2S, {_mm2s_qo}, ^qo{h}, ^e{h})
     ^qo{h}:
       aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZ})
+      aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZL})
       aie.use_lock(%{p}_Qp, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
@@ -655,7 +678,8 @@ class OFold8F3BestEmitter:
 
     def _score(self, h):
         p = f"sc{h}"
-        KCH = self.KCH; ITC = self.ITC; QSZ = self.Q_SZ
+        KCH = self.KCH; ITC = self.ITC_ALLOC; QSZ = self.Q_SZ_ALLOC
+        QSZL = self.Q_SZ; ITCL = self.ITC
         NC = self.NCHUNK; CH = self.CHUNK; PT = self.PER_TILE
 
         # Auto-allocate locks and DMA channels (#154)
@@ -671,7 +695,7 @@ class OFold8F3BestEmitter:
         if self.QDUMP:
             # #188 Q dump: one extra lock pair gates the Qd relay buffer (the score
             # tile has 16/16 locks with 5 pairs used -> 3 pairs headroom; no extra
-            # DMA channel is allocated — the O_h relay MM2S1 is re-pointed at Qd).
+            # DMA channel is allocated - the O_h relay MM2S1 is re-pointed at Qd).
             _qd = L.pair('Qd')
             _lock_decls = '\n'.join([
                 _ld('Q', _q), _ld('K', _k), _ld('I', _i),
@@ -686,8 +710,8 @@ class OFold8F3BestEmitter:
         if self.QDUMP:
             # #188 Q-dump variant: after rope, copy the received roped-Q (PT) into
             # Qd and gate the relay on Qd (instead of O_h). The O_h relay buffer is
-            # still filled by S2MM0-BD1 (core sends O via mm2s_qo BD1) — we cycle
-            # Ohc/Ohp so that S2MM0 BD1 never spins — but its data is discarded.
+            # still filled by S2MM0-BD1 (core sends O via mm2s_qo BD1) - we cycle
+            # Ohc/Ohp so that S2MM0 BD1 never spins - but its data is discarded.
             # The O_hd pair (Ohd) is left idle (no code references it -> no deadlock).
             return f"""
     %{p}_Qs = aie.buffer(%sc{h}) {{sym_name = "{p}_Qs"}} : memref<{QSZ}xbf16>
@@ -732,7 +756,7 @@ class OFold8F3BestEmitter:
       %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
     ^q{h}:
       aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZ})
+      aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZL})
       aie.use_lock(%{p}_Qc, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
@@ -751,7 +775,7 @@ class OFold8F3BestEmitter:
       %m0 = aie.dma_start(MM2S, {_mm2s_out}, ^io{h}, ^ohm{h})
     ^io{h}:
       aie.use_lock(%{p}_Ic, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_It : memref<{ITC}xbf16>, 0, {ITC})
+      aie.dma_bd(%{p}_It : memref<{ITC}xbf16>, 0, {ITCL})
       aie.use_lock(%{p}_Ip, Release, 1)
       aie.next_bd ^io{h}
     ^ohm{h}:
@@ -803,7 +827,7 @@ class OFold8F3BestEmitter:
       %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
     ^q{h}:
       aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZ})
+      aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZL})
       aie.use_lock(%{p}_Qc, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
@@ -822,7 +846,7 @@ class OFold8F3BestEmitter:
       %m0 = aie.dma_start(MM2S, {_mm2s_out}, ^io{h}, ^ohm{h})
     ^io{h}:
       aie.use_lock(%{p}_Ic, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_It : memref<{ITC}xbf16>, 0, {ITC})
+      aie.dma_bd(%{p}_It : memref<{ITC}xbf16>, 0, {ITCL})
       aie.use_lock(%{p}_Ip, Release, 1)
       aie.next_bd ^io{h}
     ^ohm{h}:
@@ -838,7 +862,8 @@ class OFold8F3BestEmitter:
 
     def _value(self, h):
         p = f"va{h}"
-        KCH = self.KCH; ITC = self.ITC; PT = self.PER_TILE
+        KCH = self.KCH; ITC = self.ITC_ALLOC; PT = self.PER_TILE
+        ITCL = self.ITC
         NC = self.NCHUNK; CH = self.CHUNK
 
         # Auto-allocate locks and DMA channels (#154)
@@ -883,7 +908,7 @@ class OFold8F3BestEmitter:
       %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^iv{h}, ^vs{h})
     ^iv{h}:
       aie.use_lock(%{p}_Ip, AcquireGreaterEqual, 1)
-      aie.dma_bd(%{p}_Iv : memref<{ITC}xbf16>, 0, {ITC})
+      aie.dma_bd(%{p}_Iv : memref<{ITC}xbf16>, 0, {ITCL})
       aie.use_lock(%{p}_Ic, Release, 1)
       aie.next_bd ^iv{h}
     ^vs{h}:
@@ -1083,13 +1108,65 @@ class OFold8F3BestEmitter:
         return s
 
     def _relay_block(self):
-        """rl tile: relay attn_out half0+half1 -> mx (packet)."""
+        """rl tile: relay attn_out half0+half1 -> mx (packet).
+
+        #245 ATTN_DUMP: a second MM2S (free channel 1) copies rl_A into a host-
+        visible debug BO via a free shim S2MM (sh2 ch0), so the host can read the
+        full pre-O-proj attention output per q-head. Numerically identical to the
+        production path (rl_A is read-only here). Gated by F3BEST_ATTN_DUMP."""
         E = self.E; E2 = E // 2
         L = _LockAlloc('core'); D = _DmaAlloc('core')
         _h0 = L.pair('p0'); _h1 = L.pair('p1'); _oo = L.pair('op')
         _s2mm_0 = D.s2mm(); _s2mm_1 = D.s2mm(); _mm2s = D.mm2s()
         _ld = lambda name, ids: _LockAlloc.mlir_decl('rl', 'rl', name, *ids)
-        _lock_decls = '\n'.join([_ld('p0', _h0), _ld('p1', _h1), _ld('op', _oo)])
+        if self.ATTN_DUMP:
+            # Dedicated lock pair for the dump MM2S (core signals "data ready" via
+            # dp_consumer release; dump MM2S acquires it, copies rl_A, releases
+            # dp_producer; next-iteration core acquires dp_producer = dump done).
+            _dp = L.pair('dp')
+            _mm2s_dbg = D.mm2s('attn_dump')   # free channel 1
+            _lock_decls = '\n'.join([_ld('p0', _h0), _ld('p1', _h1), _ld('op', _oo), _ld('dp', _dp)])
+            # #245 core dump handshake: acquire dpp (previous dump done) BEFORE
+            # releasing opc/dpc (trigger new drains), so both MM2S channels are
+            # guaranteed idle before rl_A is overwritten. Release dpc (data ready
+            # for tap) alongside opc (data ready for production drain).
+            _dump_core_wait = "        aie.use_lock(%rl_dpp, AcquireGreaterEqual, 1)\n"
+            _dump_core_fire = "        aie.use_lock(%rl_dpc, Release, 1)"
+            _dump_mem = (
+                f"""    ^rm0:
+      %m0 = aie.dma_start(MM2S, {_mm2s}, ^ro, ^rd)
+    ^ro:
+      aie.use_lock(%rl_opc, AcquireGreaterEqual, 1)
+      aie.dma_bd_packet(0, 0)
+      aie.dma_bd(%rl_A : memref<{E}xbf16>, 0, {E})
+      aie.use_lock(%rl_opp, Release, 1)
+      aie.next_bd ^ro
+    ^rd:
+      %m1 = aie.dma_start(MM2S, {_mm2s_dbg}, ^rdo, ^re)
+    ^rdo:
+      aie.use_lock(%rl_dpc, AcquireGreaterEqual, 1)
+      aie.dma_bd(%rl_A : memref<{E}xbf16>, 0, {E})
+      aie.use_lock(%rl_dpp, Release, 1)
+      aie.next_bd ^rdo
+    ^re:
+      aie.end
+    }}""")
+        else:
+            _lock_decls = '\n'.join([_ld('p0', _h0), _ld('p1', _h1), _ld('op', _oo)])
+            _dump_core_wait = ""
+            _dump_core_fire = ""
+            _dump_mem = (
+                f"""    ^rm0:
+      %m0 = aie.dma_start(MM2S, {_mm2s}, ^ro, ^re)
+    ^ro:
+      aie.use_lock(%rl_opc, AcquireGreaterEqual, 1)
+      aie.dma_bd_packet(0, 0)
+      aie.dma_bd(%rl_A : memref<{E}xbf16>, 0, {E})
+      aie.use_lock(%rl_opp, Release, 1)
+      aie.next_bd ^ro
+    ^re:
+      aie.end
+    }}""")
         return f"""
     %rl_A = aie.buffer(%rl) {{sym_name = "rl_A"}} : memref<{E}xbf16>
     {_lock_decls}
@@ -1101,9 +1178,11 @@ class OFold8F3BestEmitter:
         aie.use_lock(%rl_p0c, AcquireGreaterEqual, 1)
         aie.use_lock(%rl_p1c, AcquireGreaterEqual, 1)
         aie.use_lock(%rl_opp, AcquireGreaterEqual, 1)
+{_dump_core_wait}
         aie.use_lock(%rl_p0p, Release, 1)
         aie.use_lock(%rl_p1p, Release, 1)
         aie.use_lock(%rl_opc, Release, 1)
+{_dump_core_fire}
       }}
       aie.end
     }}
@@ -1121,20 +1200,10 @@ class OFold8F3BestEmitter:
       aie.dma_bd(%rl_A : memref<{E}xbf16>, {E2}, {E2})
       aie.use_lock(%rl_p1c, Release, 1)
       aie.next_bd ^rh1
-    ^rm0:
-      %m0 = aie.dma_start(MM2S, {_mm2s}, ^ro, ^re)
-    ^ro:
-      aie.use_lock(%rl_opc, AcquireGreaterEqual, 1)
-      aie.dma_bd_packet(0, 0)
-      aie.dma_bd(%rl_A : memref<{E}xbf16>, 0, {E})
-      aie.use_lock(%rl_opp, Release, 1)
-      aie.next_bd ^ro
-    ^re:
-      aie.end
-    }}"""
+{_dump_mem}"""
 
     def _op_block(self):
-        """op tile: O-relay — concat O_h0..3 + O_h4..7 -> nm."""
+        """op tile: O-relay - concat O_h0..3 + O_h4..7 -> nm."""
         E = self.E; E2 = E // 2
         L = _LockAlloc('core'); D = _DmaAlloc('core')
         _h0 = L.pair('p0'); _h1 = L.pair('p1'); _oo = L.pair('op')
@@ -1289,7 +1358,7 @@ class OFold8F3BestEmitter:
       %nx = arith.constant {XB} : i32
       %ne = arith.constant {E} : i32
       scf.for %it = %z to %N step %one {{
-        // NOTE: F3BEST_RL_FIX is OFF in production — this RL_FIX branch is dead.
+        // NOTE: F3BEST_RL_FIX is OFF in production - this RL_FIX branch is dead.
         // The non-RL_FIX mux below (L1340+) is what ships; its lock protocol is
         // already a clean acquire mx_op / release mx_oc ping-pong on all 3 phases.
         aie.use_lock(%mx_xc, AcquireGreaterEqual, 1)
@@ -1416,7 +1485,7 @@ class OFold8F3BestEmitter:
     }}"""
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  emit_mlir — assemble complete MLIR text
+    #  emit_mlir - assemble complete MLIR text
     # ═══════════════════════════════════════════════════════════════════════
 
     def emit_mlir(self):
@@ -1437,9 +1506,10 @@ class OFold8F3BestEmitter:
         shim_decls = "".join(f"    %sh{h} = aie.tile({h}, 0)\n" for h in range(NH))
 
         # kernel function declarations (parametric buffer sizes)
-        PK = self.PACKED; XB = self.XB; QSZ = self.Q_SZ; OSZ = self.O_SZ
+        # Types must match the buffer ALLOCATION, so use the padded sizes.
+        PK = self.PACKED; XB = self.XB; QSZ = self.Q_SZ_ALLOC; OSZ = self.O_SZ
         PSZ = self.P_SZ; HP = self.HPER; UNI = self.UNI_SZ; E = self.E
-        KCH = self.KCH; ITC = self.ITC; PT = self.PER_TILE
+        KCH = self.KCH; ITC = self.ITC_ALLOC; PT = self.PER_TILE
         funcs = (
             f'    func.func private @fused_dequant_matvec_v2_bf16(i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{QSZ}xbf16>) attributes {{link_with = "fused_dequant_gemv_v2_signed_{self.E}k_g32.o"}}\n'
             f'    func.func private @rope_bundled(memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) attributes {{link_with = "{self.ROPE_LIB}"}}\n'
@@ -1584,6 +1654,8 @@ class OFold8F3BestEmitter:
         rt.append("".join(f"      aiex.dma_await_task(%tp{h})\n" for h in range(NH)).rstrip()
                   + "\n      aiex.dma_await_task(%ts)")
         rt_body = "\n".join(rt) + "\n"
+        # #245: in ATTN_DUMP mode arg3 (Wo-placeholder) is the tap destination, so
+        # declare it xbf16 (WO_BYTES/2 elems) to match the S2MM BD element count.
         rt_args = (f"%arg0: memref<{P_TY}>, %arg1: memref<{self.XR_ELEMS}xbf16>, %arg2: memref<{WT_TY}>, "
                    f"%arg3: memref<{self.WO_BYTES}xi8>, %arg4: memref<{KV_TY}>")
 
