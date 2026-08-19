@@ -238,6 +238,15 @@ class OFold8F3BestEmitter:
         # re-pointed at Qd, so the per-head Q lands in the host-visible s-region of
         # the output BO (the O output is displaced for this diagnostic build).
         self.QDUMP = _os.environ.get('F3BEST_QDUMP', '').strip() != ''
+        # #259 SDUMP: dump per-position Q·K scores from the score tile's %It
+        # buffer to host via the SAME proven @S_alloc S2MM shim that QDUMP uses
+        # (single-shot host task — zero AIE2P runtime risk, unlike #245 tap).
+        # After flowkv_score_chunk_bf16 fills %It, copy It→Sd; the ^ohm S2MM BD
+        # (which QDUMP re-points at %Qd) is here re-pointed at %Sd. The value
+        # tile still receives %It via the ^io MM2S BD — attention computes
+        # normally AND scores reach host. Diagnostic-only build (cache key
+        # _sdump suffix). Reuses layer_fused_dump_q_bf16 (generic memcpy).
+        self.SDUMP = _os.environ.get('F3BEST_SDUMP', '').strip() != ''
         # #211 B0 dump: after phase1 (B0=x_bundle consumed), memcpy B0 -> P and
         # drain P via the existing Pf0 MM2S to the shim s-region. Lets the host
         # read the CONTENTS of B0 as delivered by the mux->center flow, to confirm
@@ -692,7 +701,17 @@ class OFold8F3BestEmitter:
         _mm2s_oh  = D.mm2s('oh')   # Oh relay to join
 
         _ld = lambda name, ids: _LockAlloc.mlir_decl(f'sc{h}', f'{p}', name, *ids)
-        if self.QDUMP:
+        if self.SDUMP:
+            # #259 score dump: one extra lock pair gates the Sd relay buffer (the
+            # score tile has 16/16 locks with 5 pairs used -> 3 pairs headroom; no
+            # extra DMA channel — the ^ohm S2MM BD is re-pointed at Sd, like QDUMP
+            # re-points it at Qd). @S_alloc proven single-shot, zero runtime risk.
+            _sd = L.pair('Sd')
+            _lock_decls = '\n'.join([
+                _ld('Q', _q), _ld('K', _k), _ld('I', _i),
+                _ld('Oh', _oh), _ld('Ohd', _ohd), _ld('Sd', _sd),
+            ])
+        elif self.QDUMP:
             # #188 Q dump: one extra lock pair gates the Qd relay buffer (the score
             # tile has 16/16 locks with 5 pairs used -> 3 pairs headroom; no extra
             # DMA channel is allocated - the O_h relay MM2S1 is re-pointed at Qd).
@@ -706,6 +725,88 @@ class OFold8F3BestEmitter:
                 _ld('Q', _q), _ld('K', _k), _ld('I', _i),
                 _ld('Oh', _oh), _ld('Ohd', _ohd),
             ])
+
+        if self.SDUMP:
+            # #259 score-dump variant: after each score_chunk fills %It, copy It→Sd
+            # and gate the ^ohm S2MM relay on Sd (instead of Oh). The value tile
+            # still receives %It via the ^io MM2S BD — attention computes normally
+            # AND per-chunk Q·K scores reach host via @S_alloc. Ohc/Ohp cycled so
+            # S2MM0-BD1 (core O) never stalls; its data is discarded.
+            return f"""
+    %{p}_Qs = aie.buffer(%sc{h}) {{sym_name = "{p}_Qs"}} : memref<{QSZ}xbf16>
+    %{p}_K  = aie.buffer(%sc{h}) {{sym_name = "{p}_K"}}  : memref<{KCH}xbf16>
+    %{p}_It = aie.buffer(%sc{h}) {{sym_name = "{p}_It"}} : memref<{ITC}xbf16>
+    %{p}_Oh = aie.buffer(%sc{h}) {{sym_name = "{p}_Oh"}} : memref<{PT}xbf16>
+    %{p}_Sd = aie.buffer(%sc{h}) {{sym_name = "{p}_Sd"}} : memref<{ITC}xbf16>
+    {_lock_decls}
+    %core_sc{h} = aie.core(%sc{h}) {{
+      %c0 = arith.constant 0 : index
+      %cN = arith.constant 9223372036854775807 : index
+      %c1 = arith.constant 1 : index
+      %ag = arith.constant {self.AG} : i32
+      %hd = arith.constant {self.HD} : i32
+      %cnc = arith.constant {NC} : index
+      %sC = arith.constant {CH} : i32
+      %citc = arith.constant {ITC} : i32
+      scf.for %tok = %c0 to %cN step %c1 {{
+        func.call @flowkv_score_init_bf16(%ag) : (i32) -> ()
+        aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
+        func.call @flowkv_score_rope_q_bf16(%{p}_Qs, %ag, %hd) : (memref<{QSZ}xbf16>, i32, i32) -> ()
+        scf.for %ci = %c0 to %cnc step %c1 {{
+          aie.use_lock(%{p}_Kc, AcquireGreaterEqual, 1)
+          aie.use_lock(%{p}_Ip, AcquireGreaterEqual, 1)
+          func.call @flowkv_score_chunk_bf16(%{p}_Qs, %{p}_K, %{p}_It, %ag, %hd, %sC) : (memref<{QSZ}xbf16>, memref<{KCH}xbf16>, memref<{ITC}xbf16>, i32, i32, i32) -> ()
+          // #259: relay the per-chunk Q·K scores (It) to host via @S_alloc (the
+          // ^ohm S2MM BD re-pointed at Sd). Compute is the producer of Sd.
+          aie.use_lock(%{p}_Sdp, AcquireGreaterEqual, 1)
+          func.call @layer_fused_dump_q_bf16(%{p}_It, %{p}_Sd, %citc) : (memref<{ITC}xbf16>, memref<{ITC}xbf16>, i32) -> ()
+          aie.use_lock(%{p}_Sdc, Release, 1)
+          aie.use_lock(%{p}_Kp, Release, 1)
+          aie.use_lock(%{p}_Ic, Release, 1)
+        }}
+        aie.use_lock(%{p}_Qp, Release, 1)
+        // cycle the dead O_h buffer so the incoming core O (S2MM0-BD1) never stalls
+        aie.use_lock(%{p}_Ohc, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Ohp, Release, 1)
+      }}
+      aie.end
+    }}
+    %mem_sc{h} = aie.mem(%sc{h}) {{
+      %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
+    ^q{h}:
+      aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZL})
+      aie.use_lock(%{p}_Qc, Release, 1)
+      aie.next_bd ^oh{h}
+    ^oh{h}:
+      aie.use_lock(%{p}_Ohp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Oh : memref<{PT}xbf16>, 0, {PT})
+      aie.use_lock(%{p}_Ohc, Release, 1)
+      aie.next_bd ^q{h}
+    ^ks{h}:
+      %s1 = aie.dma_start(S2MM, {_s2mm_kv}, ^k{h}, ^im{h})
+    ^k{h}:
+      aie.use_lock(%{p}_Kp, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_K : memref<{KCH}xbf16>, 0, {KCH})
+      aie.use_lock(%{p}_Kc, Release, 1)
+      aie.next_bd ^k{h}
+    ^im{h}:
+      %m0 = aie.dma_start(MM2S, {_mm2s_out}, ^io{h}, ^ohm{h})
+    ^io{h}:
+      aie.use_lock(%{p}_Ic, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_It : memref<{ITC}xbf16>, 0, {ITCL})
+      aie.use_lock(%{p}_Ip, Release, 1)
+      aie.next_bd ^io{h}
+    ^ohm{h}:
+      %m1 = aie.dma_start(MM2S, {_mm2s_oh}, ^ohf{h}, ^e{h})
+    ^ohf{h}:
+      aie.use_lock(%{p}_Sdc, AcquireGreaterEqual, 1)
+      aie.dma_bd(%{p}_Sd : memref<{ITC}xbf16>, 0, {ITCL})
+      aie.use_lock(%{p}_Sdp, Release, 1)
+      aie.next_bd ^ohf{h}
+    ^e{h}:
+      aie.end
+    }}"""
 
         if self.QDUMP:
             # #188 Q-dump variant: after rope, copy the received roped-Q (PT) into
@@ -1286,6 +1387,10 @@ class OFold8F3BestEmitter:
         aie.use_lock(%nm_Gc, AcquireGreaterEqual, 1)
         aie.use_lock(%nm_Fp, AcquireGreaterEqual, 1)
         aie.use_lock(%nm_FNp, AcquireGreaterEqual, 1)
+        // #242: in QDUMP mode, add_bf16 still runs but resid (nm_R) is host-zeroed,
+        // so F = O(Q) + 0 = Q (clean, no resid corruption). The host zeros nm_R via
+        // the XR bundle resid region when QDUMP is active. This keeps the s-region
+        // = Q exactly (bf16, but without the bf16(Q+R)-minus-R precision loss).
         func.call @layer_fused_add_bf16(%nm_O, %nm_R, %nm_F, %ne) : (memref<{E}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) -> ()
         func.call @layer_fused_rms_norm2_bf16(%nm_F, %nm_gain, %nm_FN, %ne) : (memref<{XB}xbf16>, memref<{E}xbf16>, memref<{XB}xbf16>, i32) -> ()
         aie.use_lock(%nm_Op, Release, 1)
@@ -1530,8 +1635,11 @@ class OFold8F3BestEmitter:
             f'    func.func private @flowkv_value_init_bf16(i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_value_accum_bf16(memref<{ITC}xbf16>, memref<{KCH}xbf16>, i32, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
             f'    func.func private @flowkv_value_normalize_bf16(memref<{PT}xbf16>, i32, i32) attributes {{link_with = "{self.FLOWKV_LIB}"}}\n'
-            + (f'    func.func private @layer_fused_dump_q_bf16(memref<{QSZ}xbf16>, memref<{PT}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
-               if self.QDUMP else ''))
+            + (f'    func.func private @layer_fused_dump_q_bf16(memref<{ITC}xbf16>, memref<{ITC}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+               if self.SDUMP else
+               (f'    func.func private @layer_fused_dump_q_bf16(memref<{QSZ}xbf16>, memref<{PT}xbf16>, i32) attributes {{link_with = "{self.RELAY_LIB}"}}\n'
+                if self.QDUMP else ''))
+        )
 
         # flows
         flows = []
