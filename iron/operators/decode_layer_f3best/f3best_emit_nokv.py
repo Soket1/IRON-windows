@@ -1676,10 +1676,12 @@ class OFold8F3BestEmitter:
         flows = []
         flows.append("    aie.flow(%sh0, DMA : 1, %mx, DMA : 0)   // x_bundle -> mux S2MM0")
         if self.AIE_TRACE:
-            # #260: trace only 1 score tile (sc0) — let the auto-router find a
-            # free path. Explicit packet_flow caused port conflicts (South:2
-            # busy); with 1 tile the auto-router has more freedom.
-            flows.append(f"    aie.flow(%sc0, Trace : 0, %sh7, DMA : 0)   // trace sc0 -> sh7")
+            # #260: cascade trace through score tiles to ONE shim (avoids 8
+            # parallel trace lines exhausting shim port-slots). Windows x86
+            # simulator doesn't model stalls, so this must work on hardware —
+            # route sc0 Trace:0 -> sc1 (neighbour) -> sh7 DMA (free shim with
+            # East/West transits available per North:0/South:2 only occupied).
+            flows.append(f"    aie.flow(%sc1, Trace : 0, %sh7, DMA : 1)   // trace sc1 -> sh7 S2MM1")
         if self.RL_FIX:
             flows.append("    aie.packet_flow(0) { aie.packet_source<%jA, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // attnA -> mux S2MM1")
             flows.append("    aie.packet_flow(1) { aie.packet_source<%nm, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // ffn_in -> mux S2MM1")
@@ -1743,9 +1745,10 @@ class OFold8F3BestEmitter:
         shim_allocs += "    aie.shim_dma_allocation @Vhi_alloc(%sh6, MM2S, 1)\n"
         shim_allocs += "    aie.shim_dma_allocation @S_alloc(%sh4, S2MM, 1)\n"
         if self.AIE_TRACE:
-            # #260: dedicated trace-destination shim. sh7 is free unless
-            # ATTN_DUMP (which uses sh7 S2MM1); use sh7 S2MM0 for trace.
-            shim_allocs += "    aie.shim_dma_allocation @T_alloc(%sh7, S2MM, 0)\n"
+            # #260: dedicated trace-destination shim. sh7 S2MM ch1 is free
+            # (ATTN_DUMP uses it only when enabled; production SDUMP doesn't).
+            # sh7 DMA:1 is the working route — DMA:0 collides (South:2 busy).
+            shim_allocs += "    aie.shim_dma_allocation @T_alloc(%sh7, S2MM, 1)\n"
         if self.ATTN_DUMP:
             shim_allocs += "    aie.shim_dma_allocation @ATN_alloc(%sh7, S2MM, 1)\n"
         shim_allocs += "".join(
@@ -1827,7 +1830,7 @@ class OFold8F3BestEmitter:
 
         # Build MLIR sections
         centers = "".join(self._center(h) for h in range(NH))
-        scores = "".join(self._score(h) + (self._score_trace_ops(h) if h == 0 else '') for h in range(NH))
+        scores = "".join(self._score(h) + (self._score_trace_ops(h) if h == 1 else '') for h in range(NH))
         values = "".join(self._value(h) for h in range(NH))
         if self.RL_FIX:
             joins = (self._join_memtile('jA', 'jA', with_weight_relay=(0 in self.RELAY_COLS), packet_id=0)
