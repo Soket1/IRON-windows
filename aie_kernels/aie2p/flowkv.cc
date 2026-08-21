@@ -253,14 +253,35 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
             // The loop is compile-time bounded (HEAD_DIM / 32) so the AIE
             // compiler can fully unroll without runtime loop overhead.
             // For HEAD_DIM=64: 2 chunks; 128: 4 chunks; 256: 8 chunks.
-            aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
             constexpr int n_chunks = HEAD_DIM / 32;
+#ifdef FLOWKV_DOT_MULINIT
+            // #267i CANDIDATE FOR #187, REFUTED BY MEASUREMENT. Kept as an
+            // opt-in A/B arm only. The theory was that with n_chunks == 4 under
+            // unroll(full) the zeros() seeding `acc` is hoisted out of the pos
+            // loop, so the first position of each new head inherits the previous
+            // head's live accumulator; seeding from the c == 0 PRODUCT leaves no
+            // initialization to hoist while computing the identical sum. A/B on
+            // a genuinely new xclbin left post_attention unchanged
+            // (0.630/0.722/0.923 vs baseline 0.619/0.691/0.847), and #267k later
+            // measured the raw scores CORRECT in every head, so the dot product
+            // was never the defect -- see the exp2 note below for the real root.
+            aie::accum<accfloat, 32> acc =
+                aie::mul(aie::load_v<32>(q_head), aie::load_v<32>(k_pos));
+            #pragma clang loop unroll(full)
+            for (int c = 1; c < n_chunks; c++) {
+                auto qv = aie::load_v<32>(q_head + c * 32);
+                auto kv = aie::load_v<32>(k_pos  + c * 32);
+                acc = aie::mac(acc, qv, kv);
+            }
+#else
+            aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
             #pragma clang loop unroll(full)
             for (int c = 0; c < n_chunks; c++) {
                 auto qv = aie::load_v<32>(q_head + c * 32);
                 auto kv = aie::load_v<32>(k_pos  + c * 32);
                 acc = aie::mac(acc, qv, kv);
             }
+#endif
 
 #ifdef FLOWKV_SCORE_NOREDUCE
             // PROBE (latency-only, WRONG answer): skip the horizontal reduce_add
@@ -299,7 +320,24 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         bfloat16 l_new_bf16 = static_cast<bfloat16>(c_correction * l_old);
 
         // Compute exp2 for each score position.
-#ifdef FLOWKV_VEC_EXP
+        //
+        // #187 / #267k-n (AIE2P codegen defect, HEAD_DIM=128): the 16-wide
+        // block form below is CORRECT AT HEAD_DIM=64 and BROKEN AT HEAD_DIM=128.
+        // Measured: with FLOWKV_NOEXP the raw scores agree with CPU in every
+        // q-head (rel_l2 0.003-0.008, pos 0 included), so the dot product, the
+        // Q/K delivery, the prescale and the score store are all correct -- yet
+        // the FLOWKV_VEC_EXP build reads exactly 0.0 at pos 0 of every q-head
+        // h >= 1 and post_attention degrades to 0.62-0.92. Dropping the block
+        // loop for the scalar form below repairs the score region completely
+        // (all heads 0.0002-0.022, no drop-one candidate) and cuts
+        // post_attention to 0.04-0.33. Two attempts to keep the vectorization
+        // by removing the tmp_in staging buffer (16-wide load straight out of
+        // scores_bf16, 32-byte aligned, tail padded to a 16-multiple so the
+        // load is unconditional and in bounds) both produce entirely non-finite
+        // output, so the defect is the vector load of this stack array itself,
+        // not the staging buffer. Hence the selection is by head_dim, made on
+        // the host: FLOWKV_VEC_EXP for 64, scalar otherwise.
+#if defined(FLOWKV_VEC_EXP)
         aie::vector<float, 16> m_new_vec = aie::broadcast<float, 16>(m_new);
         aie::vector<float, 16> log2e_vec = aie::broadcast<float, 16>(1.4453125f);
 
@@ -328,9 +366,8 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
             }
         }
 #else
-        // Scalar form broadcasts one score per vector exp2. Kept as the default
-        // fallback for probes because some AIE2P codegen versions are sensitive
-        // to local vector spill buffers in this loop.
+        // Scalar form broadcasts one score per vector exp2. This is the correct
+        // path at HEAD_DIM=128 (see the note above) and the default there.
         for (int pos = 0; pos < eff_chunk; pos++) {
 #ifdef FLOWKV_NOEXP
             // PROBE (latency-only, WRONG): skip per-position exp2.

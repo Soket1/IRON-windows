@@ -288,8 +288,8 @@ class OFold8F3BestEmitter:
       aie.trace.event<"PORT_STALLED_2">
       aie.trace.event<"INSTR_LOCK_ACQUIRE_REQ">
       aie.trace.event<"NONE">
-      aie.trace.start broadcast=15
-      aie.trace.stop broadcast=14
+      aie.trace.start event = <"TRUE">
+      aie.trace.stop event = <"NONE">
     }}"""
 
     def _compute_l1_budget(self):
@@ -1711,7 +1711,8 @@ class OFold8F3BestEmitter:
             flows.append(f"    aie.flow(%t{h}, DMA : 0, %sh{h}, DMA : 0)   // Pf{h} -> drain (circuit)")
             flows.append(f"    aie.flow(%t{h}, DMA : 1, %sc{h}, DMA : 0)   // [Qi,O_h]{h} 2-BD -> score{h} (circuit)")
             flows.append(f"    aie.flow(%sc{h}, DMA : 0, %va{h}, DMA : 0)   // inter{h} -> value{h}")
-            flows.append(f"    aie.flow(%sc{h}, DMA : 1, %{oj}, DMA : {osl})   // O_h{h} relayed by score -> {oj}[{osl}]")
+            if not self.SDUMP:
+                flows.append(f"    aie.flow(%sc{h}, DMA : 1, %{oj}, DMA : {osl})   // O_h{h} relayed by score -> {oj}[{osl}]")
         flows.append("    aie.flow(%sh3, DMA : 1, %Klo, DMA : 0)   // K_lo -> Klo split")
         flows.append("    aie.flow(%sh4, DMA : 1, %Khi, DMA : 0)   // K_hi -> Khi split")
         flows.append("    aie.flow(%sh5, DMA : 1, %Vlo, DMA : 0)   // V_lo -> Vlo split")
@@ -1731,7 +1732,10 @@ class OFold8F3BestEmitter:
         flows.append("    aie.flow(%oK, DMA : 0, %op, DMA : 1)   // O Half1 -> orelay")
         flows.append("    aie.flow(%op, DMA : 0, %nm, DMA : 0)   // O -> ANM")
         flows.append("    aie.flow(%sh2, DMA : 1, %nm, DMA : 1)   // resid+gain -> ANM (2-BD on S2MM1)")
-        flows.append("    aie.flow(%nm, DMA : 1, %sh4, DMA : 1)   // s = O+resid (attn-residual) -> arg0 tail")
+        if self.SDUMP:
+            flows.append("    aie.flow(%sc0, DMA : 1, %sh4, DMA : 1)   // SDUMP: sc0 scores -> @S_alloc (host reads scores)")
+        else:
+            flows.append("    aie.flow(%nm, DMA : 1, %sh4, DMA : 1)   // s = O+resid (attn-residual) -> arg0 tail")
         if self.ATTN_DUMP:
             flows.append("    aie.flow(%rl, DMA : 1, %sh7, DMA : 1)   // attn_out tap (ATTN_DUMP) -> sh7 S2MM1")
         flows_txt = "\n".join(flows) + "\n"
@@ -1764,6 +1768,7 @@ class OFold8F3BestEmitter:
         rt = []
         if self.AIE_TRACE:
             rt.append(f"""      aie.trace.host_config buffer_size=65536 arg_idx=6
+      aie.trace.start_config @trace_sc1
 """)
         rt.append(f"""      %tx = aiex.dma_configure_task_for @X_alloc {{
         aie.dma_bd(%arg1 : memref<{self.XR_ELEMS}xbf16>, 0, {XB}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {XB}, stride = 1>]) {{burst_length = 0 : i32}}
@@ -1811,6 +1816,12 @@ class OFold8F3BestEmitter:
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%ts)""")
+        if self.AIE_TRACE:
+            rt.append(f"""      %ttr = aiex.dma_configure_task_for @T_alloc {{
+        aie.dma_bd(%arg3 : memref<65536xi8>, 0, 65536, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = 65536, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.end
+      }} {{issue_token = true}}
+      aiex.dma_start_task(%ttr)""")
         if self.ATTN_DUMP:
             # #245: single-shot shim S2MM task capturing rl_A (pre-O-proj attn_out)
             # from sh7 into arg0 (output BO) at offset (NH+1)*E. One dispatch = one
@@ -1825,8 +1836,9 @@ class OFold8F3BestEmitter:
         rt.append("".join(f"      aiex.dma_await_task(%tp{h})\n" for h in range(NH)).rstrip()
                   + "\n      aiex.dma_await_task(%ts)" + _await_extra)
         rt_body = "\n".join(rt) + "\n"
+        _wo_ty = "65536xi8" if self.AIE_TRACE else f"{self.WO_BYTES}xi8"
         rt_args = (f"%arg0: memref<{P_TY}>, %arg1: memref<{self.XR_ELEMS}xbf16>, %arg2: memref<{WT_TY}>, "
-                   f"%arg3: memref<{self.WO_BYTES}xi8>, %arg4: memref<{KV_TY}>")
+                   f"%arg3: memref<{_wo_ty}>, %arg4: memref<{KV_TY}>")
 
         # Build MLIR sections
         centers = "".join(self._center(h) for h in range(NH))

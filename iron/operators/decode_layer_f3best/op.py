@@ -101,11 +101,54 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         # must participate in the cache key.
         _uni = _os.environ.get('F3BEST_UNI_SZ', '128')
         _uni_sfx = '' if _uni == '128' else f'_u{_uni}'
+        # #266 A/B: the value tile's register-resident AMAC accumulator vs the
+        # memory-resident reference (flowkv.cc claims the two are bit-identical,
+        # so a numeric difference isolates a codegen defect rather than a math
+        # change). The chosen macro lands in the FlowKV object fingerprint, so it
+        # propagates into the outer xclbin name via flowkv_obj_tag -- keep the
+        # native mirror in ggml-xdna.cpp's f3best cache key in sync.
+        _value_impl = ("-DFLOWKV_VALUE_LEGACY=1"
+                       if _os.environ.get('F3BEST_VALUE_LEGACY', '').strip() != ''
+                       else "-DFLOWKV_VALUE_AMAC=1")
+        # #267i A/B: seed the score dot product from the c == 0 product instead of
+        # aie::zeros(), removing the hoistable accumulator init at HEAD_DIM=128.
+        # Keep the native mirror in ggml-xdna.cpp's cache key in sync.
+        _dot_init = (("-DFLOWKV_DOT_MULINIT=1",)
+                     if _os.environ.get('F3BEST_DOT_MULINIT', '').strip() != ''
+                     else ())
+        # #267k RAW-SCORE build: replace the vector exp2 with FLOWKV_NOEXP, so the
+        # score tile relays scores_bf16[pos] verbatim. Only for the SDUMP
+        # measurement -- the softmax is gone, so attention output is meaningless
+        # (SDUMP already severs the output path, #266). This is the only score
+        # comparison free of both the sparsity artifact and the running-max
+        # coupling. Keep the native mirror in ggml-xdna.cpp's cache key in sync.
+        #
+        # #267l/n PRODUCTION SELECTION BY HEAD_DIM. The 16-wide block exp2 loop
+        # (FLOWKV_VEC_EXP) is the ROOT of #187: it is correct at HEAD_DIM=64 and
+        # broken at HEAD_DIM=128, where it reads exactly 0.0 at pos 0 of every
+        # q-head h >= 1 even though #267k measured the RAW scores correct in all
+        # heads (rel_l2 0.003-0.008). Dropping it for the scalar exp2 repairs the
+        # score region completely (all heads 0.0002-0.022, no drop-one candidate)
+        # and cuts post_attention from 0.62/0.69/0.85 to 0.33/0.14/0.20. Two
+        # attempts to keep the vectorization while removing the tmp_in staging
+        # buffer both produced entirely non-finite output, so the defect is the
+        # vector load of the stack score array itself. Hence: vectorized at 64,
+        # scalar elsewhere. F3BEST_SCALAR_EXP / F3BEST_VEC_EXP force either arm
+        # for A/B. Keep the native mirror in ggml-xdna.cpp's cache key in sync.
+        if _os.environ.get('F3BEST_RAWSCORE', '').strip() != '':
+            _exp_impl = ("-DFLOWKV_NOEXP=1",)
+        elif _os.environ.get('F3BEST_SCALAR_EXP', '').strip() != '':
+            _exp_impl = ()
+        elif _os.environ.get('F3BEST_VEC_EXP', '').strip() != '':
+            _exp_impl = ("-DFLOWKV_VEC_EXP=1",)
+        elif self.head_dim == 64:
+            _exp_impl = ("-DFLOWKV_VEC_EXP=1",)
+        else:
+            _exp_impl = ()
         flowkv_tuning = (
             "-DFLOWKV_PRESCALE_Q=1",
-            "-DFLOWKV_VEC_EXP=1",
-            "-DFLOWKV_VALUE_AMAC=1",
-        )
+            _value_impl,
+        ) + _exp_impl + _dot_init
         flowkv_obj_name = flowkv_kernel_object_name(
             self.head_dim, self.attn_group, self.seq_len, flowkv_tuning
         )
