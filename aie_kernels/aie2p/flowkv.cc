@@ -264,7 +264,7 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
                 aie::vector<float, 32> q_f32 = q_acc.to_vector<float>();
                 aie::vector<float, 32> q_scaled = aie::mul(q_f32, aie::broadcast<float, 32>(HEAD_DIM_INV_SQRT));
                 aie::accum<accfloat, 32> q_scaled_acc(q_scaled);
-                auto qv = q_scaled_acc;
+                auto qv = q_scaled_acc.to_vector<bfloat16>();
 #else
                 auto qv = aie::load_v<32>(q_head_base + c * 32);
 #endif
@@ -280,7 +280,7 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
                 aie::vector<float, 32> q_f32 = q_acc.to_vector<float>();
                 aie::vector<float, 32> q_scaled = aie::mul(q_f32, aie::broadcast<float, 32>(HEAD_DIM_INV_SQRT));
                 aie::accum<accfloat, 32> q_scaled_acc(q_scaled);
-                auto qv = q_scaled_acc;
+                auto qv = q_scaled_acc.to_vector<bfloat16>();
 #else
                 auto qv = aie::load_v<32>(q_head_base + c * 32);
 #endif

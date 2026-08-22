@@ -33,6 +33,9 @@ _ALLOWED_TUNING_MACROS = frozenset({
     # hoistable aie::zeros(), so no accumulator initialization survives the
     # unroll at HEAD_DIM=128 (n_chunks=4). Correctness A/B for #187.
     "FLOWKV_DOT_MULINIT",
+    # #268: read Q directly from q_in in flowkv_score_chunk_bf16 instead of
+    # static rotated_q buffer, fixing stale Q in 2-chunk mode.
+    "FLOWKV_Q_IN_DIRECT",
 })
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _VALUE_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")

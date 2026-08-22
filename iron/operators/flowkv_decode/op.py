@@ -153,7 +153,6 @@ class AIEFlowKVDecode(AIEOperatorBase):
                 2,
                 2,
                 3,
-                self.kernel_obj_name,
             ],
         )
 
