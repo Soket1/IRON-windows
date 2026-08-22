@@ -1073,7 +1073,8 @@ def _find_tool(name, peano_dir, mlir_aie_dir):
 
 
 class PeanoCompilationRule(CompilationRule):
-    def __init__(self, peano_dir, mlir_aie_dir, *args, **kwargs):
+    def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
+        self.build_dir = build_dir
         self.peano_dir = peano_dir
         self.mlir_aie_dir = mlir_aie_dir
         # Locate libc++ headers from pip-installed llvm-aie (needed on Windows
@@ -1181,7 +1182,7 @@ class PeanoCompilationRule(CompilationRule):
                 + ["-c", source_file.filename, "-o", artifact.filename]
             )
 
-            commands.append(ShellCompilationCommand(cmd))
+            commands.append(ShellCompilationCommand(cmd, cwd=str(self.build_dir)))
             if artifact.rename_symbols:
                 commands.extend(self._rename_symbols(artifact))
             if artifact.prefix_symbols:
@@ -1204,7 +1205,7 @@ class PeanoCompilationRule(CompilationRule):
                 f"{old_sym}={new_sym}",
             ]
         cmd += [artifact.filename]
-        return [ShellCompilationCommand(cmd)]
+        return [ShellCompilationCommand(cmd, cwd=str(self.build_dir))]
 
     def _prefix_symbols(self, artifact, prefix):
         objcopy_path = self._find_tool("llvm-objcopy")
@@ -1246,13 +1247,14 @@ class PeanoCompilationRule(CompilationRule):
             artifact.filename,
         ]
 
-        return [nm_cmd, ShellCompilationCommand(objcopy_cmd)]
+        return [nm_cmd, ShellCompilationCommand(objcopy_cmd, cwd=str(self.build_dir))]
 
 
 class ArchiveCompilationRule(CompilationRule):
     """Bundle KernelObjectArtifacts into a static archive (.a)."""
 
-    def __init__(self, peano_dir, mlir_aie_dir, *args, **kwargs):
+    def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
+        self.build_dir = build_dir
         self.peano_dir = peano_dir
         self.mlir_aie_dir = mlir_aie_dir
         super().__init__(*args, **kwargs)
@@ -1271,6 +1273,6 @@ class ArchiveCompilationRule(CompilationRule):
                 if isinstance(dep, KernelObjectArtifact)
             ]
             cmd = [str(ar_path), "rcs", artifact.filename] + object_files
-            commands.append(ShellCompilationCommand(cmd))
+            commands.append(ShellCompilationCommand(cmd, cwd=str(self.build_dir)))
             artifact.available = True
         return commands

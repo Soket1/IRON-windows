@@ -137,8 +137,8 @@ class AIEContext:
         return [
             comp.FusePythonGeneratedMLIRCompilationRule(),
             comp.GenerateMLIRFromPythonCompilationRule(),
-            comp.PeanoCompilationRule(peano_dir, mlir_aie_dir),
-            comp.ArchiveCompilationRule(peano_dir, mlir_aie_dir),
+            comp.PeanoCompilationRule(self.build_dir, peano_dir, mlir_aie_dir),
+            comp.ArchiveCompilationRule(self.build_dir, peano_dir, mlir_aie_dir),
             comp.AieccXclbinInstsCompilationRule(
                 self.build_dir, peano_dir, mlir_aie_dir
             ),
