@@ -39,9 +39,6 @@
 static float score_running_max[4] __attribute__((aligned(64)));
 static float score_running_sum[4] __attribute__((aligned(64)));
 
-// RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk)
-static bfloat16 rotated_q[4 * 64] __attribute__((aligned(64)));
-
 // Actual sequence length (number of filled KV positions).
 // Read from Q buffer element [num_q_heads*head_dim + head_dim] = angles[64].
 // The host encodes this as bf16 before dispatch.
@@ -82,9 +79,11 @@ void flowkv_score_init_bf16(int32_t num_q_heads)
     }
 }
 
-// Copy Q heads into static buffer. The host already provides post-RoPE Q
-// (the ggml ROPE node runs before FlowKV dispatch), so no rotation needed.
-// Also reads actual_seq_len from the angles region of the Q buffer.
+// Read actual_seq_len from Q buffer and reset chunk counter.
+// The host already provides post-RoPE Q (the ggml ROPE node runs before
+// FlowKV dispatch), so no rotation needed. Q is read directly from the
+// DMA buffer (q_in) in flowkv_score_chunk_bf16, eliminating the static
+// rotated_q buffer that caused stale Q in 2-chunk mode (#268).
 //
 // Q buffer layout: [Q_heads (gs * hd) | angles (hd) | actual_seq_len (1)]
 // angles region is unused for rotation but actual_seq_len is read from
@@ -101,25 +100,14 @@ void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_hea
     // Reset chunk counter for this attention computation.
     *(volatile int32_t *)&g_actual_seq_len; // force re-read (compiler barrier)
     g_score_chunk_counter = 0;
-
-    // Q is already post-RoPE — just copy into the static rotated_q buffer.
-    // No rotation applied. The angles region is skipped (not needed).
-    for (int h = 0; h < num_q_heads; h++) {
-        const bfloat16 *q_head = q_in + h * head_dim;
-        bfloat16 *out_head = rotated_q + h * head_dim;
-
-        for (int v = 0; v < head_dim; v += 16) {
-            aie::vector<bfloat16, 16> q_vec = aie::load_v<16>(q_head + v);
-            aie::store_v(out_head + v, q_vec);
-        }
-    }
 }
 
 // Compute attention scores for one K chunk and update online softmax state.
 // Writes results into a single packed inter-tile buffer.
-// Uses rotated Q from the static buffer (populated by flowkv_score_rope_q_bf16).
+// Reads Q directly from q_in (DMA buffer refreshed per attention computation).
+// #268: eliminated static rotated_q buffer to fix stale Q in 2-chunk mode.
 //
-// q_in:      (num_q_heads, head_dim)  -- query vectors (unused, reads rotated_q)
+// q_in:      (num_q_heads, head_dim)  -- query vectors (read directly)
 // k_chunk:   (chunk_size, head_dim)   -- K cache chunk
 // packed_out: packed buffer for inter-tile FIFO:
 //   [0 .. cs*gs-1]: F_c scores in (chunk_size, num_q_heads) layout
@@ -169,7 +157,8 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         eff_chunk = actual_seq - pos_start;
 
     for (int h = 0; h < num_q_heads; h++) {
-        const bfloat16 *q_head = rotated_q + h * head_dim;
+        // #268: read Q directly from q_in instead of static rotated_q buffer.
+        const bfloat16 *q_head = q_in + h * head_dim;
         float m_old = score_running_max[h];
         float l_old = score_running_sum[h];
 

@@ -83,11 +83,6 @@ static_assert(MAX_CHUNK >= 1, "FlowKV: MAX_CHUNK must be >= 1");
 static float score_running_max[MAX_Q_HEADS] __attribute__((aligned(64)));
 static float score_running_sum[MAX_Q_HEADS] __attribute__((aligned(64)));
 
-// RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk).
-// Sized for HEAD_DIM at compile time so larger head dims don't overflow
-// the static buffer.
-static bfloat16 rotated_q[MAX_Q_HEADS * HEAD_DIM] __attribute__((aligned(64)));
-
 // Actual sequence length (number of filled KV positions).
 // Read from Q buffer element [num_q_heads*head_dim + head_dim] = angles[64].
 // The host encodes this as bf16 before dispatch.
@@ -128,9 +123,11 @@ void flowkv_score_init_bf16(int32_t num_q_heads)
     }
 }
 
-// Copy Q heads into static buffer. The host already provides post-RoPE Q
-// (the ggml ROPE node runs before FlowKV dispatch), so no rotation needed.
-// Also reads actual_seq_len from the angles region of the Q buffer.
+// Read actual_seq_len from Q buffer and reset chunk counter.
+// The host already provides post-RoPE Q (the ggml ROPE node runs before
+// FlowKV dispatch), so no rotation needed. Q is read directly from the
+// DMA buffer (q_in) in flowkv_score_chunk_bf16, eliminating the static
+// rotated_q buffer that caused stale Q in 2-chunk mode (#268).
 //
 // Q buffer layout: [Q_heads (gs * hd) | angles (hd) | actual_seq_len (1)]
 // angles region is unused for rotation but actual_seq_len is read from
@@ -147,37 +144,14 @@ void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_hea
     // Reset chunk counter for this attention computation.
     *(volatile int32_t *)&g_actual_seq_len; // force re-read (compiler barrier)
     g_score_chunk_counter = 0;
-
-    // Q is already post-RoPE — copy into the static rotated_q buffer.
-    // No rotation applied. The angles region is skipped (not needed).
-#ifdef FLOWKV_PRESCALE_Q
-    aie::vector<float, 16> scale_vec = aie::broadcast<float, 16>(HEAD_DIM_INV_SQRT);
-#endif
-    for (int h = 0; h < num_q_heads; h++) {
-        const bfloat16 *q_head = q_in + h * head_dim;
-        bfloat16 *out_head = rotated_q + h * head_dim;
-
-        for (int v = 0; v < head_dim; v += 16) {
-            aie::vector<bfloat16, 16> q_vec = aie::load_v<16>(q_head + v);
-#ifdef FLOWKV_PRESCALE_Q
-            aie::accum<accfloat, 16> q_acc(q_vec);
-            aie::vector<float, 16> q_f32 = q_acc.to_vector<float>();
-            aie::vector<float, 16> scaled = aie::mul(q_f32, scale_vec);
-            aie::accum<accfloat, 16> scaled_acc(scaled);
-            aie::vector<bfloat16, 16> q_scaled = scaled_acc.to_vector<bfloat16>();
-            aie::store_v(out_head + v, q_scaled);
-#else
-            aie::store_v(out_head + v, q_vec);
-#endif
-        }
-    }
 }
 
 // Compute attention scores for one K chunk and update online softmax state.
 // Writes results into a single packed inter-tile buffer.
-// Uses rotated Q from the static buffer (populated by flowkv_score_rope_q_bf16).
+// Reads Q directly from q_in (DMA buffer refreshed per attention computation).
+// #268: eliminated static rotated_q buffer to fix stale Q in 2-chunk mode.
 //
-// q_in:      (num_q_heads, head_dim)  -- query vectors (unused, reads rotated_q)
+// q_in:      (num_q_heads, head_dim)  -- query vectors (read directly)
 // k_chunk:   (chunk_size, head_dim)   -- K cache chunk
 // packed_out: packed buffer for inter-tile FIFO:
 //   [0 .. cs*gs-1]: F_c scores in (chunk_size, num_q_heads) layout
@@ -237,7 +211,14 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         eff_chunk = actual_seq - pos_start;
 
     for (int h = 0; h < num_q_heads; h++) {
-        const bfloat16 *q_head = rotated_q + h * head_dim;
+        // #268: read Q directly from q_in instead of static rotated_q buffer.
+        // The static rotated_q was written by flowkv_score_rope_q_bf16 once per
+        // attention computation, but in 2-chunk mode both chunks read it and the
+        // AIE compiler may hoist/cache the loads across chunk calls, causing
+        // stale Q for subsequent layers. Reading from q_in (the DMA buffer
+        // refreshed per attention computation) eliminates this dependency.
+        // FLOWKV_PRESCALE_Q prescaling is applied on-the-fly when loading Q.
+        const bfloat16 *q_head_base = q_in + h * head_dim;
         float m_old = score_running_max[h];
         float l_old = score_running_sum[h];
 
@@ -265,11 +246,28 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
             // (0.630/0.722/0.923 vs baseline 0.619/0.691/0.847), and #267k later
             // measured the raw scores CORRECT in every head, so the dot product
             // was never the defect -- see the exp2 note below for the real root.
-            aie::accum<accfloat, 32> acc =
-                aie::mul(aie::load_v<32>(q_head), aie::load_v<32>(k_pos));
+            aie::accum<accfloat, 32> acc;
+            // Load first chunk with prescaling if needed
+#ifdef FLOWKV_PRESCALE_Q
+            aie::accum<accfloat, 32> q_acc(aie::load_v<32>(q_head_base));
+            aie::vector<float, 32> q_f32 = q_acc.to_vector<float>();
+            aie::vector<float, 32> q_scaled = aie::mul(q_f32, aie::broadcast<float, 32>(HEAD_DIM_INV_SQRT));
+            aie::accum<accfloat, 32> q_scaled_acc(q_scaled);
+            acc = aie::mul(q_scaled_acc, aie::load_v<32>(k_pos));
+#else
+            acc = aie::mul(aie::load_v<32>(q_head_base), aie::load_v<32>(k_pos));
+#endif
             #pragma clang loop unroll(full)
             for (int c = 1; c < n_chunks; c++) {
-                auto qv = aie::load_v<32>(q_head + c * 32);
+#ifdef FLOWKV_PRESCALE_Q
+                aie::accum<accfloat, 32> q_acc(aie::load_v<32>(q_head_base + c * 32));
+                aie::vector<float, 32> q_f32 = q_acc.to_vector<float>();
+                aie::vector<float, 32> q_scaled = aie::mul(q_f32, aie::broadcast<float, 32>(HEAD_DIM_INV_SQRT));
+                aie::accum<accfloat, 32> q_scaled_acc(q_scaled);
+                auto qv = q_scaled_acc;
+#else
+                auto qv = aie::load_v<32>(q_head_base + c * 32);
+#endif
                 auto kv = aie::load_v<32>(k_pos  + c * 32);
                 acc = aie::mac(acc, qv, kv);
             }
@@ -277,7 +275,15 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
             aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
             #pragma clang loop unroll(full)
             for (int c = 0; c < n_chunks; c++) {
-                auto qv = aie::load_v<32>(q_head + c * 32);
+#ifdef FLOWKV_PRESCALE_Q
+                aie::accum<accfloat, 32> q_acc(aie::load_v<32>(q_head_base + c * 32));
+                aie::vector<float, 32> q_f32 = q_acc.to_vector<float>();
+                aie::vector<float, 32> q_scaled = aie::mul(q_f32, aie::broadcast<float, 32>(HEAD_DIM_INV_SQRT));
+                aie::accum<accfloat, 32> q_scaled_acc(q_scaled);
+                auto qv = q_scaled_acc;
+#else
+                auto qv = aie::load_v<32>(q_head_base + c * 32);
+#endif
                 auto kv = aie::load_v<32>(k_pos  + c * 32);
                 acc = aie::mac(acc, qv, kv);
             }
@@ -286,17 +292,17 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
 #ifdef FLOWKV_SCORE_NOREDUCE
             // PROBE (latency-only, WRONG answer): skip the horizontal reduce_add
             // to size its cost. Same loads/macs, no 32→1 reduction.
-  #ifdef FLOWKV_PRESCALE_Q
+#ifdef FLOWKV_PRESCALE_Q
             bfloat16 score = static_cast<bfloat16>(acc.to_vector<float>()[0]);
-  #else
-            bfloat16 score = static_cast<bfloat16>(acc.to_vector<float>()[0] * inv_sqrt_d);
-  #endif
 #else
-  #ifdef FLOWKV_PRESCALE_Q
+            bfloat16 score = static_cast<bfloat16>(acc.to_vector<float>()[0] * inv_sqrt_d);
+#endif
+#else
+#ifdef FLOWKV_PRESCALE_Q
             bfloat16 score = static_cast<bfloat16>(aie::reduce_add(acc.to_vector<float>()));
-  #else
+#else
             bfloat16 score = static_cast<bfloat16>(aie::reduce_add(acc.to_vector<float>()) * inv_sqrt_d);
-  #endif
+#endif
 #endif
 
             scores_bf16[pos] = score;
