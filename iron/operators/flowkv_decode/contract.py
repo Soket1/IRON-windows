@@ -36,6 +36,9 @@ _ALLOWED_TUNING_MACROS = frozenset({
     # #268: read Q directly from q_in in flowkv_score_chunk_bf16 instead of
     # static rotated_q buffer, fixing stale Q in 2-chunk mode.
     "FLOWKV_Q_IN_DIRECT",
+    # #271: Q sync protocol v2 - separate lock pairs for center->mem (Qc2m/Qp_c2m)
+    # and center->score (Qc2s/Qp_c2s) to prevent stale Q in 2-chunk continuous dispatch.
+    "FLOWKV_Q_SYNC_V2",
 })
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _VALUE_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")

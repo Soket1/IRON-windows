@@ -146,9 +146,9 @@ class AIEDecodeLayerF3Best(AIEOperatorBase):
         else:
             _exp_impl = ()
         flowkv_tuning = (
-            "-DFLOWKV_PRESCALE_Q=1",
             _value_impl,
             "-DFLOWKV_Q_IN_DIRECT=1",  # #268: read Q directly from q_in in chunk fn
+            "-DFLOWKV_Q_SYNC_V2=1",    # #271: Q sync protocol v2 (separate Qc2m/Qc2s locks)
         ) + _exp_impl + _dot_init
         flowkv_obj_name = flowkv_kernel_object_name(
             self.head_dim, self.attn_group, self.seq_len, flowkv_tuning

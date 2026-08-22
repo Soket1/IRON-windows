@@ -354,9 +354,12 @@ class OFold8F3BestEmitter:
         # Auto-allocate locks and DMA channels (#154)
         L = _LockAlloc('core')
         D = _DmaAlloc('core')
-        _a0 = L.pair('A0'); _b0 = L.pair('B0'); _q = L.pair('Q')
+        _a0 = L.pair('A0'); _b = L.pair('B')  # single B lock pair shared across B0/B1/B2 (sequential phases)
+        # // #271: separate Q lock pairs for three sync paths:
+        #   _q_c2m: center core -> center mem (Q ready for DMA to score)
+        #   _q_c2s: center core -> score core (Q ready for score tile)
+        _q_c2m = L.pair('Qc2m'); _q_c2s = L.pair('Qc2s')
         _o = L.pair('O');   _p = L.pair('P');   _a1 = L.pair('A1')
-        _b1 = L.pair('B1'); _b2 = L.pair('B2')
         _s2mm_w  = D.s2mm('weight')   # A0/A1 ping-pong
         _s2mm_b  = D.s2mm('bcast')    # B0/B1/B2 triple
         _mm2s_p  = D.mm2s('drain')    # P drain
@@ -365,8 +368,8 @@ class OFold8F3BestEmitter:
         # Lock declarations (auto-allocated)
         _ld = lambda name, ids: _LockAlloc.mlir_decl(f't{h}', f'{p}', name, *ids)
         _lock_decls = '\n'.join([
-            _ld('A0', _a0), _ld('B0', _b0), _ld('Q', _q), _ld('O', _o),
-            _ld('P', _p), _ld('A1', _a1), _ld('B1', _b1), _ld('B2', _b2),
+            _ld('A0', _a0), _ld('B', _b), _ld('Qc2m', _q_c2m), _ld('Qc2s', _q_c2s),
+            _ld('O', _o), _ld('P', _p), _ld('A1', _a1),
         ])
 
         return f"""
@@ -395,8 +398,9 @@ class OFold8F3BestEmitter:
       %xb_i32 = arith.constant {XB} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         // ---- phase 1: Q-GEMV + rope (B0 = x_bundle, nchunk=8) ----
-        aie.use_lock(%{p}_B0c, AcquireGreaterEqual, 1)
-        aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
+        // #271: wait for score tile to finish reading previous layer's Q (Qc2s consumer)
+        aie.use_lock(%{p}_Qc2sc, AcquireGreaterEqual, 1)
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -409,8 +413,10 @@ class OFold8F3BestEmitter:
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_bundled(%{p}_Q, %{p}_B0, %{p}_Q, %qr) : (memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) -> ()
-        aie.use_lock(%{p}_Qc, Release, 1)
-        aie.use_lock(%{p}_B0p, Release, 1)
+        // #271: release Q for BOTH center mem (DMA, Qc2m producer) AND score tile (processing, Qc2s producer)
+        aie.use_lock(%{p}_Qc2mp, Release, 1)
+        aie.use_lock(%{p}_Qc2sp, Release, 1)
+        aie.use_lock(%{p}_Bp, Release, 1)
         // #211 B0 dump: snapshot B0 (x_bundle as delivered by mux->center) into P,
         // then drain P via the existing Pf0 MM2S to the shim s-region. The host
         // reads P and compares TB=0 vs TB=1 B0 contents. Reuses attn_copy_bf16
@@ -423,7 +429,7 @@ class OFold8F3BestEmitter:
         aie.use_lock(%{p}_Pc, Release, 1)
         """ if self.B0DUMP else "") + f"""
         // ---- phase 2: O-proj (B1 = attn_out, nchunk=8) ----
-        aie.use_lock(%{p}_B1c, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Op, AcquireGreaterEqual, 1)
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
@@ -436,11 +442,11 @@ class OFold8F3BestEmitter:
           func.call @layer_fused_oproj_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B1, %{p}_O) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, memref<{OSZ}xbf16>) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        aie.use_lock(%{p}_B1p, Release, 1)
+        aie.use_lock(%{p}_Bp, Release, 1)
         aie.use_lock(%{p}_Oc, Release, 1)
         // ---- phase 3: FFN (B2 = ffn_in) ----
         // 3a: gate GEMV (nchunk=8, output -> gate_buf)
-        aie.use_lock(%{p}_B2c, AcquireGreaterEqual, 1)
+        aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
         scf.for %j = %c0 to %cF step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -464,7 +470,7 @@ class OFold8F3BestEmitter:
           func.call @layer_fused_gate_up_bcast_bf16(%ji1, %c0_i32, %{p}_A1, %{p}_B2, %c1_i32) : (i32, i32, memref<{PK}xi8>, memref<{XB}xbf16>, i32) -> ()
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
-        aie.use_lock(%{p}_B2p, Release, 1)
+        aie.use_lock(%{p}_Bp, Release, 1)
         // 3c: SiLU(gate) * up -> silu_buf.
         // The C++ bcast wrappers keep gate/up/silu in the file-scope statics
         // lf_left_buf / lf_right_buf / lf_silu_buf: gate_up writes the statics
@@ -504,19 +510,19 @@ class OFold8F3BestEmitter:
     ^bs{h}:
       %s1 = aie.dma_start(S2MM, {_s2mm_b}, ^b0{h}, ^m0{h})
     ^b0{h}:
-      aie.use_lock(%{p}_B0p, AcquireGreaterEqual, 1)
+      aie.use_lock(%{p}_Bp, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_B0 : memref<{XB}xbf16>, 0, {XB})
-      aie.use_lock(%{p}_B0c, Release, 1)
+      aie.use_lock(%{p}_Bc, Release, 1)
       aie.next_bd ^b1{h}
     ^b1{h}:
-      aie.use_lock(%{p}_B1p, AcquireGreaterEqual, 1)
+      aie.use_lock(%{p}_Bp, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_B1 : memref<{XB}xbf16>, 0, {XB})
-      aie.use_lock(%{p}_B1c, Release, 1)
+      aie.use_lock(%{p}_Bc, Release, 1)
       aie.next_bd ^b2{h}
     ^b2{h}:
-      aie.use_lock(%{p}_B2p, AcquireGreaterEqual, 1)
+      aie.use_lock(%{p}_Bp, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_B2 : memref<{XB}xbf16>, 0, {XB})
-      aie.use_lock(%{p}_B2c, Release, 1)
+      aie.use_lock(%{p}_Bc, Release, 1)
       aie.next_bd ^b0{h}
     ^m0{h}:
       %m0 = aie.dma_start(MM2S, {_mm2s_p}, ^pf{h}, ^qo{h})
@@ -528,9 +534,11 @@ class OFold8F3BestEmitter:
     ^qo{h}:
       %m1 = aie.dma_start(MM2S, {_mm2s_qo}, ^qi{h}, ^e{h})
     ^qi{h}:
-      aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
+      // #271: wait for center core to signal Q ready for DMA (Qc2m consumer)
+      aie.use_lock(%{p}_Qc2mc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZL})
-      aie.use_lock(%{p}_Qp, Release, 1)
+      // #271: signal center core that DMA is done (Qc2m producer)
+      aie.use_lock(%{p}_Qc2mp, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
       aie.use_lock(%{p}_Oc, AcquireGreaterEqual, 1)
@@ -551,16 +559,19 @@ class OFold8F3BestEmitter:
         # Auto-allocate locks and DMA channels (#154)
         L = _LockAlloc('core')
         D = _DmaAlloc('core')
-        _a0 = L.pair('A0'); _b = L.pair('B'); _q = L.pair('Q')
+        _a0 = L.pair('A0'); _b = L.pair('B')
         _o = L.pair('O');   _p = L.pair('P'); _a1 = L.pair('A1')
         _s2mm_w  = D.s2mm('weight')
         _s2mm_b  = D.s2mm('bcast')
         _mm2s_p  = D.mm2s('drain')
         _mm2s_qo = D.mm2s('qo')
 
+        # // #271: separate Q lock pairs for center->mem and center->score
+        _q_c2m = L.pair('Qc2m'); _q_c2s = L.pair('Qc2s')
+
         _ld = lambda name, ids: _LockAlloc.mlir_decl(f't{h}', f'{p}', name, *ids)
         _lock_decls = '\n'.join([
-            _ld('A0', _a0), _ld('B', _b), _ld('Q', _q),
+            _ld('A0', _a0), _ld('B', _b), _ld('Qc2m', _q_c2m), _ld('Qc2s', _q_c2s),
             _ld('O', _o), _ld('P', _p), _ld('A1', _a1),
         ])
 
@@ -589,7 +600,8 @@ class OFold8F3BestEmitter:
       scf.for %tok = %c0 to %cN step %c1 {{
         // ---- phase 1: Q-GEMV + rope (B = x_bundle, nchunk=8) ----
         aie.use_lock(%{p}_Bc, AcquireGreaterEqual, 1)
-        aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+        // #271: wait for score tile to finish reading previous layer's Q (Qc2s consumer)
+        aie.use_lock(%{p}_Qc2sc, AcquireGreaterEqual, 1)
         scf.for %j = %c0 to %c64 step %c2 {{
           aie.use_lock(%{p}_A0c, AcquireGreaterEqual, 1)
           %ji0 = arith.index_cast %j : index to i32
@@ -602,7 +614,9 @@ class OFold8F3BestEmitter:
           aie.use_lock(%{p}_A1p, Release, 1)
         }}
         func.call @rope_bundled(%{p}_Q, %{p}_B, %{p}_Q, %qr) : (memref<{QSZ}xbf16>, memref<{XB}xbf16>, memref<{QSZ}xbf16>, i32) -> ()
-        aie.use_lock(%{p}_Qc, Release, 1)
+        // #271: release Q for BOTH center mem (DMA, Qc2m producer) AND score tile (processing, Qc2s producer)
+        aie.use_lock(%{p}_Qc2mp, Release, 1)
+        aie.use_lock(%{p}_Qc2sp, Release, 1)
         aie.use_lock(%{p}_Bp, Release, 1)
         // #211 B0 dump (single-B): snapshot B (x_bundle as delivered by mux->center)
         // into P, then drain P via Pf0 MM2S. Mirrors the triple-B dump so the host
@@ -703,9 +717,11 @@ class OFold8F3BestEmitter:
     ^m1{h}:
       %m1 = aie.dma_start(MM2S, {_mm2s_qo}, ^qo{h}, ^e{h})
     ^qo{h}:
-      aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
+      // #271: wait for center core to signal Q ready for DMA (Qc2m consumer)
+      aie.use_lock(%{p}_Qc2mc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Q : memref<{QSZ}xbf16>, 0, {QSZL})
-      aie.use_lock(%{p}_Qp, Release, 1)
+      // #271: signal center core that DMA is done (Qc2m producer)
+      aie.use_lock(%{p}_Qc2mp, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
       aie.use_lock(%{p}_Oc, AcquireGreaterEqual, 1)
@@ -724,7 +740,9 @@ class OFold8F3BestEmitter:
 
         # Auto-allocate locks and DMA channels (#154)
         L = _LockAlloc('core'); D = _DmaAlloc('core')
-        _q = L.pair('Q'); _k = L.pair('K'); _i = L.pair('I')
+        # // #271: separate Q lock pairs for center->score and score->mem
+        _q_c2s = L.pair('Qc2s'); _q_s2m = L.pair('Qs2m')
+        _k = L.pair('K'); _i = L.pair('I')
         _oh = L.pair('Oh'); _ohd = L.pair('Ohd')
         _s2mm_in  = D.s2mm('in')   # Q + Oh relay (2-BD chain)
         _s2mm_kv  = D.s2mm('kv')   # K
@@ -739,7 +757,7 @@ class OFold8F3BestEmitter:
             # re-points it at Qd). @S_alloc proven single-shot, zero runtime risk.
             _sd = L.pair('Sd')
             _lock_decls = '\n'.join([
-                _ld('Q', _q), _ld('K', _k), _ld('I', _i),
+                _ld('Qc2s', _q_c2s), _ld('Qs2m', _q_s2m), _ld('K', _k), _ld('I', _i),
                 _ld('Oh', _oh), _ld('Ohd', _ohd), _ld('Sd', _sd),
             ])
         elif self.QDUMP:
@@ -748,12 +766,12 @@ class OFold8F3BestEmitter:
             # DMA channel is allocated - the O_h relay MM2S1 is re-pointed at Qd).
             _qd = L.pair('Qd')
             _lock_decls = '\n'.join([
-                _ld('Q', _q), _ld('K', _k), _ld('I', _i),
+                _ld('Qc2s', _q_c2s), _ld('Qs2m', _q_s2m), _ld('K', _k), _ld('I', _i),
                 _ld('Oh', _oh), _ld('Ohd', _ohd), _ld('Qd', _qd),
             ])
         else:
             _lock_decls = '\n'.join([
-                _ld('Q', _q), _ld('K', _k), _ld('I', _i),
+                _ld('Qc2s', _q_c2s), _ld('Qs2m', _q_s2m), _ld('K', _k), _ld('I', _i),
                 _ld('Oh', _oh), _ld('Ohd', _ohd),
             ])
 
@@ -781,7 +799,10 @@ class OFold8F3BestEmitter:
       %citc = arith.constant {ITC} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         func.call @flowkv_score_init_bf16(%ag) : (i32) -> ()
-        aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
+        // #271: wait for center core to signal Q ready (Qc2s consumer)
+        aie.use_lock(%{p}_Qc2sc, AcquireGreaterEqual, 1)
+        // #271: wait for score mem S2MM DMA to fill Qs (Qs2m consumer)
+        aie.use_lock(%{p}_Qs2mc, AcquireGreaterEqual, 1)
         func.call @flowkv_score_rope_q_bf16(%{p}_Qs, %ag, %hd) : (memref<{QSZ}xbf16>, i32, i32) -> ()
         scf.for %ci = %c0 to %cnc step %c1 {{
           aie.use_lock(%{p}_Kc, AcquireGreaterEqual, 1)
@@ -795,7 +816,8 @@ class OFold8F3BestEmitter:
           aie.use_lock(%{p}_Kp, Release, 1)
           aie.use_lock(%{p}_Ic, Release, 1)
         }}
-        aie.use_lock(%{p}_Qp, Release, 1)
+        // #271: signal center core that score tile is done reading Q (Qc2s producer)
+        aie.use_lock(%{p}_Qc2sp, Release, 1)
         // cycle the dead O_h buffer so the incoming core O (S2MM0-BD1) never stalls
         aie.use_lock(%{p}_Ohc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Ohp, Release, 1)
@@ -805,9 +827,11 @@ class OFold8F3BestEmitter:
     %mem_sc{h} = aie.mem(%sc{h}) {{
       %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
     ^q{h}:
-      aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+      // #271: wait for center mem MM2S stream (Qs2m consumer)
+      aie.use_lock(%{p}_Qs2mc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZL})
-      aie.use_lock(%{p}_Qc, Release, 1)
+      // #271: signal score core that Qs DMA is done (Qs2m producer)
+      aie.use_lock(%{p}_Qs2mp, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
       aie.use_lock(%{p}_Ohp, AcquireGreaterEqual, 1)
@@ -863,7 +887,10 @@ class OFold8F3BestEmitter:
       %cd = arith.constant {PT} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         func.call @flowkv_score_init_bf16(%ag) : (i32) -> ()
-        aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
+        // #271: wait for center core to signal Q ready (Qc2s consumer)
+        aie.use_lock(%{p}_Qc2sc, AcquireGreaterEqual, 1)
+        // #271: wait for score mem S2MM DMA to fill Qs (Qs2m consumer)
+        aie.use_lock(%{p}_Qs2mc, AcquireGreaterEqual, 1)
         func.call @flowkv_score_rope_q_bf16(%{p}_Qs, %ag, %hd) : (memref<{QSZ}xbf16>, i32, i32) -> ()
         // #188 Q dump: relay the roped-Q slice off to the host s-region via the O_h
         // relay (MM2S1, re-pointed at Qd). Compute is the producer of Qd.
@@ -877,7 +904,8 @@ class OFold8F3BestEmitter:
           aie.use_lock(%{p}_Kp, Release, 1)
           aie.use_lock(%{p}_Ic, Release, 1)
         }}
-        aie.use_lock(%{p}_Qp, Release, 1)
+        // #271: signal center core that score tile is done reading Q (Qc2s producer)
+        aie.use_lock(%{p}_Qc2sp, Release, 1)
         // cycle the dead O_h buffer so the incoming core O (S2MM0-BD1) never stalls
         aie.use_lock(%{p}_Ohc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Ohp, Release, 1)
@@ -887,9 +915,11 @@ class OFold8F3BestEmitter:
     %mem_sc{h} = aie.mem(%sc{h}) {{
       %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
     ^q{h}:
-      aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+      // #271: wait for center mem MM2S stream (Qs2m consumer)
+      aie.use_lock(%{p}_Qs2mc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZL})
-      aie.use_lock(%{p}_Qc, Release, 1)
+      // #271: signal score core that Qs DMA is done (Qs2m producer)
+      aie.use_lock(%{p}_Qs2mp, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
       aie.use_lock(%{p}_Ohp, AcquireGreaterEqual, 1)
@@ -937,7 +967,10 @@ class OFold8F3BestEmitter:
       %sC = arith.constant {CH} : i32
       scf.for %tok = %c0 to %cN step %c1 {{
         func.call @flowkv_score_init_bf16(%ag) : (i32) -> ()
-        aie.use_lock(%{p}_Qc, AcquireGreaterEqual, 1)
+        // #271: wait for center core to signal Q ready (Qc2s consumer)
+        aie.use_lock(%{p}_Qc2sc, AcquireGreaterEqual, 1)
+        // #271: wait for score mem S2MM DMA to fill Qs (Qs2m consumer)
+        aie.use_lock(%{p}_Qs2mc, AcquireGreaterEqual, 1)
         func.call @flowkv_score_rope_q_bf16(%{p}_Qs, %ag, %hd) : (memref<{QSZ}xbf16>, i32, i32) -> ()
         scf.for %ci = %c0 to %cnc step %c1 {{
           aie.use_lock(%{p}_Kc, AcquireGreaterEqual, 1)
@@ -946,7 +979,8 @@ class OFold8F3BestEmitter:
           aie.use_lock(%{p}_Kp, Release, 1)
           aie.use_lock(%{p}_Ic, Release, 1)
         }}
-        aie.use_lock(%{p}_Qp, Release, 1)
+        // #271: signal center core that score tile is done reading Q (Qc2s producer)
+        aie.use_lock(%{p}_Qc2sp, Release, 1)
         // ph2: relay O_h (S2MM0-BD1 -> MM2S1, no compute, rl-style lock-dance)
         aie.use_lock(%{p}_Ohc, AcquireGreaterEqual, 1)
         aie.use_lock(%{p}_Ohdp, AcquireGreaterEqual, 1)
@@ -958,9 +992,11 @@ class OFold8F3BestEmitter:
     %mem_sc{h} = aie.mem(%sc{h}) {{
       %s0 = aie.dma_start(S2MM, {_s2mm_in}, ^q{h}, ^ks{h})
     ^q{h}:
-      aie.use_lock(%{p}_Qp, AcquireGreaterEqual, 1)
+      // #271: wait for center mem MM2S stream (Qs2m consumer)
+      aie.use_lock(%{p}_Qs2mc, AcquireGreaterEqual, 1)
       aie.dma_bd(%{p}_Qs : memref<{QSZ}xbf16>, 0, {QSZL})
-      aie.use_lock(%{p}_Qc, Release, 1)
+      // #271: signal score core that Qs DMA is done (Qs2m producer)
+      aie.use_lock(%{p}_Qs2mp, Release, 1)
       aie.next_bd ^oh{h}
     ^oh{h}:
       aie.use_lock(%{p}_Ohp, AcquireGreaterEqual, 1)
@@ -1681,7 +1717,7 @@ class OFold8F3BestEmitter:
             # simulator doesn't model stalls, so this must work on hardware —
             # route sc0 Trace:0 -> sc1 (neighbour) -> sh7 DMA (free shim with
             # East/West transits available per North:0/South:2 only occupied).
-            flows.append(f"    aie.flow(%sc1, Trace : 0, %sh7, DMA : 1)   // trace sc1 -> sh7 S2MM1")
+            flows.append(f'    aie.flow(%sc1, Trace : 0, %sh7, DMA : 1)   // trace sc1 -> sh7 S2MM1')
         if self.RL_FIX:
             flows.append("    aie.packet_flow(0) { aie.packet_source<%jA, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // attnA -> mux S2MM1")
             flows.append("    aie.packet_flow(1) { aie.packet_source<%nm, DMA : 0> aie.packet_dest<%mx, DMA : 1> }   // ffn_in -> mux S2MM1")
