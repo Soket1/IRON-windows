@@ -9,9 +9,11 @@ covered on a CPU-only machine.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections.abc import Iterable
+from pathlib import Path
 
 
 class FlowKVContractError(ValueError):
@@ -170,6 +172,27 @@ def flowkv_tuning_fingerprint(tokens: Iterable[str]) -> str:
     return f"{value:016x}"
 
 
+def _flowkv_source_hash(base_dir: Path | None = None) -> str:
+    """Return a short hash of FlowKV kernel source files.
+
+    This hash is mixed into the cache key so that any change to the kernel
+    source invalidates the cached artifact, preventing stale .o reuse.
+    """
+    if base_dir is None:
+        # contract.py is at IRON-windows/iron/operators/flowkv_decode/contract.py
+        # flowkv.cc is at IRON-windows/aie_kernels/aie2p/flowkv.cc
+        contract_path = Path(__file__).resolve()
+        base_dir = contract_path.parents[3] / "aie_kernels" / "aie2p"
+    source_files = [
+        base_dir / "flowkv.cc",
+    ]
+    hasher = hashlib.sha256()
+    for src in source_files:
+        if src.is_file():
+            hasher.update(src.read_bytes())
+    return hasher.hexdigest()[:16]
+
+
 def flowkv_bundle_cache_key(
     num_heads: int,
     num_kv_heads: int,
@@ -178,6 +201,7 @@ def flowkv_bundle_cache_key(
     chunk_size: int,
     num_cols: int,
     tuning_fingerprint: str = "63624e81faf2e175",
+    source_hash: str | None = None,
 ) -> str:
     """Return the directory key shared by Python and native FlowKV builds."""
     _require_positive_int("num_heads", num_heads)
@@ -190,9 +214,11 @@ def flowkv_bundle_cache_key(
         r"[0-9a-f]{16}", tuning_fingerprint
     ):
         raise FlowKVContractError("tuning_fingerprint must be a 16-character lowercase hex value")
+    if source_hash is None:
+        source_hash = _flowkv_source_hash()
     return (
         f"flowkv_H{num_heads}_KV{num_kv_heads}_d{head_dim}_S{seq_len}"
-        f"_C{chunk_size}_{num_cols}col_t{tuning_fingerprint}"
+        f"_C{chunk_size}_{num_cols}col_t{tuning_fingerprint}_s{source_hash}"
     )
 
 
@@ -201,10 +227,14 @@ def flowkv_artifact_identity(
     max_q_heads: int,
     max_chunk: int,
     tuning_tokens: Iterable[str] = (),
+    source_hash: str | None = None,
 ) -> str:
     """Return the cache-safe identity for FlowKV generated artifacts."""
     flowkv_geometry_flags(head_dim, max_q_heads, max_chunk)
-    return flowkv_tuning_fingerprint(tuning_tokens)
+    if source_hash is None:
+        source_hash = _flowkv_source_hash()
+    # Include source hash in the artifact identity so it propagates to xclbin cache key
+    return f"{flowkv_tuning_fingerprint(tuning_tokens)}_s{source_hash}"
 
 
 def flowkv_kernel_object_name(
@@ -212,11 +242,14 @@ def flowkv_kernel_object_name(
     max_q_heads: int,
     max_chunk: int,
     tuning_tokens: Iterable[str] = (),
+    source_hash: str | None = None,
 ) -> str:
-    """Return an object identity covering FlowKV geometry and optional tuning."""
+    """Return an object identity covering FlowKV geometry, tuning, and source."""
     flowkv_geometry_flags(head_dim, max_q_heads, max_chunk)
     normalized = normalize_flowkv_tuning_tokens(tuning_tokens)
     base = f"flowkv_{head_dim}d_h{max_q_heads}_c{max_chunk}"
+    if source_hash is None:
+        source_hash = _flowkv_source_hash()
     if normalized:
-        return f"{base}_t{flowkv_tuning_fingerprint(normalized)}.o"
-    return f"{base}.o"
+        return f"{base}_t{flowkv_tuning_fingerprint(normalized)}_s{source_hash}.o"
+    return f"{base}_s{source_hash}.o"

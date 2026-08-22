@@ -14,6 +14,7 @@ from iron.common import (
     PythonGeneratedMLIRArtifact,
 )
 from iron.operators.flowkv_decode.contract import (
+    _flowkv_source_hash,
     flowkv_artifact_identity,
     flowkv_geometry_flags,
     flowkv_kernel_object_name,
@@ -111,11 +112,13 @@ class AIEFlowKVDecode(AIEOperatorBase):
             self.tuning_tokens = flowkv_tuning_tokens_from_environment()
         else:
             self.tuning_tokens = normalize_flowkv_tuning_tokens(tuning_tokens)
+        self.source_hash = _flowkv_source_hash()
         self.kernel_obj_name = flowkv_kernel_object_name(
             self.head_dim,
             self.group_size,
             self.chunk_size,
             self.tuning_tokens,
+            self.source_hash,
         )
 
         self.xclbin_artifact = None
@@ -131,6 +134,7 @@ class AIEFlowKVDecode(AIEOperatorBase):
             self.group_size,
             self.chunk_size,
             self.tuning_tokens,
+            self.source_hash,
         )
         file_name_base = (
             f"flowkv_decode_{device_name}_{self.num_heads}h_{self.num_kv_heads}kv_"
