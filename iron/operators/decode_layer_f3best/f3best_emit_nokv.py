@@ -1771,7 +1771,16 @@ class OFold8F3BestEmitter:
         if self.SDUMP:
             flows.append("    aie.flow(%sc0, DMA : 1, %sh4, DMA : 1)   // SDUMP: sc0 scores -> @S_alloc (host reads scores)")
         else:
-            flows.append("    aie.flow(%nm, DMA : 1, %sh4, DMA : 1)   // s = O+resid (attn-residual) -> arg0 tail")
+            # #272: the tail output must NOT land on %sh4 S2MM:1. Pathfinder has
+            # no legal routing for it there (sh4 already carries Khi MM2S:1 +
+            # P4 S2MM:0 transits; a third task on the same shim channel set is
+            # unroutable) and the whole PROD xclbin fails with "Unable to find
+            # a legal routing" while SDUMP builds fine. sh7 S2MM:1 is free in
+            # production (only AIE_TRACE/ATTN_DUMP use it). Verified by aie-opt
+            # bisection on the failing MLIR: deleting OR retargeting this one
+            # flow to shim col7 makes routing legal.
+            flows.append("    aie.flow(%nm, DMA : 1, %sh7, DMA : 1)   // s = O+resid (attn-residual) -> arg0 tail")
+
         if self.ATTN_DUMP:
             flows.append("    aie.flow(%rl, DMA : 1, %sh7, DMA : 1)   // attn_out tap (ATTN_DUMP) -> sh7 S2MM1")
         flows_txt = "\n".join(flows) + "\n"
@@ -1783,13 +1792,21 @@ class OFold8F3BestEmitter:
         shim_allocs += "    aie.shim_dma_allocation @Khi_alloc(%sh4, MM2S, 1)\n"
         shim_allocs += "    aie.shim_dma_allocation @Vlo_alloc(%sh5, MM2S, 1)\n"
         shim_allocs += "    aie.shim_dma_allocation @Vhi_alloc(%sh6, MM2S, 1)\n"
-        shim_allocs += "    aie.shim_dma_allocation @S_alloc(%sh4, S2MM, 1)\n"
+        # #272: @S_alloc lives on sh7 S2MM:1 in production (sh4 S2MM:1 is
+        # unroutable for the nm tail flow — see the flow comment above).
+        # SDUMP keeps its proven sc0 -> sh4 hijack route untouched.
+        _s_shim = 4 if self.SDUMP else 7
+        shim_allocs += f"    aie.shim_dma_allocation @S_alloc(%sh{_s_shim}, S2MM, 1)\n"
         if self.AIE_TRACE:
             # #260: dedicated trace-destination shim. sh7 S2MM ch1 is free
             # (ATTN_DUMP uses it only when enabled; production SDUMP doesn't).
             # sh7 DMA:1 is the working route — DMA:0 collides (South:2 busy).
+            assert not (_s_shim == 7 and not self.SDUMP), "#272: prod tail and AIE_TRACE both target sh7 S2MM:1"
             shim_allocs += "    aie.shim_dma_allocation @T_alloc(%sh7, S2MM, 1)\n"
         if self.ATTN_DUMP:
+            # #245: ATN tap shares sh7 S2MM:1 — only legal in SDUMP builds
+            # where the prod tail is not on sh7 (#272).
+            assert self.SDUMP or _s_shim != 7, "#272: ATN tap and prod tail both target sh7 S2MM:1"
             shim_allocs += "    aie.shim_dma_allocation @ATN_alloc(%sh7, S2MM, 1)\n"
         shim_allocs += "".join(
             f'    aie.shim_dma_allocation @A{h}(%sh{h}, MM2S, 0)\n'
